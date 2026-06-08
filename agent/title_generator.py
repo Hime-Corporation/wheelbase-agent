@@ -118,16 +118,39 @@ def auto_title_session(
     if not title:
         return
 
-    try:
-        session_db.set_session_title(session_id, title)
-        logger.debug("Auto-generated session title: %s", title)
-        if title_callback is not None:
-            try:
-                title_callback(title)
-            except Exception:
-                logger.debug("Auto-title callback failed", exc_info=True)
-    except Exception as e:
-        logger.debug("Failed to set auto-generated title: %s", e)
+    # `sessions.title` carries a UNIQUE index, so two conversations that open
+    # with near-identical first messages can generate the SAME title — the
+    # second `set_session_title` then raises ValueError and, if we just swallow
+    # it, the row is left with a NULL title and shows as "New chat" forever.
+    # Retry with a disambiguating suffix so a duplicate title still yields a
+    # unique, non-null one ("Foo" → "Foo (2)" → "Foo (3)" …).
+    for attempt in range(1, 6):
+        candidate = title if attempt == 1 else f"{title} ({attempt})"
+        try:
+            if session_db.set_session_title(session_id, candidate):
+                logger.debug("Auto-generated session title: %s", candidate)
+                if title_callback is not None:
+                    try:
+                        title_callback(candidate)
+                    except Exception:
+                        logger.debug("Auto-title callback failed", exc_info=True)
+            else:
+                logger.debug(
+                    "Auto-title: session %s row missing; title not set", session_id
+                )
+            return
+        except ValueError:
+            # Title collides with another session's title — try the next variant.
+            logger.debug(
+                "Auto-title collision for %s on %r; retrying", session_id, candidate
+            )
+            continue
+        except Exception as e:
+            logger.debug("Failed to set auto-generated title: %s", e)
+            return
+    logger.warning(
+        "Auto-title gave up for %s after %d title collisions", session_id, attempt
+    )
 
 
 def maybe_auto_title(
