@@ -1778,6 +1778,19 @@ def _find_agent_browser() -> str:
     # (not before the search) to prevent a race where a concurrent thread
     # sees resolved=True but _cached_agent_browser is still None.
 
+    # Explicit override for bundled deployments (Electron app). Points at an
+    # absolute agent-browser executable so we never depend on system PATH/npx.
+    override = os.environ.get("AGENT_BROWSER_CLI", "").strip()
+    if override:
+        if os.path.isfile(override) and os.access(override, os.X_OK):
+            _cached_agent_browser = override
+            _agent_browser_resolved = True
+            return override
+        logger.warning(
+            "AGENT_BROWSER_CLI=%r is not an executable file; falling back to search",
+            override,
+        )
+
     # Check if it's in PATH (global install)
     which_result = shutil.which("agent-browser")
     if which_result:
