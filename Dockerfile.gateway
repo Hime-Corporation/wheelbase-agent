@@ -42,10 +42,13 @@ COPY README.md* ./
 # messaging: Slack/Discord/Telegram gateway transports
 # anthropic, bedrock, azure-identity: provider SDKs (no runtime lazy-install
 #   inside a container without PyPI access)
+# daytona: the cloud gateway runs per-user shell/file tools in Daytona
+#   sandboxes (TERMINAL_ENV=daytona); the env lazy-imports this SDK, which
+#   would fail at first use without PyPI access — so bake it in.
 # We use pip rather than uv here to keep the gateway image dependency-light;
 # the full dev image (Dockerfile) uses uv + s6-overlay.
 RUN pip install --no-cache-dir --upgrade pip && \
-    pip install --no-cache-dir -e ".[all,messaging,anthropic]"
+    pip install --no-cache-dir -e ".[all,messaging,anthropic,daytona]"
 
 # ---------- Source code ----------
 COPY . .
