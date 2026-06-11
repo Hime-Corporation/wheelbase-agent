@@ -16,7 +16,11 @@ log = logging.getLogger(__name__)
 
 def report_session_usage(db, session_key: str, identity) -> None:
     base = os.environ.get("WHEELBASE_INTERNAL_API", "").rstrip("/")
-    token = os.environ.get("WHEELBASE_GATEWAY_TOKEN", "")
+    # Same shared secret the backend knows as HERMES_GATEWAY_TOKEN; fall back
+    # to the dashboard session token so one env var can serve both purposes.
+    token = os.environ.get("WHEELBASE_GATEWAY_TOKEN", "") or os.environ.get(
+        "HERMES_DASHBOARD_SESSION_TOKEN", ""
+    )
     if not base or identity is None or db is None:
         return
 
