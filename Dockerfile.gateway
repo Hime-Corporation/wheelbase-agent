@@ -78,7 +78,11 @@ RUN if [ "${WITH_WB_SDK}" = "1" ] && [ -d vendor/wheelbase_sdk ]; then \
 # unless <dist>/index.html exists. The gateway is an API-only surface (the
 # backend broker speaks /api/ws + REST), so a stub index satisfies the check
 # without shipping node + the SPA toolchain in the image.
-RUN mkdir -p hermes_cli/web_dist && \
+# mount_spa mounts StaticFiles at both web_dist/ and web_dist/assets/, and
+# StaticFiles raises at construction if the directory is missing — so create
+# both (assets/ with a .keep so it survives the COPY/build) and a stub index.
+RUN mkdir -p hermes_cli/web_dist/assets && \
+    touch hermes_cli/web_dist/assets/.keep && \
     printf '<html><body>Wheelbase Agent Gateway — API only (no dashboard UI)</body></html>' \
       > hermes_cli/web_dist/index.html
 
