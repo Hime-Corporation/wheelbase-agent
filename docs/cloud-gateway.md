@@ -73,44 +73,42 @@ def should_require_auth(host: str, allow_public: bool) -> bool:
 
 `_LOOPBACK_HOST_VALUES = {"localhost", "127.0.0.1", "::1"}`.
 
-The gateway container starts with `--host 0.0.0.0` (not loopback) and without
-`--insecure` (`allow_public=False`), so `should_require_auth` returns `True` and
-`app.state.auth_required = True`. This engages the **gated** WS auth path.
+There are three WS auth modes (`_ws_auth_mode` in `web_server.py`):
 
-In gated mode (`_ws_auth_reason` in `web_server.py`):
+| Bind | `--insecure` | Mode | `?token=` WS auth |
+|------|-------------|------|-------------------|
+| loopback | n/a | `loopback` | accepted (constant-time) |
+| non-loopback | yes | `insecure` | accepted (constant-time) |
+| non-loopback | no | `gated` | **unconditionally rejected** (requires `?ticket=`/`?internal=`) |
 
-- The legacy `?token=<_SESSION_TOKEN>` query parameter is **unconditionally
-  rejected** — the SPA bundle no longer carries it, and a leaked token must not
-  grant WS access.
-- WS clients must use one of two credentials:
-  - `?ticket=<single-use>` — a browser-minted, 30-second-TTL ticket issued by
-    the dashboard SPA and consumed against the ticket store. This is what
-    browser-based or native UI clients use.
-  - `?internal=<process-credential>` — the per-process-lifetime internal
-    credential, used only by server-spawned WS clients (embedded PTY child
-    attaching to `/api/ws` and `/api/pub`). It is multi-use and never expires.
-
-For **HTTP API** endpoints (REST calls to `/api/status`, etc.), auth uses the
-`X-Hermes-Session-Token` header (or `Authorization: Bearer …`) containing the
-value of `HERMES_DASHBOARD_SESSION_TOKEN`.
-
-Gated mode requires at least one registered DashboardAuthProvider plugin. The
-`wheelbase_sdk` plugin (installed via `WITH_WB_SDK=1` build-arg) registers the
-Wheelbase provider which authenticates using `HERMES_DASHBOARD_SESSION_TOKEN`.
-
-**Summary — the correct non-loopback token-authenticated combination:**
+The Wheelbase backend chat broker authenticates its gateway dial with
+`ws://gateway:9320/api/ws?token=<HERMES_DASHBOARD_SESSION_TOKEN>` — the
+legacy token credential. Gated mode rejects that credential outright (and
+its `?ticket=` flow is a browser-SPA mint the broker cannot perform), so
+**the gateway container MUST run with `--insecure`**:
 
 ```
 python -m hermes_cli.main dashboard \
-    --no-open --host 0.0.0.0 --port 9320
-# (no --insecure flag)
-# WITH HERMES_DASHBOARD_SESSION_TOKEN set
-# WITH wheelbase_sdk plugin installed (provides the auth provider)
+    --no-open --insecure --host 0.0.0.0 --port 9320
+# WITH HERMES_DASHBOARD_SESSION_TOKEN set (high-entropy, shared with backend)
 ```
 
-This binds to all container interfaces, engages gated mode, and authenticates
-HTTP requests via `X-Hermes-Session-Token`. WS clients use tickets or the
-internal credential — not the raw session token.
+What `--insecure` actually means here: it skips the OAuth browser-login
+gate. It does NOT disable token auth — the WS upgrade still constant-time
+compares `?token=` against `HERMES_DASHBOARD_SESSION_TOKEN`, and HTTP API
+endpoints still require the `X-Hermes-Session-Token` header (or
+`Authorization: Bearer …`). This combination is acceptable only under the
+deployment invariants below:
+
+- the gateway port is **never published publicly** — it is reachable only on
+  the private Dokploy network, with the Go backend as the single public door
+  (spec §10);
+- `HERMES_DASHBOARD_SESSION_TOKEN` is a strong random secret (32+ bytes),
+  matching `HERMES_GATEWAY_TOKEN` on the backend.
+
+Do not "harden" this by removing `--insecure`: that flips the container into
+gated mode and silently breaks the backend broker (every chat connect returns
+502 because the gateway rejects the WS upgrade).
 
 ---
 

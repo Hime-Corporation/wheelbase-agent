@@ -86,15 +86,15 @@ EXPOSE 9320
 #                   container itself is on a private network; the
 #                   reverse proxy / backend handles external exposure)
 #
-# AUTH MODE: binding to 0.0.0.0 without --insecure causes
-# web_server.should_require_auth to return True (non-loopback host,
-# allow_public=False), engaging the OAuth auth gate.  In gated mode the
-# legacy ?token= WS path is rejected; WS clients must present either a
-# short-lived ?ticket= (browser SPA) or the process-lifetime ?internal=
-# credential (embedded PTY child).  HTTP API endpoints require the
-# X-Hermes-Session-Token header (valued to HERMES_DASHBOARD_SESSION_TOKEN).
-# Gated mode requires at least one DashboardAuthProvider plugin; the
-# wheelbase_sdk plugin (loaded via WITH_WB_SDK) registers the Wheelbase
-# provider backed by HERMES_DASHBOARD_SESSION_TOKEN for service-to-service
-# auth. See docs/cloud-gateway.md §Auth for the full auth-mode decision tree.
-CMD ["python", "-m", "hermes_cli.main", "dashboard", "--no-open", "--host", "0.0.0.0", "--port", "9320"]
+# AUTH MODE: --insecure is REQUIRED here. Without it, a 0.0.0.0 bind engages
+# the OAuth gate (should_require_auth → gated), which UNCONDITIONALLY rejects
+# the legacy ?token= WS credential — and the Wheelbase backend chat broker
+# authenticates exactly that way (ws://gateway:9320/api/ws?token=<shared>).
+# With --insecure the WS upgrade still enforces a constant-time comparison of
+# ?token= against HERMES_DASHBOARD_SESSION_TOKEN, and /api/* still requires
+# the X-Hermes-Session-Token header. "Insecure" refers to skipping the OAuth
+# browser-login gate, not to disabling token auth. This is acceptable ONLY
+# because the container is reachable solely on the private network (never
+# publish 9320) and the token is a high-entropy shared secret with the
+# backend. See docs/cloud-gateway.md §Auth for the full decision tree.
+CMD ["python", "-m", "hermes_cli.main", "dashboard", "--no-open", "--insecure", "--host", "0.0.0.0", "--port", "9320"]

@@ -5770,8 +5770,21 @@ def _(rid, params: dict) -> dict:
     task_id = f"bg_{uuid.uuid4().hex[:6]}"
 
     def run():
+        wb_cleanup = None
         session_tokens = _set_session_context(task_id, cwd=_session_cwd(session))
         try:
+            # Cloud gateway: background sub-agents must run under the same
+            # per-user scoping as the parent turn (SDK credential, CDP relay,
+            # sandbox volume). FAIL CLOSED: injection failure aborts the task
+            # via the except below — never unscoped execution (spec §5/§7).
+            wb_ident = session.get("wheelbase_identity")
+            if wb_ident is not None:
+                from tui_gateway.wheelbase_inject import apply_session_injection
+
+                wb_cleanup = apply_session_injection(
+                    task_id, wb_ident, Path(get_hermes_home())
+                )
+
             from run_agent import AIAgent
 
             result = AIAgent(
@@ -5799,6 +5812,11 @@ def _(rid, params: dict) -> dict:
                 {"task_id": task_id, "text": f"error: {e}"},
             )
         finally:
+            if wb_cleanup is not None:
+                try:
+                    wb_cleanup()
+                except Exception:
+                    logger.exception("wheelbase injection cleanup failed (background)")
             _clear_session_context(session_tokens)
 
     threading.Thread(target=run, daemon=True).start()
@@ -5867,6 +5885,7 @@ def _(rid, params: dict) -> dict:
     def run():
         # Pin the validated preview cwd, else the parent workspace — never an
         # invalid client path, which would silently fall back to the launch dir.
+        wb_cleanup = None
         session_tokens = _set_session_context(task_id, cwd=(preview_cwd or _session_cwd(session)))
         try:
             from run_agent import AIAgent
@@ -5874,6 +5893,19 @@ def _(rid, params: dict) -> dict:
 
             if preview_cwd:
                 register_task_env_overrides(task_id, {"cwd": preview_cwd})
+
+            # Cloud gateway: the hidden restart agent runs shell/file tools and
+            # must stay inside the user's sandbox + scoping. FAIL CLOSED via the
+            # except below. Injection runs after the preview cwd registration so
+            # its /workspace cwd wins for identified sessions (host paths are
+            # meaningless inside the per-user sandbox).
+            wb_ident = session.get("wheelbase_identity")
+            if wb_ident is not None:
+                from tui_gateway.wheelbase_inject import apply_session_injection
+
+                wb_cleanup = apply_session_injection(
+                    task_id, wb_ident, Path(get_hermes_home())
+                )
 
             history_note = (
                 f" (with {len(parent_history)} parent-session messages of context)"
@@ -5906,6 +5938,11 @@ def _(rid, params: dict) -> dict:
                 {"task_id": task_id, "text": f"error: {e}"},
             )
         finally:
+            if wb_cleanup is not None:
+                try:
+                    wb_cleanup()
+                except Exception:
+                    logger.exception("wheelbase injection cleanup failed (preview)")
             try:
                 from tools.terminal_tool import clear_task_env_overrides
 

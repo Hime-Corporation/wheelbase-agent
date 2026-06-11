@@ -13,7 +13,16 @@ import pytest
 from hermes_state import SessionDB
 from tui_gateway import server
 from tui_gateway.transport import bind_transport, reset_transport
+from tui_gateway import wheelbase_identity
 from tui_gateway.wheelbase_identity import WheelbaseIdentity
+
+
+@pytest.fixture(autouse=True)
+def _clear_jwt_cache():
+    """The module-level JWT cache must not leak across tests/files."""
+    yield
+    with wheelbase_identity._lock:
+        wheelbase_identity._jwt_by_user.clear()
 
 
 class _FakeTransport:
@@ -133,3 +142,60 @@ def test_identity_update_rejected_without_identity(_bound):
         {"id": 1, "method": "identity.update", "params": {"jwt": "x"}}
     )
     assert resp["error"]["code"] == 4030
+
+
+def test_prompt_background_fail_closed_on_injection_error(monkeypatch):
+    """prompt.background must abort (not run unscoped) when injection fails."""
+    import sys
+    import time as _time
+    import types
+
+    agent_constructed = []
+    fake_run_agent = types.ModuleType("run_agent")
+
+    class _FakeAgent:
+        def __init__(self, **kw):
+            agent_constructed.append(kw)
+
+        def run_conversation(self, **kw):
+            return "ran"
+
+    fake_run_agent.AIAgent = _FakeAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+    monkeypatch.setattr(server, "_background_agent_kwargs", lambda agent, task_id: {})
+
+    from tui_gateway import wheelbase_inject
+
+    def _boom(task_id, ident, home):
+        raise RuntimeError("sandbox unavailable")
+
+    monkeypatch.setattr(wheelbase_inject, "apply_session_injection", _boom)
+
+    events = []
+    monkeypatch.setattr(server, "_emit", lambda ev, sid, payload=None: events.append((ev, payload)))
+
+    sid = "bgtest1"
+    server._sessions[sid] = {
+        "agent": object(),
+        "session_key": "bg-session-key",
+        "wheelbase_identity": IDENT_A,
+        "cwd": "/tmp",
+        "history_lock": __import__("threading").Lock(),
+    }
+    try:
+        resp = server.handle_request(
+            {"id": 1, "method": "prompt.background", "params": {"session_id": sid, "text": "do it"}}
+        )
+        assert "result" in resp
+        deadline = _time.time() + 5
+        while _time.time() < deadline:
+            if any(ev == "background.complete" for ev, _ in events):
+                break
+            _time.sleep(0.02)
+        completes = [p for ev, p in events if ev == "background.complete"]
+        assert completes, "background task never completed"
+        assert "error" in completes[0]["text"]
+        assert "sandbox unavailable" in completes[0]["text"]
+        assert not agent_constructed, "agent ran despite failed injection (UNSCOPED EXECUTION)"
+    finally:
+        server._sessions.pop(sid, None)
