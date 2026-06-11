@@ -1077,6 +1077,17 @@ def _register_session_cwd(session: dict | None) -> None:
         pass
 
 
+def _transport_identity():
+    """Wheelbase identity bound to the current connection's transport.
+
+    Set by the WS layer for cloud-gateway connections (see
+    tui_gateway/wheelbase_identity.py); None for legacy desktop/TUI
+    connections, which keep single-user behavior everywhere below.
+    """
+    t = current_transport()
+    return getattr(t, "wheelbase_identity", None) if t is not None else None
+
+
 def _ensure_session_db_row(session: dict) -> None:
     """Idempotently persist the session's DB row on first real activity.
 
@@ -1113,12 +1124,14 @@ def _ensure_session_db_row(session: dict) -> None:
         close_db = False
     if db is None:
         return
+    ident = session.get("wheelbase_identity")
     try:
         db.create_session(
             key,
             source="tui",
             model=_resolve_model(),
             cwd=_session_cwd(session) if session.get("explicit_cwd") else None,
+            user_id=ident.user_id if ident is not None else None,
         )
     except Exception:
         logger.debug("failed to persist desktop session row", exc_info=True)
@@ -3349,6 +3362,7 @@ def _(rid, params: dict) -> dict:
             "tool_progress_mode": _load_tool_progress_mode(),
             "tool_started_at": {},
             "transport": current_transport() or _stdio_transport,
+            "wheelbase_identity": _transport_identity(),
         }
         _register_session_cwd(_sessions[sid])
     # NOTE: we intentionally do NOT persist a DB row here. Every TUI/desktop
@@ -3413,9 +3427,16 @@ def _(rid, params: dict) -> dict:
         # short; the compression-tip projection in ``list_sessions_rich``
         # can also merge rows.
         fetch_limit = max(limit * 2, 200)
+        # Cloud gateway: an identified connection only ever sees its own
+        # sessions; legacy connections (no identity) see everything.
+        ident = _transport_identity()
         rows = [
             s
-            for s in db.list_sessions_rich(source=None, limit=fetch_limit)
+            for s in db.list_sessions_rich(
+                source=None,
+                limit=fetch_limit,
+                user_id=ident.user_id if ident is not None else None,
+            )
             if (s.get("source") or "").strip().lower() not in deny
         ][:limit]
         return _ok(
@@ -3462,7 +3483,12 @@ def _(rid, params: dict) -> dict:
         # users (lots of recent ``tool`` rows) don't get a false
         # "no eligible session" answer.  ``session.list`` uses a
         # similar over-fetch strategy.
-        rows = db.list_sessions_rich(source=None, limit=200)
+        ident = _transport_identity()
+        rows = db.list_sessions_rich(
+            source=None,
+            limit=200,
+            user_id=ident.user_id if ident is not None else None,
+        )
         for row in rows:
             src = (row.get("source") or "").strip().lower()
             if src in deny:
@@ -3480,6 +3506,31 @@ def _(rid, params: dict) -> dict:
     except Exception:
         logger.exception("session.most_recent failed")
         return _ok(rid, {"session_id": None})
+
+
+@method("identity.update")
+def _(rid, params: dict) -> dict:
+    """Refresh the connection identity's Supabase JWT (cloud gateway only).
+
+    Only the backend chat broker can originate this frame — it strips any
+    client-sent identity.update before proxying (defense in depth: even a
+    forged frame could only refresh the *same* connection's own identity;
+    it can never change user_id, which is bound at upgrade time).
+    """
+    ident = _transport_identity()
+    if ident is None:
+        return _err(rid, 4030, "no identity on this connection")
+    jwt = str(params.get("jwt") or "").strip()
+    if not jwt:
+        return _err(rid, 4031, "jwt required")
+    try:
+        from tui_gateway.wheelbase_identity import update_user_jwt, write_credential_file
+
+        update_user_jwt(ident.user_id, jwt)
+        write_credential_file(Path(get_hermes_home()), ident)
+    except Exception as e:
+        return _err(rid, 5040, f"credential refresh failed: {e}")
+    return _ok(rid, {"ok": True})
 
 
 @method("session.resume")
@@ -3514,6 +3565,13 @@ def _(rid, params: dict) -> dict:
             target = found["id"]
         else:
             return _err(rid, 4007, "session not found")
+    # Ownership gate (cloud gateway): an identified connection may only
+    # resume rows it owns. Legacy rows (NULL user_id) are also denied to
+    # identified users. Respond exactly like a missing session so other
+    # users' session ids are not enumerable.
+    resume_ident = _transport_identity()
+    if resume_ident is not None and (found.get("user_id") or "") != resume_ident.user_id:
+        return _err(rid, 4007, "session not found")
     # Fast path: if the session is already live, reuse it under the lock.
     with _session_resume_lock:
         live = _find_live_session_by_key(target)
@@ -3594,6 +3652,9 @@ def _(rid, params: dict) -> dict:
             _init_session(sid, target, agent, history, cols=cols)
             if sid in _sessions:
                 _sessions[sid]["display_history_prefix"] = display_history_prefix
+                # Bind the resumed session to the resuming connection's
+                # identity (ownership was verified against the DB row above).
+                _sessions[sid]["wheelbase_identity"] = resume_ident
                 # Remember the profile home so each turn re-binds HERMES_HOME (the
                 # agent persists to its own db, but mid-turn home reads — memory,
                 # skills — must resolve to the resumed profile too).
