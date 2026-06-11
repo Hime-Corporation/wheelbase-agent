@@ -954,12 +954,24 @@ def register_task_env_overrides(task_id: str, overrides: Dict[str, Any]):
         - modal_image: str -- Path to Dockerfile or Docker Hub image name
         - docker_image: str -- Docker image name
         - cwd: str -- Working directory inside the sandbox
+        - docker_volumes: list[str] -- Docker -v specs (e.g. "vol:/workspace")
+        - docker_env: dict[str, str] -- Extra env vars injected into the container
 
     Args:
         task_id: The rollout's unique task identifier
         overrides: Dict of config keys to override
+
+    Note — merge semantics: this function *merges* the new overrides into any
+    previously registered overrides for the same task_id rather than replacing
+    them wholesale.  This lets different callers each own their slice of the
+    config without clobbering each other.  For example the cloud gateway
+    registers docker_volumes/docker_env once per session while the dashboard
+    server or ACP adapter later registers {"cwd": ...} — with merge both sets
+    coexist.  Callers that need to clear a key explicitly should pass the key
+    with a falsy value.
     """
-    _task_env_overrides[task_id] = overrides
+    existing = _task_env_overrides.get(task_id, {})
+    _task_env_overrides[task_id] = {**existing, **overrides}
 
     # If a live environment already exists for this task, a freshly registered
     # ``cwd`` override (e.g. the ACP client switching the editor's project root
@@ -1019,7 +1031,7 @@ def _resolve_container_task_id(task_id: Optional[str]) -> str:
     """
     _ISOLATION_KEYS = frozenset({
         "docker_image", "modal_image", "singularity_image",
-        "daytona_image", "env_type",
+        "daytona_image", "env_type", "docker_volumes",
     })
     if task_id and task_id in _task_env_overrides:
         overrides = _task_env_overrides[task_id]
@@ -1967,16 +1979,24 @@ def terminal_tool(
 
                         container_config = None
                         if env_type in {"docker", "singularity", "modal", "daytona"}:
+                            # Merge per-task docker_volumes (append) and docker_env
+                            # (task values win) so the cloud gateway's per-user
+                            # sandbox settings coexist with global TERMINAL_DOCKER_*
+                            # env vars.
+                            task_volumes = overrides.get("docker_volumes") or []
+                            task_docker_env = overrides.get("docker_env") or {}
+                            merged_volumes = list(config.get("docker_volumes", [])) + list(task_volumes)
+                            merged_docker_env = {**config.get("docker_env", {}), **task_docker_env}
                             container_config = {
                                 "container_cpu": config.get("container_cpu", 1),
                                 "container_memory": config.get("container_memory", 5120),
                                 "container_disk": config.get("container_disk", 51200),
                                 "container_persistent": config.get("container_persistent", True),
                                 "modal_mode": config.get("modal_mode", "auto"),
-                                "docker_volumes": config.get("docker_volumes", []),
+                                "docker_volumes": merged_volumes,
                                 "docker_mount_cwd_to_workspace": config.get("docker_mount_cwd_to_workspace", False),
                                 "docker_forward_env": config.get("docker_forward_env", []),
-                                "docker_env": config.get("docker_env", {}),
+                                "docker_env": merged_docker_env,
                                 "docker_run_as_host_user": config.get("docker_run_as_host_user", False),
                                 "docker_extra_args": config.get("docker_extra_args", []),
                                 "docker_persist_across_processes": config.get("docker_persist_across_processes", True),
