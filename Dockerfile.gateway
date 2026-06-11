@@ -1,0 +1,114 @@
+# Cloud dealership gateway (one container per dealership) — spec §4.
+# Required env:
+#   HERMES_HOME=/data/hermes        state volume
+#   HERMES_DASHBOARD_SESSION_TOKEN  shared with backend (HERMES_GATEWAY_TOKEN)
+#   OPENROUTER_API_KEY              central Wheelbase key (spec §9)
+#   SUPABASE_URL / SUPABASE_ANON_KEY / WHEELBASE_GO_API_ORIGIN
+#   WHEELBASE_INTERNAL_API          http://backend:8091 (usage sink + CDP relay base)
+#   WHEELBASE_GATEWAY_TOKEN         same shared token (usage sink auth)
+#   TERMINAL_ENV=docker             per-user sandboxes (spec §7)
+#   DOCKER_HOST                     scoped daemon (rootless DinD / dedicated host —
+#                                   NEVER the host's /var/run/docker.sock, spec §10)
+#   TERMINAL_DOCKER_IMAGE           sandbox image
+#   WHEELBASE_WORKSPACE_VOLUME_PREFIX  optional volume name prefix (default wb-ws-)
+
+FROM python:3.11-slim
+
+ENV PYTHONUNBUFFERED=1
+ENV HERMES_HOME=/data/hermes
+
+# System deps: git (required for skills/plugin update), curl (health checks /
+# script downloads), docker CLI (TERMINAL_ENV=docker shells out to `docker`
+# to spawn per-user sandbox containers).
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        git \
+        curl \
+        docker.io \
+        ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
+WORKDIR /opt/hermes-gateway
+
+# ---------- Layer-cached Python dependency install ----------
+# Copy manifests first so pip install is cached unless they change.
+COPY pyproject.toml ./
+# uv.lock is present in the repo; copy it for reproducible installs.
+COPY uv.lock* ./
+# README referenced by pyproject.toml metadata
+COPY README.md* ./
+
+# Install pip + the package with all extras needed for gateway operation.
+# messaging: Slack/Discord/Telegram gateway transports
+# anthropic, bedrock, azure-identity: provider SDKs (no runtime lazy-install
+#   inside a container without PyPI access)
+# We use pip rather than uv here to keep the gateway image dependency-light;
+# the full dev image (Dockerfile) uses uv + s6-overlay.
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir -e ".[all,messaging,anthropic]"
+
+# ---------- Source code ----------
+COPY . .
+
+# Re-run editable install so the egg-link captures the full source tree
+# (the first install above only had pyproject.toml + README).
+RUN pip install --no-cache-dir --no-deps -e "."
+
+# ---------- Optional: wheelbase_sdk plugin ----------
+# The sibling wheelbase-app repo ships a hermes plugin (wheelbase_sdk) that
+# provides Wheelbase-specific tools (inventory lookup, dealership context, etc.).
+# The umbrella build script is expected to copy it to vendor/wheelbase_sdk/
+# before running `docker build -f Dockerfile.gateway` so the plugin lands in the
+# image. When the directory is absent (bare hermes-agent checkout) the COPY is
+# skipped — a RUN guard rather than a plain COPY prevents build failure.
+# The umbrella CI step is:
+#   cp -r ../wheelbase-app/hermes-plugins/wheelbase_sdk vendor/wheelbase_sdk
+#   docker build -f Dockerfile.gateway --build-arg WITH_WB_SDK=1 ...
+ARG WITH_WB_SDK=0
+RUN if [ "${WITH_WB_SDK}" = "1" ] && [ -d vendor/wheelbase_sdk ]; then \
+        pip install --no-cache-dir --no-deps vendor/wheelbase_sdk && \
+        echo "wheelbase_sdk installed from vendor/"; \
+    else \
+        echo "wheelbase_sdk vendor dir absent or WITH_WB_SDK!=1, skipping"; \
+    fi
+
+# ---------- Web dist stub ----------
+# The dashboard insists on a web dist: without --skip-build it shells out to
+# npm/vite (no node in this image -> exit 1); with --skip-build it exits
+# unless <dist>/index.html exists. The gateway is an API-only surface (the
+# backend broker speaks /api/ws + REST), so a stub index satisfies the check
+# without shipping node + the SPA toolchain in the image.
+# mount_spa mounts StaticFiles at both web_dist/ and web_dist/assets/, and
+# StaticFiles raises at construction if the directory is missing — so create
+# both (assets/ with a .keep so it survives the COPY/build) and a stub index.
+RUN mkdir -p hermes_cli/web_dist/assets && \
+    touch hermes_cli/web_dist/assets/.keep && \
+    printf '<html><body>Wheelbase Agent Gateway — API only (no dashboard UI)</body></html>' \
+      > hermes_cli/web_dist/index.html
+
+# ---------- Data volume ----------
+RUN mkdir -p /data/hermes
+VOLUME ["/data/hermes"]
+
+# Dashboard on a fixed port so Dokploy / docker-compose can map it inside
+# the private dealership network. Never publish this port publicly.
+EXPOSE 9320
+
+# Run the dashboard server:
+#   --no-open   skip browser launch (headless container)
+#   --host 0.0.0.0  bind to all interfaces inside the container (the
+#                   container itself is on a private network; the
+#                   reverse proxy / backend handles external exposure)
+#
+# AUTH MODE: --insecure is REQUIRED here. Without it, a 0.0.0.0 bind engages
+# the OAuth gate (should_require_auth → gated), which UNCONDITIONALLY rejects
+# the legacy ?token= WS credential — and the Wheelbase backend chat broker
+# authenticates exactly that way (ws://gateway:9320/api/ws?token=<shared>).
+# With --insecure the WS upgrade still enforces a constant-time comparison of
+# ?token= against HERMES_DASHBOARD_SESSION_TOKEN, and /api/* still requires
+# the X-Hermes-Session-Token header. "Insecure" refers to skipping the OAuth
+# browser-login gate, not to disabling token auth. This is acceptable ONLY
+# because the container is reachable solely on the private network (never
+# publish 9320) and the token is a high-entropy shared secret with the
+# backend. See docs/cloud-gateway.md §Auth for the full decision tree.
+CMD ["python", "-m", "hermes_cli.main", "dashboard", "--no-open", "--insecure", "--skip-build", "--host", "0.0.0.0", "--port", "9320"]

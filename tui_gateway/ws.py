@@ -30,6 +30,7 @@ import socket
 from typing import Any
 
 from tui_gateway import server
+from tui_gateway.wheelbase_identity import _attach_identity_to_transport
 
 _log = logging.getLogger(__name__)
 
@@ -175,6 +176,7 @@ async def handle_ws(ws: Any) -> None:
         _log.info("ws accepted peer=%s", peer)
 
         transport = WSTransport(ws, asyncio.get_running_loop(), peer=peer)
+        _attach_identity_to_transport(ws, transport)
 
         ready_ok = await transport.write_async(
             {

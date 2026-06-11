@@ -281,17 +281,37 @@ def _resolve_cdp_override(cdp_url: str) -> str:
     return raw
 
 
-def _get_cdp_override() -> str:
+_task_cdp_urls: dict[str, str] = {}
+_task_cdp_lock = threading.Lock()
+
+
+def register_task_cdp_url(task_id: str, url: str) -> None:
+    """Per-task CDP endpoint for the multi-user cloud gateway. Overrides the
+    process-global BROWSER_CDP_URL/browser.cdp_url for this task only."""
+    with _task_cdp_lock:
+        if url:
+            _task_cdp_urls[task_id] = url
+        else:
+            _task_cdp_urls.pop(task_id, None)
+
+
+def _get_cdp_override(task_id: str = "default") -> str:
     """Return a normalized CDP URL override, or empty string.
 
     Precedence is:
+    0. Per-task registry (``register_task_cdp_url``) — multi-user cloud gateway
     1. ``BROWSER_CDP_URL`` env var (live override from ``/browser connect``)
     2. ``browser.cdp_url`` in config.yaml (persistent config)
 
-    When either is set, we skip both Browserbase and the local headless
+    When any is set, we skip both Browserbase and the local headless
     launcher and connect directly to the supplied Chrome DevTools Protocol
     endpoint.
     """
+    with _task_cdp_lock:
+        task_url = _task_cdp_urls.get(task_id, "")
+    if task_url:
+        return _resolve_cdp_override(task_url)
+
     env_override = os.environ.get("BROWSER_CDP_URL", "").strip()
     if env_override:
         return _resolve_cdp_override(env_override)
@@ -364,7 +384,7 @@ def _ensure_cdp_supervisor(task_id: str) -> None:
     the browser session itself.  The agent simply won't see
     ``pending_dialogs`` / ``frame_tree`` fields in snapshots.
     """
-    cdp_url = _get_cdp_override()
+    cdp_url = _get_cdp_override(task_id)
     if not cdp_url:
         # Fallback: active session may carry a per-session CDP URL from a
         # cloud provider (Browserbase sets this).
@@ -1077,7 +1097,7 @@ def _navigation_session_key(task_id: str, url: str) -> str:
     """
     if task_id is None:
         task_id = "default"
-    if _get_cdp_override():
+    if _get_cdp_override(task_id):
         return task_id
     if _is_camofox_mode():
         return task_id
@@ -1689,7 +1709,7 @@ def _get_session_info(task_id: Optional[str] = None) -> Dict[str, str]:
     force_local = _is_local_sidecar_key(task_id)
 
     # Create session outside the lock (network call in cloud mode)
-    cdp_override = _get_cdp_override()
+    cdp_override = _get_cdp_override(task_id)
     if cdp_override and not force_local:
         session_info = _create_cdp_session(task_id, cdp_override)
     elif force_local:

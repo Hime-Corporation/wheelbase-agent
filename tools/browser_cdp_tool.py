@@ -68,19 +68,20 @@ def _run_async(coro):
 # ---------------------------------------------------------------------------
 
 
-def _resolve_cdp_endpoint() -> str:
+def _resolve_cdp_endpoint(task_id: str = "default") -> str:
     """Return the normalized CDP WebSocket URL, or empty string if unavailable.
 
     Delegates to ``tools.browser_tool._get_cdp_override`` so precedence stays
     consistent with the rest of the browser tool surface:
 
-    1. ``BROWSER_CDP_URL`` env var (live override from ``/browser connect``)
-    2. ``browser.cdp_url`` in ``config.yaml``
+    1. Per-task registry (multi-user cloud gateway, ``register_task_cdp_url``)
+    2. ``BROWSER_CDP_URL`` env var (live override from ``/browser connect``)
+    3. ``browser.cdp_url`` in ``config.yaml``
     """
     try:
         from tools.browser_tool import _get_cdp_override  # type: ignore[import-not-found]
 
-        return (_get_cdp_override() or "").strip()
+        return (_get_cdp_override(task_id) or "").strip()
     except Exception as exc:  # pragma: no cover — defensive
         logger.debug("browser_cdp: failed to resolve CDP endpoint: %s", exc)
         return ""
@@ -339,7 +340,8 @@ def browser_cdp(
             params=params,
             timeout=timeout,
         )
-    del task_id  # stateless path below
+    # Stateless path below still honors per-task CDP scoping (cloud gateway).
+    cdp_task_id = task_id or "default"
 
     if not method or not isinstance(method, str):
         return tool_error(
@@ -353,7 +355,7 @@ def browser_cdp(
             "Install it with: pip install websockets"
         )
 
-    endpoint = _resolve_cdp_endpoint()
+    endpoint = _resolve_cdp_endpoint(cdp_task_id)
     if not endpoint:
         return tool_error(
             "No CDP endpoint is available. Run '/browser connect' to attach "
