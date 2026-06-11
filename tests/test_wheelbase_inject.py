@@ -98,6 +98,29 @@ def test_refused_without_docker_sandbox(tmp_path, monkeypatch):
     apply_session_injection("task-a", IDENT_A, tmp_path)()
 
 
+def test_daytona_mode_per_user_sandbox(tmp_path, monkeypatch):
+    """In daytona mode each user gets ONE stable sandbox key (persistent
+    workspace IS the sandbox); turns never resolve to another user's sandbox,
+    and no docker volume is registered."""
+    from tui_gateway.wheelbase_inject import user_sandbox_key
+
+    monkeypatch.setenv("TERMINAL_ENV", "daytona")
+    apply_session_injection("task-a", IDENT_A, tmp_path)()
+    apply_session_injection("task-b", IDENT_B, tmp_path)()
+
+    ov_a = terminal_tool._task_env_overrides["task-a"]
+    ov_b = terminal_tool._task_env_overrides["task-b"]
+    assert ov_a["sandbox_key"] == user_sandbox_key(IDENT_A.user_id)
+    assert ov_b["sandbox_key"] == user_sandbox_key(IDENT_B.user_id)
+    assert ov_a["sandbox_key"] != ov_b["sandbox_key"]
+    # Daytona persists via the sandbox itself — no bind-mounted volume.
+    assert "docker_volumes" not in ov_a and "docker_volumes" not in ov_b
+
+    # Every turn for a user collapses to that user's own sandbox, never shared.
+    assert terminal_tool._resolve_container_task_id("task-a") == user_sandbox_key(IDENT_A.user_id)
+    assert terminal_tool._resolve_container_task_id("task-b") == user_sandbox_key(IDENT_B.user_id)
+
+
 def test_jwt_refresh_only_touches_own_user(tmp_path):
     apply_session_injection("task-a", IDENT_A, tmp_path)()
     apply_session_injection("task-b", IDENT_B, tmp_path)()

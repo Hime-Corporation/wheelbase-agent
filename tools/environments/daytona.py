@@ -47,9 +47,13 @@ class DaytonaEnvironment(BaseEnvironment):
         disk: int = 10240,
         persistent_filesystem: bool = True,
         task_id: str = "default",
+        always_on: bool = False,
     ):
         requested_cwd = cwd
         super().__init__(cwd=cwd, timeout=timeout)
+        # Honoured by the terminal-tool idle reaper: an always-on sandbox is
+        # kept warm (never stopped on idle) for instant next-turn response.
+        self._always_on = always_on
 
         try:
             from tools.lazy_deps import ensure as _lazy_ensure
@@ -140,6 +144,17 @@ class DaytonaEnvironment(BaseEnvironment):
         except Exception:
             pass
         logger.info("Daytona: resolved home to %s, cwd to %s", self._remote_home, self.cwd)
+
+        # Ensure the working directory exists. In docker mode /workspace is a
+        # bind-mounted volume that always exists; a Daytona sandbox has no such
+        # mount, so a requested cwd (e.g. the cloud gateway's /workspace) must be
+        # created or every command would fail with "no such file or directory".
+        # The sandbox is persistent, so this dir survives stop/start like the
+        # rest of the filesystem.
+        try:
+            self._sandbox.process.exec(f"mkdir -p {shlex.quote(self.cwd)}")
+        except Exception as e:
+            logger.warning("Daytona: could not create cwd %s: %s", self.cwd, e)
 
         self._sync_manager = FileSyncManager(
             get_files_fn=lambda: iter_sync_files(f"{self._remote_home}/.hermes"),

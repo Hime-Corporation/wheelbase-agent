@@ -28,6 +28,20 @@ logger = logging.getLogger(__name__)
 
 SANDBOX_MOUNT = "/workspace"
 
+# Terminal backends that isolate shell execution off the gateway host, so a
+# multi-user turn cannot read the gateway's filesystem or another user's data:
+#   docker      — per-user container (+ per-user volume) on a scoped daemon
+#   daytona     — per-user cloud sandbox (own kernel/fs/network), spec §7
+#   modal       — per-task serverless sandbox
+#   singularity — rootless container
+# `local` runs ON the gateway host and `ssh` lands every user on one shared
+# remote host — both are unsafe for multi-tenant and are refused below.
+SANDBOXED_TERMINAL_ENVS = frozenset({"docker", "daytona", "modal", "singularity"})
+
+
+def _terminal_env() -> str:
+    return (os.environ.get("TERMINAL_ENV", "local") or "local").strip().lower()
+
 
 def workspace_volume(user_id: str) -> str:
     """Stable per-user docker volume name (persistent workspace, spec §8.2)."""
@@ -35,18 +49,34 @@ def workspace_volume(user_id: str) -> str:
     return f"{prefix}{user_id}"
 
 
-def _require_docker_sandbox() -> None:
-    terminal_env = (os.environ.get("TERMINAL_ENV", "local") or "local").strip().lower()
-    if terminal_env == "docker":
-        return
+def user_sandbox_key(user_id: str) -> str:
+    """Stable per-user sandbox key (daytona/non-volume backends).
+
+    Returned by ``terminal_tool._resolve_container_task_id`` so every turn for
+    one user reuses ONE sandbox (``hermes-<key>``) instead of spawning a fresh
+    per-turn sandbox. Persistence for daytona is the sandbox itself (stop/start
+    preserves the filesystem), not a separate mounted volume as in docker mode.
+    """
+    prefix = os.environ.get("WHEELBASE_SANDBOX_KEY_PREFIX", "wb-")
+    return f"{prefix}{user_id}"
+
+
+def _require_sandboxed_env() -> str:
+    """Refuse an identified turn unless the terminal backend isolates execution
+    off the gateway host. Returns the resolved terminal env on success."""
+    terminal_env = _terminal_env()
+    if terminal_env in SANDBOXED_TERMINAL_ENVS:
+        return terminal_env
     if os.environ.get("WHEELBASE_ALLOW_UNSANDBOXED", "") == "1":
         logger.warning(
-            "identified session running WITHOUT docker sandbox "
-            "(WHEELBASE_ALLOW_UNSANDBOXED=1 — dev/test only)"
+            "identified session running WITHOUT a sandbox (TERMINAL_ENV=%s, "
+            "WHEELBASE_ALLOW_UNSANDBOXED=1 — dev/test only)",
+            terminal_env,
         )
-        return
+        return terminal_env
     raise RuntimeError(
-        "multi-user session refused: TERMINAL_ENV must be 'docker' on a cloud "
+        f"multi-user session refused: TERMINAL_ENV={terminal_env!r} is not "
+        f"sandboxed; must be one of {sorted(SANDBOXED_TERMINAL_ENVS)} on a cloud "
         "gateway (spec §7); set WHEELBASE_ALLOW_UNSANDBOXED=1 only for local dev"
     )
 
@@ -60,7 +90,7 @@ def apply_session_injection(
     if not task_id or identity is None or not identity.user_id:
         raise ValueError("session injection requires a task_id and an identified user")
 
-    _require_docker_sandbox()
+    terminal_env = _require_sandboxed_env()
 
     # 1. Session-scoped Supabase JWT for the Wheelbase SDK (RLS scoping,
     #    spec §5.1.1). Freshest JWT wins (identity.update may have rotated it).
@@ -92,22 +122,40 @@ def apply_session_injection(
 
     register_task_cdp_url(task_id, identity.cdp_url or "")
 
-    # 3. Per-user docker sandbox: own volume mounted at /workspace (spec §7).
-    #    register_task_env_overrides MERGES, so the dashboard's cwd
-    #    registration earlier in the turn is overridden by ours, not lost.
+    # 3. Per-user sandbox (spec §7). register_task_env_overrides MERGES, so the
+    #    dashboard's cwd registration earlier in the turn is overridden by ours,
+    #    not lost. The override shape depends on how the backend persists:
+    #      - daytona: persistence IS the sandbox. Pin a stable per-user
+    #        sandbox_key so every turn reuses ONE cloud sandbox
+    #        (hermes-wb-<uid>) rather than spawning a per-turn sandbox; there is
+    #        no separate volume to mount. sandbox_key is an isolation key, so
+    #        _resolve_container_task_id returns it and the env caches per-user.
+    #      - docker (and other volume-mount backends): per-turn container that
+    #        mounts the user's own named volume at /workspace.
     from tools.terminal_tool import register_task_env_overrides
 
-    register_task_env_overrides(
-        task_id,
-        {
-            "cwd": SANDBOX_MOUNT,
-            "docker_volumes": [f"{workspace_volume(identity.user_id)}:{SANDBOX_MOUNT}"],
-            "docker_env": {
-                "WHEELBASE_USER_ID": identity.user_id,
-                "WHEELBASE_DEALERSHIP_ID": identity.dealership_id,
+    sandbox_env = {
+        "WHEELBASE_USER_ID": identity.user_id,
+        "WHEELBASE_DEALERSHIP_ID": identity.dealership_id,
+    }
+    if terminal_env == "daytona":
+        register_task_env_overrides(
+            task_id,
+            {
+                "cwd": SANDBOX_MOUNT,
+                "sandbox_key": user_sandbox_key(identity.user_id),
+                "docker_env": sandbox_env,
             },
-        },
-    )
+        )
+    else:
+        register_task_env_overrides(
+            task_id,
+            {
+                "cwd": SANDBOX_MOUNT,
+                "docker_volumes": [f"{workspace_volume(identity.user_id)}:{SANDBOX_MOUNT}"],
+                "docker_env": sandbox_env,
+            },
+        )
 
     def cleanup() -> None:
         if wb_runtime is not None and sdk_token is not None:

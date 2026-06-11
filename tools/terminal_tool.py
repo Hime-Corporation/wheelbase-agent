@@ -1035,6 +1035,15 @@ def _resolve_container_task_id(task_id: Optional[str]) -> str:
     })
     if task_id and task_id in _task_env_overrides:
         overrides = _task_env_overrides[task_id]
+        # An explicit per-user sandbox_key (cloud gateway, daytona mode) pins a
+        # stable container/sandbox key so every turn for one user reuses ONE
+        # sandbox instead of the per-turn task_id. This is what gives daytona
+        # cross-turn persistence (the sandbox itself is the workspace) AND keeps
+        # users isolated — the key is derived solely from the authenticated
+        # user_id, never another user's.
+        sandbox_key = overrides.get("sandbox_key")
+        if sandbox_key:
+            return sandbox_key
         if set(overrides.keys()) & _ISOLATION_KEYS:
             return task_id
     return "default"
@@ -1126,6 +1135,10 @@ def _get_env_config() -> Dict[str, Any]:
         "singularity_image": os.getenv("TERMINAL_SINGULARITY_IMAGE", f"docker://{default_image}"),
         "modal_image": os.getenv("TERMINAL_MODAL_IMAGE", default_image),
         "daytona_image": os.getenv("TERMINAL_DAYTONA_IMAGE", default_image),
+        # Keep daytona sandboxes warm across idle periods (spec §7 always-on
+        # knob). When true the idle reaper never stops them — instant next-turn
+        # response at the cost of continuous billing while a user is active.
+        "daytona_always_on": os.getenv("TERMINAL_DAYTONA_ALWAYS_ON", "false").lower() in {"true", "1", "yes"},
         "cwd": cwd,
         "host_cwd": host_cwd,
         "docker_mount_cwd_to_workspace": mount_docker_cwd,
@@ -1311,6 +1324,7 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
             image=image, cwd=cwd, timeout=timeout,
             cpu=int(cpu), memory=memory, disk=disk,
             persistent_filesystem=persistent, task_id=task_id,
+            always_on=(container_config or {}).get("daytona_always_on", False),
         )
 
     elif env_type == "ssh":
@@ -1355,6 +1369,15 @@ def _cleanup_inactive_envs(lifetime_seconds: int = 300):
     with _env_lock:
         for task_id, last_time in list(_last_activity.items()):
             if current_time - last_time > lifetime_seconds:
+                # Always-on sandboxes (e.g. cloud-gateway daytona per-user
+                # workspaces, spec §7) are never reaped on idle: the user
+                # expects instant response on their next turn, and the backend
+                # bills for keeping them warm. Refresh their timestamp instead
+                # of tearing them down.
+                env = _active_environments.get(task_id)
+                if env is not None and getattr(env, "_always_on", False):
+                    _last_activity[task_id] = current_time
+                    continue
                 env = _active_environments.pop(task_id, None)
                 _last_activity.pop(task_id, None)
                 if env is not None:
@@ -1992,6 +2015,7 @@ def terminal_tool(
                                 "container_memory": config.get("container_memory", 5120),
                                 "container_disk": config.get("container_disk", 51200),
                                 "container_persistent": config.get("container_persistent", True),
+                                "daytona_always_on": config.get("daytona_always_on", False),
                                 "modal_mode": config.get("modal_mode", "auto"),
                                 "docker_volumes": merged_volumes,
                                 "docker_mount_cwd_to_workspace": config.get("docker_mount_cwd_to_workspace", False),
