@@ -4909,6 +4909,7 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
         session_tokens = []
         home_token = None  # per-turn HERMES_HOME override for a resumed remote profile
         goal_followup = None  # set by the post-turn goal hook below
+        wb_inject_cleanup = None  # resets the SDK identity context (thread reuse)
         try:
             from tools.approval import (
                 reset_current_session_key,
@@ -4929,6 +4930,18 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
             _wire_callbacks(sid)
             cwd = _session_cwd(session)
             _register_session_cwd(session)
+            # Cloud gateway: bind this turn's task_id to the session's user —
+            # SDK credential, browser CDP endpoint, docker sandbox volume
+            # (spec §5). FAIL CLOSED: if injection raises, the exception
+            # propagates and the turn never reaches the agent loop; an
+            # identified session must never run unscoped.
+            wb_ident = session.get("wheelbase_identity")
+            if wb_ident is not None:
+                from tui_gateway.wheelbase_inject import apply_session_injection
+
+                wb_inject_cleanup = apply_session_injection(
+                    session["session_key"], wb_ident, Path(get_hermes_home())
+                )
             cols = session.get("cols", 80)
             streamer = make_stream_renderer(cols)
             prompt = text
@@ -5248,6 +5261,11 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                     reset_current_session_key(approval_token)
             except Exception:
                 pass
+            if wb_inject_cleanup is not None:
+                try:
+                    wb_inject_cleanup()
+                except Exception:
+                    logger.exception("wheelbase injection cleanup failed")
             if home_token is not None:
                 reset_hermes_home_override(home_token)
             _clear_session_context(session_tokens)
