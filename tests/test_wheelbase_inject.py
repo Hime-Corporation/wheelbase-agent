@@ -7,25 +7,13 @@ other's.
 from __future__ import annotations
 
 import json
-import sys
-from pathlib import Path
 
 import pytest
 
 from tools import browser_tool, terminal_tool
 from tui_gateway.wheelbase_identity import WheelbaseIdentity, update_user_jwt
 from tui_gateway.wheelbase_inject import apply_session_injection, workspace_volume
-
-# The wheelbase_sdk plugin lives in the sibling wheelbase-app repo; make it
-# importable when the umbrella checkout is present so the SDK context path
-# is exercised too (otherwise those assertions are skipped).
-_SDK_DIR = Path(__file__).resolve().parents[2] / "wheelbase-app" / "hermes-plugins" / "wheelbase_sdk"
-if _SDK_DIR.is_dir() and str(_SDK_DIR) not in sys.path:
-    sys.path.insert(0, str(_SDK_DIR))
-try:
-    from wheelbase_sdk import runtime as wb_runtime
-except ImportError:  # pragma: no cover - bare checkout
-    wb_runtime = None
+from wheelbase_sdk import runtime as wb_runtime
 
 IDENT_A = WheelbaseIdentity(
     user_id="user-aaaa", tenant_id="t1", dealership_id="d1",
@@ -46,10 +34,9 @@ def _sandboxed_env(monkeypatch):
     for t in ("task-a", "task-b"):
         browser_tool.register_task_cdp_url(t, "")
         terminal_tool._task_env_overrides.pop(t, None)
-    if wb_runtime is not None:
-        wb_runtime.clear_task("task-a")
-        wb_runtime.clear_task("task-b")
-        wb_runtime._current.set(None)
+    wb_runtime.clear_task("task-a")
+    wb_runtime.clear_task("task-b")
+    wb_runtime._current.set(None)
 
 
 def test_two_users_no_cross_bleed(tmp_path):
@@ -77,7 +64,6 @@ def test_two_users_no_cross_bleed(tmp_path):
     cleanup_b()
 
 
-@pytest.mark.skipif(wb_runtime is None, reason="wheelbase_sdk not importable")
 def test_sdk_context_set_and_reset(tmp_path):
     cleanup = apply_session_injection("task-a", IDENT_A, tmp_path)
     ident = wb_runtime.current_identity()
