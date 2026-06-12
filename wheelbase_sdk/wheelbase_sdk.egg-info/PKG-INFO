@@ -1,6 +1,0 @@
-Metadata-Version: 2.4
-Name: wheelbase_sdk
-Version: 0.1.0
-Summary: Shared client for Wheelbase Hermes plugins — Supabase PostgREST + Go API, authed via the per-request session token.
-Requires-Python: >=3.11
-Requires-Dist: httpx>=0.27
