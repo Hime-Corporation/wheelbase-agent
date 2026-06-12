@@ -1,0 +1,18 @@
+name: wheelbase-auction-browser
+version: 1.0.0
+description: >
+  Activates Wheelbase auction-browser system-prompt addendum and IMX context
+  when the auction-browser marker file is present in the agent workspace.
+  Provides tools for listing auctions, runlists, IMX scores, and acting on cars.
+author: Wheelbase
+provides_tools:
+  - list_auctions
+  - list_runlists
+  - get_runlist
+  - top_imx_picks
+  - explain_imx
+  - refresh_runlist
+  - flag_car
+  - vote_on_car
+provides_hooks:
+  - pre_llm_call

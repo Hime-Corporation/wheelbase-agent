@@ -1,0 +1,17 @@
+name: wheelbase-demand-matrix
+version: 1.0.0
+description: >
+  Activates Wheelbase demand-matrix system-prompt addendum and workspace context
+  when the demand-matrix marker file (.wheelbase-demand-matrix-active) is present
+  in the agent workspace. Provides 7 tools gated on the marker file.
+author: Wheelbase
+provides_tools:
+  - read_demand_matrix
+  - read_inventory_summary
+  - read_unlabeled_cars
+  - propose_demand_targets
+  - save_demand_overrides
+  - save_inventory_demand_labels
+  - complete_demand_matrix_setup
+provides_hooks:
+  - pre_llm_call

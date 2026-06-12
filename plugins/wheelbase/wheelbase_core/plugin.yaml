@@ -1,0 +1,21 @@
+name: wheelbase-core
+version: 1.0.0
+description: Wheelbase dealership tools — inventory, runlists, work orders, inspections, and vendors. Queries Supabase (RLS) + the Wheelbase Go API using the signed-in user's session.
+author: Wheelbase
+provides_tools:
+  - get_car
+  - inventory_search
+  - update_inventory_status
+  - list_runlists
+  - get_runlist_cars
+  - assess_runlist
+  - archive_runlist_cars
+  - create_work_order
+  - get_work_order
+  - delete_work_order
+  - create_inspection_note
+  - bulk_inspect
+  - list_vendors
+  - get_vendor
+  - send_to_vendor
+  - generate_demand_score

@@ -1,0 +1,13 @@
+name: wheelbase-onboarding
+version: 1.0.0
+description: >
+  Activates Wheelbase onboarding system-prompt addendum and dealership context
+  when the onboarding marker file (.wheelbase-onboarding-active) is present in
+  the agent workspace. Provides the clutch_react and complete_onboarding tools,
+  gated on the marker file.
+author: Wheelbase
+provides_tools:
+  - clutch_react
+  - complete_onboarding
+provides_hooks:
+  - pre_llm_call
