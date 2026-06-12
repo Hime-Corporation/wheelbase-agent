@@ -57,23 +57,12 @@ COPY . .
 # (the first install above only had pyproject.toml + README).
 RUN pip install --no-cache-dir --no-deps -e "."
 
-# ---------- Optional: wheelbase_sdk plugin ----------
-# The sibling wheelbase-app repo ships a hermes plugin (wheelbase_sdk) that
-# provides Wheelbase-specific tools (inventory lookup, dealership context, etc.).
-# The umbrella build script is expected to copy it to vendor/wheelbase_sdk/
-# before running `docker build -f Dockerfile.gateway` so the plugin lands in the
-# image. When the directory is absent (bare hermes-agent checkout) the COPY is
-# skipped — a RUN guard rather than a plain COPY prevents build failure.
-# The umbrella CI step is:
-#   cp -r ../wheelbase-app/hermes-plugins/wheelbase_sdk vendor/wheelbase_sdk
-#   docker build -f Dockerfile.gateway --build-arg WITH_WB_SDK=1 ...
-ARG WITH_WB_SDK=0
-RUN if [ "${WITH_WB_SDK}" = "1" ] && [ -d vendor/wheelbase_sdk ]; then \
-        pip install --no-cache-dir --no-deps vendor/wheelbase_sdk && \
-        echo "wheelbase_sdk installed from vendor/"; \
-    else \
-        echo "wheelbase_sdk vendor dir absent or WITH_WB_SDK!=1, skipping"; \
-    fi
+# ---------- wheelbase_sdk ----------
+# wheelbase_sdk now lives in this repo at ./wheelbase_sdk (moved from
+# wheelbase-app/hermes-plugins/). Install it unconditionally; the four
+# wheelbase plugins under plugins/wheelbase/ import it at runtime.
+# --no-deps: httpx is already installed via the hermes extras above.
+RUN pip install --no-cache-dir --no-deps ./wheelbase_sdk
 
 # ---------- Web dist stub ----------
 # The dashboard insists on a web dist: without --skip-build it shells out to
