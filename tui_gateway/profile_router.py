@@ -21,6 +21,7 @@ from typing import Any, Callable, Optional
 
 from fastapi import FastAPI, Request, WebSocket
 from fastapi.responses import JSONResponse, Response
+from starlette.websockets import WebSocketDisconnect
 
 from tui_gateway.wheelbase_identity import is_valid_user_id
 
@@ -409,16 +410,22 @@ def build_app(manager: ChildManager) -> FastAPI:
         await ws.accept()
 
         async def client_to_child() -> None:
-            while True:
-                msg = await ws.receive_text()
-                await upstream.send(msg)
+            try:
+                while True:
+                    msg = await ws.receive_text()
+                    await upstream.send(msg)
+            except WebSocketDisconnect:
+                logger.debug("client_to_child: client disconnected")
 
         async def child_to_client() -> None:
-            async for msg in upstream:
-                if isinstance(msg, str):
-                    await ws.send_text(msg)
-                else:
-                    await ws.send_text(msg.decode("utf-8"))
+            try:
+                async for msg in upstream:
+                    if isinstance(msg, str):
+                        await ws.send_text(msg)
+                    else:
+                        await ws.send_text(msg.decode("utf-8"))
+            except websockets.exceptions.ConnectionClosed:
+                logger.debug("child_to_client: upstream connection closed")
 
         pumps = [
             asyncio.create_task(client_to_child()),
