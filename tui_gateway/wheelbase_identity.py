@@ -29,6 +29,11 @@ HEADER_CDP = "x-wheelbase-cdp-url"
 _USER_ID_RE = re.compile(r'^[A-Za-z0-9_-]{1,64}$')
 
 
+def is_valid_user_id(user_id: str) -> bool:
+    """Return True when *user_id* is safe for profile and credential paths."""
+    return bool(user_id) and bool(_USER_ID_RE.match(user_id))
+
+
 @dataclass(frozen=True)
 class WheelbaseIdentity:
     user_id: str
@@ -51,7 +56,7 @@ def identity_from_headers(headers: Mapping[str, str]) -> Optional[WheelbaseIdent
         return None
     # Sanitize: reject anything that doesn't match the safe identifier pattern.
     # This prevents path traversal (../evil), spaces, null bytes, slashes, etc.
-    if not _USER_ID_RE.match(user_id):
+    if not is_valid_user_id(user_id):
         return None
     return WheelbaseIdentity(
         user_id=user_id,

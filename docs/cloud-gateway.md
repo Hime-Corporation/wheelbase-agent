@@ -1,44 +1,146 @@
 # Cloud Gateway Runbook
 
-One gateway container per dealership. Each container runs the Hermes dashboard
-server, hosts the TUI gateway for connected users, and reports usage to the
-Wheelbase backend.
+One gateway container runs per dealership. The container entrypoint is the
+profile router, not a shared dashboard:
+
+```bash
+python -m tui_gateway.profile_router
+```
+
+The router listens on port 9320, provisions one Hermes profile and one private
+child dashboard per Wheelbase user, and proxies backend REST/WS traffic to the
+right child process.
 
 ---
 
 ## Topology
 
-```
-                  Internet / Wheelbase backend
-                        │
-                  ┌─────▼──────────────────────────────┐
-                  │  backend (Go / Gin)                │
-                  │  public  :8000   ← user-facing API │
-                  │  internal :8091  ← private network │
-                  │    POST /internal/agent/usage       │
-                  │    GET  /internal/agent/cdp/{uid}   │
-                  └────────────────┬───────────────────┘
-                                   │ private Docker network
-                  ┌────────────────▼───────────────────┐
-                  │  gateway (this container)          │
-                  │  :9320  dashboard + TUI gateway    │
-                  │  NEVER published to the internet   │
-                  │  HERMES_HOME = /data/hermes volume │
-                  │  DOCKER_HOST → scoped daemon       │
-                  └────────────────────────────────────┘
+```text
+Internet / Wheelbase clients
+          |
+          v
+Wheelbase backend (Go / Gin)
+  public   :8000
+  internal :8091
+          |
+          | private Docker network
+          v
+gateway container
+  :9320 profile router
+    - REST /api/* and WS /api/ws auth gate
+    - validates X-Wheelbase-User-Id
+    - swaps router token for per-child token
+    - eagerly starts existing wb-* profiles on boot
+          |
+          | loopback only
+          v
+per-user child dashboards
+  127.0.0.1:9400-9899
+  HERMES_HOME=/data/hermes/profiles/wb-<uid>
 ```
 
 Key rules:
 
-- Port 9320 is **private**. It is reachable only by the backend and authorised
+- Port 9320 is private. It is reachable only by the backend and authorized
   internal services on the same Docker network. Never map it to a public port.
-- Each dealership gets its **own gateway container** with its own `HERMES_HOME`
-  volume and its own `DOCKER_HOST` pointing at a scoped, rootless-DinD or
-  dedicated Docker daemon. The host daemon socket (`/var/run/docker.sock`) must
-  **never** be mounted — this would allow sandbox containers from one dealership
-  to interfere with others (spec §10).
-- The backend's internal API (`WHEELBASE_INTERNAL_API`) is on the private
-  network and is not reachable from the public internet.
+- Each dealership gets its own gateway container and `/data/hermes` volume.
+- Each authenticated Wheelbase user gets an isolated profile named
+  `wb-<user_id>`, where `user_id` must match `^[A-Za-z0-9_-]{1,64}$`.
+- Child dashboards bind to `127.0.0.1` only. The router is the only listener
+  the backend should dial.
+
+---
+
+## Profile Router
+
+The router is implemented in `tui_gateway/profile_router.py`.
+
+On first use, it provisions:
+
+- `/data/hermes/profiles/wb-<uid>`
+- the same profile directory skeleton used by `hermes profile create`
+- seed-once `config.yaml`
+- seed-once Wheelbase dealership `SOUL.md`
+- bundled profile skills through `hermes_cli.profiles.seed_profile_skills`
+
+Default seeded config:
+
+```yaml
+model: minimax/minimax-m3
+provider: openrouter
+skin: wheelbase
+plugins:
+  enabled:
+    - wheelbase-core
+    - wheelbase-onboarding
+    - wheelbase-auction-browser
+    - wheelbase-demand-matrix
+```
+
+Child process command:
+
+```bash
+python -m hermes_cli.main dashboard \
+  --no-open --insecure --skip-build \
+  --host 127.0.0.1 --port <9400-9899>
+```
+
+Each child gets a random `HERMES_DASHBOARD_SESSION_TOKEN`. The router keeps the
+dealership-level token at the edge and swaps in the child token when proxying.
+
+Supervision behavior:
+
+- one child per valid user id
+- capped exponential restart backoff, 1s to 60s
+- no idle stop, because per-user crons must keep firing
+- boot reconcile starts existing valid `wb-*` profile dirs and skips invalid
+  names
+
+---
+
+## Auth Contract
+
+The backend broker contract is unchanged:
+
+- REST `/api/{path}` requires `X-Hermes-Session-Token` equal to the router's
+  `HERMES_DASHBOARD_SESSION_TOKEN`.
+- WS `/api/ws` requires `?token=` equal to the router's
+  `HERMES_DASHBOARD_SESSION_TOKEN`.
+- REST and WS both require a valid `X-Wheelbase-User-Id`.
+- The backend should also forward `X-Wheelbase-Tenant-Id`,
+  `X-Wheelbase-Dealership-Id`, `X-Wheelbase-User-Jwt`, and
+  `X-Wheelbase-Cdp-Url` when available.
+
+Reject behavior:
+
+- REST auth or identity failure: HTTP 403.
+- WS auth or identity failure: close code 4003.
+- The router refuses to start if `HERMES_DASHBOARD_SESSION_TOKEN` is missing.
+
+Do not point `WHEELBASE_AGENT_WS_OVERRIDE` at the profile router during local
+desktop development. That override lacks Wheelbase identity headers. Point it
+at a plain locally-run `hermes dashboard` or directly at a child dashboard port.
+
+---
+
+## Per-Conversation Workspaces
+
+Identified Wheelbase sessions run tools inside the user's sandbox with:
+
+```text
+/workspace/conversations/<stored_session_id>
+```
+
+`session.cwd.set` for identified sessions is a sandbox path operation:
+
+- accepted paths must resolve under `/workspace`
+- escapes such as `/workspace/../etc`, `/etc`, relative paths, and
+  `/workspacefoo` are rejected
+- host `os.path.isdir` is not used for identified sessions
+- anonymous desktop/dev sessions keep the old host-path behavior
+
+Daytona sandboxes create the cwd on connect and when a cached live environment
+receives a new cwd. Docker workdirs are created through container startup.
 
 ---
 
@@ -46,89 +148,36 @@ Key rules:
 
 | Variable | Required | Description |
 |---|---|---|
-| `HERMES_HOME` | yes | Path inside container for all agent state (`/data/hermes`; backed by a named volume) |
-| `HERMES_DASHBOARD_SESSION_TOKEN` | yes | Shared secret between gateway and backend. Used for HTTP API auth (`X-Hermes-Session-Token`) and as the backing value for the Wheelbase DashboardAuthProvider. Must match `HERMES_GATEWAY_TOKEN` on the backend side. |
-| `OPENROUTER_API_KEY` | yes | Central Wheelbase OpenRouter key (spec §9); delivered to agent at session injection |
-| `SUPABASE_URL` | yes | Supabase project URL |
-| `SUPABASE_ANON_KEY` | yes | Supabase anon key |
-| `WHEELBASE_GO_API_ORIGIN` | yes | Public URL of the Wheelbase Go API backend |
-| `WHEELBASE_INTERNAL_API` | yes | Base URL of the backend internal API (e.g. `http://backend:8091`); used by the usage reporter and CDP relay |
-| `WHEELBASE_GATEWAY_TOKEN` | yes | Same value as `HERMES_DASHBOARD_SESSION_TOKEN`; sent as `X-Gateway-Token` on usage sink POSTs |
-| `TERMINAL_ENV` | yes | Set to `docker` to enable per-user sandbox containers (spec §7) |
-| `DOCKER_HOST` | yes | Unix or TCP socket for the scoped Docker daemon — **never** the host `docker.sock` |
-| `TERMINAL_DOCKER_IMAGE` | yes | Image used for per-user sandbox containers |
-| `WHEELBASE_WORKSPACE_VOLUME_PREFIX` | no | Volume name prefix for workspace volumes (default `wb-ws-`) |
+| `HERMES_HOME` | yes | Router state root, normally `/data/hermes`. Profiles default to `$HERMES_HOME/profiles`. |
+| `HERMES_DASHBOARD_SESSION_TOKEN` | yes | Dealership-level router secret. Must match the backend gateway token. |
+| `PORT` | no | Router listen port. Defaults to `9320`. |
+| `WHEELBASE_PROFILES_ROOT` | no | Overrides profile root. Defaults to `$HERMES_HOME/profiles`. |
+| `WHEELBASE_PROFILE_MODEL` | no | Seeded profile model override. Defaults to `minimax/minimax-m3`. |
+| `WHEELBASE_PROFILE_PROVIDER` | no | Seeded profile provider override. Defaults to `openrouter`. |
+| `WHEELBASE_PROFILE_SKIN` | no | Seeded profile skin override. Defaults to `wheelbase`. |
+| `OPENROUTER_API_KEY` | yes | Central Wheelbase OpenRouter key inherited by children. |
+| `SUPABASE_URL` | yes | Supabase project URL inherited by children. |
+| `SUPABASE_ANON_KEY` | yes | Supabase anon key inherited by children. |
+| `WHEELBASE_GO_API_ORIGIN` | yes | Public URL of the Wheelbase Go API backend. |
+| `WHEELBASE_INTERNAL_API` | yes | Backend internal API, for usage reporting and CDP relay. |
+| `WHEELBASE_GATEWAY_TOKEN` | yes | Token sent as `X-Gateway-Token` to backend internal endpoints. |
+| `TERMINAL_ENV` | yes | Use a sandboxed backend such as `daytona` or `docker` for identified sessions. |
+| `DOCKER_HOST` | docker only | Scoped Docker daemon. Never mount the host `/var/run/docker.sock`. |
+| `TERMINAL_DOCKER_IMAGE` | docker only | Image for sandbox containers. |
+| `WHEELBASE_WORKSPACE_VOLUME_PREFIX` | no | Docker workspace volume prefix. Defaults to `wb-ws-`. |
+| `WHEELBASE_SANDBOX_KEY_PREFIX` | no | Daytona sandbox key prefix. Defaults to `wb-`. |
 
 ---
 
-## WS Auth Mode — How Non-Loopback Token Auth Works
-
-The `hermes_cli/web_server.py` `start_server()` function calls
-`should_require_auth(host, allow_public)` to decide the auth mode:
-
-```python
-def should_require_auth(host: str, allow_public: bool) -> bool:
-    return (host not in _LOOPBACK_HOST_VALUES) and (not allow_public)
-```
-
-`_LOOPBACK_HOST_VALUES = {"localhost", "127.0.0.1", "::1"}`.
-
-There are three WS auth modes (`_ws_auth_mode` in `web_server.py`):
-
-| Bind | `--insecure` | Mode | `?token=` WS auth |
-|------|-------------|------|-------------------|
-| loopback | n/a | `loopback` | accepted (constant-time) |
-| non-loopback | yes | `insecure` | accepted (constant-time) |
-| non-loopback | no | `gated` | **unconditionally rejected** (requires `?ticket=`/`?internal=`) |
-
-The Wheelbase backend chat broker authenticates its gateway dial with
-`ws://gateway:9320/api/ws?token=<HERMES_DASHBOARD_SESSION_TOKEN>` — the
-legacy token credential. Gated mode rejects that credential outright (and
-its `?ticket=` flow is a browser-SPA mint the broker cannot perform), so
-**the gateway container MUST run with `--insecure`**:
-
-```
-python -m hermes_cli.main dashboard \
-    --no-open --insecure --host 0.0.0.0 --port 9320
-# WITH HERMES_DASHBOARD_SESSION_TOKEN set (high-entropy, shared with backend)
-```
-
-What `--insecure` actually means here: it skips the OAuth browser-login
-gate. It does NOT disable token auth — the WS upgrade still constant-time
-compares `?token=` against `HERMES_DASHBOARD_SESSION_TOKEN`, and HTTP API
-endpoints still require the `X-Hermes-Session-Token` header (or
-`Authorization: Bearer …`). This combination is acceptable only under the
-deployment invariants below:
-
-- the gateway port is **never published publicly** — it is reachable only on
-  the private Dokploy network, with the Go backend as the single public door
-  (spec §10);
-- `HERMES_DASHBOARD_SESSION_TOKEN` is a strong random secret (32+ bytes),
-  matching `HERMES_GATEWAY_TOKEN` on the backend.
-
-Do not "harden" this by removing `--insecure`: that flips the container into
-gated mode and silently breaks the backend broker (every chat connect returns
-502 because the gateway rejects the WS upgrade).
-
----
-
-## Build Instructions
+## Build
 
 ```bash
-# Basic build (no wheelbase_sdk plugin):
 docker build -f Dockerfile.gateway -t wheelbase-gateway:dev .
-
-# Build with wheelbase_sdk plugin from sibling repo:
-cp -r ../wheelbase-app/hermes-plugins/wheelbase_sdk vendor/wheelbase_sdk
-docker build \
-    -f Dockerfile.gateway \
-    --build-arg WITH_WB_SDK=1 \
-    --build-arg HERMES_GIT_SHA="$(git rev-parse HEAD)" \
-    -t wheelbase-gateway:dev .
 ```
 
-The umbrella build script (`scripts/build-gateway.sh`, to be created) should
-handle the vendor copy and SHA injection automatically for CI.
+The image installs `wheelbase_sdk` from this repo and includes the bundled
+Wheelbase plugins under `plugins/wheelbase/`. The old `WITH_WB_SDK` vendor
+build path is no longer used.
 
 ---
 
@@ -143,55 +192,62 @@ docker run -d \
   wheelbase-gateway:latest
 ```
 
-The container is **not** published on any host port. The backend reaches it at
-`http://gateway-dealership-123:9320` on the shared private Docker network.
+The container is not published on any host port. The backend reaches it at:
+
+```text
+http://gateway-dealership-123:9320
+```
 
 ---
 
-## Smoke Test
+## Smoke Tests
 
-Check the HTTP status endpoint (requires `HERMES_DASHBOARD_SESSION_TOKEN`):
+REST must include both the router token and Wheelbase identity:
 
 ```bash
-curl -sf \
+curl -i \
   -H "X-Hermes-Session-Token: ${HERMES_DASHBOARD_SESSION_TOKEN}" \
+  -H "X-Wheelbase-User-Id: user-aaaa" \
   http://gateway-dealership-123:9320/api/status
 ```
 
-Expected response: JSON with `{"status": "ok", ...}` (or similar health fields).
+Missing or invalid `X-Wheelbase-User-Id` should return 403. That is healthy
+router behavior, not a gateway outage.
 
-If the gateway is unreachable from the backend host but reachable from inside
-the Docker network, exec into the backend container:
+WS smoke test:
 
 ```bash
-docker exec -it backend \
-  curl -sf \
-    -H "X-Hermes-Session-Token: ${HERMES_DASHBOARD_SESSION_TOKEN}" \
-    http://gateway-dealership-123:9320/api/status
+wscat \
+  -H "X-Wheelbase-User-Id: user-aaaa" \
+  -c "ws://gateway-dealership-123:9320/api/ws?token=${HERMES_DASHBOARD_SESSION_TOKEN}"
 ```
+
+Missing or bad token/identity should close with 4003.
 
 ---
 
 ## Volumes and State
 
-| Path in container | Purpose | Recommended backing |
+| Path in container | Purpose | Backing |
 |---|---|---|
-| `/data/hermes` | All Hermes state: sessions, messages, skills, config | Named Docker volume per dealership (`wb-hermes-<id>`) |
+| `/data/hermes` | Dealership state root and `profiles/wb-*` children | Named Docker volume per dealership |
+| `/data/hermes/profiles/wb-<uid>` | Per-user Hermes profile, state DB, skills, cron, home | Same dealership volume |
+| `/workspace/conversations/<sid>` | Per-conversation sandbox cwd | User's sandbox filesystem or user Docker volume |
 
-Do not mount the same volume into multiple gateway containers simultaneously —
-the SQLite state DB (`state.db`) does not support concurrent writers across
+Do not mount the same `/data/hermes` volume into multiple gateway containers
+simultaneously. SQLite state DBs do not support concurrent writers across
 container processes.
 
 ---
 
 ## Security Notes
 
-1. **Never publish port 9320 publicly.** It exposes an unauthenticated admin
-   surface for the agent's conversation history and tool execution. The backend
-   reverse proxy must mediate all external access.
-2. **Use a scoped `DOCKER_HOST`** (rootless DinD or a dedicated daemon socket)
-   per dealership. Sharing the host daemon allows a compromised sandbox to
-   inspect or destroy containers belonging to other dealerships.
-3. **Rotate `HERMES_DASHBOARD_SESSION_TOKEN`** on credential compromise. The
-   token is used both for usage-sink auth (`X-Gateway-Token`) and dashboard
-   HTTP auth (`X-Hermes-Session-Token`).
+1. Never publish port 9320 publicly. The backend must mediate all external
+   access.
+2. Use a scoped `DOCKER_HOST` per dealership when `TERMINAL_ENV=docker`. Sharing
+   the host daemon lets a compromised sandbox inspect or destroy unrelated
+   containers.
+3. Rotate `HERMES_DASHBOARD_SESSION_TOKEN` and `WHEELBASE_GATEWAY_TOKEN` on
+   credential compromise.
+4. Keep identified sessions on sandboxed terminal backends. `local` execution
+   is refused unless `WHEELBASE_ALLOW_UNSANDBOXED=1` is set for dev/tests.

@@ -166,6 +166,13 @@ class DaytonaEnvironment(BaseEnvironment):
         self._sync_manager.sync(force=True)
         self.init_session()
 
+    def ensure_cwd(self) -> None:
+        """Create the current cwd inside the persistent Daytona sandbox."""
+        try:
+            self._sandbox.process.exec(f"mkdir -p {shlex.quote(self.cwd)}")
+        except Exception as e:
+            logger.warning("Daytona: could not create cwd %s: %s", self.cwd, e)
+
     def _daytona_upload(self, host_path: str, remote_path: str) -> None:
         """Upload a single file via Daytona SDK."""
         parent = str(Path(remote_path).parent)

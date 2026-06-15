@@ -12,7 +12,11 @@ import pytest
 
 from tools import browser_tool, terminal_tool
 from tui_gateway.wheelbase_identity import WheelbaseIdentity, update_user_jwt
-from tui_gateway.wheelbase_inject import apply_session_injection, workspace_volume
+from tui_gateway.wheelbase_inject import (
+    apply_session_injection,
+    contain_workspace_path,
+    workspace_volume,
+)
 from wheelbase_sdk import runtime as wb_runtime
 
 IDENT_A = WheelbaseIdentity(
@@ -105,6 +109,87 @@ def test_daytona_mode_per_user_sandbox(tmp_path, monkeypatch):
     # Every turn for a user collapses to that user's own sandbox, never shared.
     assert terminal_tool._resolve_container_task_id("task-a") == user_sandbox_key(IDENT_A.user_id)
     assert terminal_tool._resolve_container_task_id("task-b") == user_sandbox_key(IDENT_B.user_id)
+
+
+def test_conversation_cwd_docker(tmp_path):
+    apply_session_injection(
+        "task-a", IDENT_A, tmp_path, conversation_id="20260612_101500_ab12cd"
+    )()
+    overrides = terminal_tool._task_env_overrides["task-a"]
+    assert overrides["cwd"] == "/workspace/conversations/20260612_101500_ab12cd"
+    assert overrides["docker_volumes"] == [f"{workspace_volume(IDENT_A.user_id)}:/workspace"]
+
+
+def test_conversation_cwd_daytona(tmp_path, monkeypatch):
+    monkeypatch.setenv("TERMINAL_ENV", "daytona")
+    apply_session_injection("task-a", IDENT_A, tmp_path, conversation_id="sess-1")()
+    overrides = terminal_tool._task_env_overrides["task-a"]
+    assert overrides["cwd"] == "/workspace/conversations/sess-1"
+    assert overrides["sandbox_key"].endswith(IDENT_A.user_id)
+
+
+def test_no_conversation_id_falls_back_to_workspace_root(tmp_path):
+    apply_session_injection("task-a", IDENT_A, tmp_path)()
+    assert terminal_tool._task_env_overrides["task-a"]["cwd"] == "/workspace"
+
+
+def test_invalid_conversation_id_rejected(tmp_path):
+    with pytest.raises(ValueError):
+        apply_session_injection("task-a", IDENT_A, tmp_path, conversation_id="../../etc")
+
+
+def test_explicit_cwd_wins_over_conversation_default(tmp_path):
+    apply_session_injection(
+        "task-a",
+        IDENT_A,
+        tmp_path,
+        conversation_id="sess-1",
+        explicit_cwd="/workspace/shared/imports",
+    )()
+    assert terminal_tool._task_env_overrides["task-a"]["cwd"] == "/workspace/shared/imports"
+
+
+def test_explicit_cwd_escape_fails_closed(tmp_path):
+    with pytest.raises(ValueError):
+        apply_session_injection(
+            "task-a",
+            IDENT_A,
+            tmp_path,
+            conversation_id="sess-1",
+            explicit_cwd="/workspace/../etc",
+        )
+
+
+def test_contain_workspace_path():
+    assert contain_workspace_path("/workspace") == "/workspace"
+    assert contain_workspace_path("/workspace/foo/bar") == "/workspace/foo/bar"
+    assert contain_workspace_path("/workspace/a/../b") == "/workspace/b"
+    for bad in ("/etc", "/workspace/../etc", "../up", "workspace/foo", "", "/workspacefoo"):
+        with pytest.raises(ValueError):
+            contain_workspace_path(bad)
+
+
+def test_live_env_cwd_change_invokes_ensure_cwd():
+    class FakeEnv:
+        cwd = "/workspace"
+        ensured = 0
+
+        def ensure_cwd(self):
+            FakeEnv.ensured += 1
+
+    env = FakeEnv()
+    with terminal_tool._env_lock:
+        terminal_tool._active_environments["task-live"] = env
+    try:
+        terminal_tool.register_task_env_overrides(
+            "task-live", {"cwd": "/workspace/conversations/sess-9"}
+        )
+        assert env.cwd == "/workspace/conversations/sess-9"
+        assert FakeEnv.ensured == 1
+    finally:
+        with terminal_tool._env_lock:
+            terminal_tool._active_environments.pop("task-live", None)
+        terminal_tool._task_env_overrides.pop("task-live", None)
 
 
 def test_jwt_refresh_only_touches_own_user(tmp_path):

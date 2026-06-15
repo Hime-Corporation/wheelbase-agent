@@ -19,6 +19,8 @@ from __future__ import annotations
 
 import logging
 import os
+import posixpath
+import re
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -27,6 +29,23 @@ from tui_gateway.wheelbase_identity import WheelbaseIdentity, write_credential_f
 logger = logging.getLogger(__name__)
 
 SANDBOX_MOUNT = "/workspace"
+_CONVERSATION_ID_RE = re.compile(r"^[A-Za-z0-9_.-]{1,80}$")
+
+
+def contain_workspace_path(raw: str) -> str:
+    """Normalize and require a sandbox cwd to remain under /workspace."""
+    candidate = posixpath.normpath(str(raw or "").strip())
+    if not candidate.startswith("/"):
+        raise ValueError(f"cwd must be an absolute sandbox path: {raw!r}")
+    if candidate != SANDBOX_MOUNT and not candidate.startswith(SANDBOX_MOUNT + "/"):
+        raise ValueError(f"cwd escapes the {SANDBOX_MOUNT} sandbox: {raw!r}")
+    return candidate
+
+
+def conversation_cwd(conversation_id: str) -> str:
+    if not _CONVERSATION_ID_RE.match(conversation_id or ""):
+        raise ValueError(f"invalid conversation id: {conversation_id!r}")
+    return f"{SANDBOX_MOUNT}/conversations/{conversation_id}"
 
 # Terminal backends that isolate shell execution off the gateway host, so a
 # multi-user turn cannot read the gateway's filesystem or another user's data:
@@ -82,7 +101,12 @@ def _require_sandboxed_env() -> str:
 
 
 def apply_session_injection(
-    task_id: str, identity: WheelbaseIdentity, hermes_home: Path
+    task_id: str,
+    identity: WheelbaseIdentity,
+    hermes_home: Path,
+    *,
+    conversation_id: Optional[str] = None,
+    explicit_cwd: Optional[str] = None,
 ) -> Callable[[], None]:
     """Scope the upcoming turn to *identity*. Returns a cleanup callable the
     turn's finally block MUST invoke (resets the SDK context for thread reuse).
@@ -134,6 +158,13 @@ def apply_session_injection(
     #        mounts the user's own named volume at /workspace.
     from tools.terminal_tool import register_task_env_overrides
 
+    if explicit_cwd:
+        cwd = contain_workspace_path(explicit_cwd)
+    elif conversation_id:
+        cwd = conversation_cwd(conversation_id)
+    else:
+        cwd = SANDBOX_MOUNT
+
     sandbox_env = {
         "WHEELBASE_USER_ID": identity.user_id,
         "WHEELBASE_DEALERSHIP_ID": identity.dealership_id,
@@ -142,7 +173,7 @@ def apply_session_injection(
         register_task_env_overrides(
             task_id,
             {
-                "cwd": SANDBOX_MOUNT,
+                "cwd": cwd,
                 "sandbox_key": user_sandbox_key(identity.user_id),
                 "docker_env": sandbox_env,
             },
@@ -151,7 +182,7 @@ def apply_session_injection(
         register_task_env_overrides(
             task_id,
             {
-                "cwd": SANDBOX_MOUNT,
+                "cwd": cwd,
                 "docker_volumes": [f"{workspace_volume(identity.user_id)}:{SANDBOX_MOUNT}"],
                 "docker_env": sandbox_env,
             },

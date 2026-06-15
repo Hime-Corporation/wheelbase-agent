@@ -994,6 +994,12 @@ def register_task_env_overrides(task_id: str, overrides: Dict[str, Any]):
             env = _active_environments.get(task_id) or _active_environments.get(container_id)
         if env is not None and getattr(env, "cwd", None) is not None:
             env.cwd = new_cwd
+            ensure_cwd = getattr(env, "ensure_cwd", None)
+            if callable(ensure_cwd):
+                try:
+                    ensure_cwd()
+                except Exception:
+                    logger.debug("ensure_cwd failed for %s", task_id, exc_info=True)
 
 
 def clear_task_env_overrides(task_id: str):

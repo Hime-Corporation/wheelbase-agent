@@ -1088,6 +1088,12 @@ def _transport_identity():
     return getattr(t, "wheelbase_identity", None) if t is not None else None
 
 
+def _wheelbase_explicit_cwd(session: dict | None) -> str | None:
+    if session and session.get("explicit_cwd") and session.get("cwd"):
+        return str(session["cwd"])
+    return None
+
+
 def _ensure_session_db_row(session: dict) -> None:
     """Idempotently persist the session's DB row on first real activity.
 
@@ -1144,6 +1150,26 @@ def _ensure_session_db_row(session: dict) -> None:
 
 
 def _set_session_cwd(session: dict, cwd: str) -> str:
+    if session.get("wheelbase_identity") is not None:
+        from tui_gateway.wheelbase_inject import contain_workspace_path
+
+        resolved = contain_workspace_path(cwd)
+        session["cwd"] = resolved
+        session["explicit_cwd"] = True
+        try:
+            from tools.terminal_tool import register_task_env_overrides
+
+            register_task_env_overrides(session["session_key"], {"cwd": resolved})
+        except Exception:
+            logger.debug("failed to register sandbox cwd override", exc_info=True)
+        db = _get_db()
+        if db is not None:
+            try:
+                db.update_session_cwd(session.get("session_key", ""), resolved)
+            except Exception:
+                logger.debug("failed to persist session cwd", exc_info=True)
+        return resolved
+
     resolved = os.path.abspath(os.path.expanduser(str(cwd)))
     if not os.path.isdir(resolved):
         raise ValueError(f"working directory does not exist: {cwd}")
@@ -4940,7 +4966,11 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                 from tui_gateway.wheelbase_inject import apply_session_injection
 
                 wb_inject_cleanup = apply_session_injection(
-                    session["session_key"], wb_ident, Path(get_hermes_home())
+                    session["session_key"],
+                    wb_ident,
+                    Path(get_hermes_home()),
+                    conversation_id=session["session_key"],
+                    explicit_cwd=_wheelbase_explicit_cwd(session),
                 )
             cols = session.get("cols", 80)
             streamer = make_stream_renderer(cols)
@@ -5782,7 +5812,11 @@ def _(rid, params: dict) -> dict:
                 from tui_gateway.wheelbase_inject import apply_session_injection
 
                 wb_cleanup = apply_session_injection(
-                    task_id, wb_ident, Path(get_hermes_home())
+                    task_id,
+                    wb_ident,
+                    Path(get_hermes_home()),
+                    conversation_id=str(session.get("session_key") or "") or None,
+                    explicit_cwd=_wheelbase_explicit_cwd(session),
                 )
 
             from run_agent import AIAgent
@@ -5904,7 +5938,11 @@ def _(rid, params: dict) -> dict:
                 from tui_gateway.wheelbase_inject import apply_session_injection
 
                 wb_cleanup = apply_session_injection(
-                    task_id, wb_ident, Path(get_hermes_home())
+                    task_id,
+                    wb_ident,
+                    Path(get_hermes_home()),
+                    conversation_id=str(session.get("session_key") or "") or None,
+                    explicit_cwd=_wheelbase_explicit_cwd(session),
                 )
 
             history_note = (

@@ -86,21 +86,8 @@ VOLUME ["/data/hermes"]
 # the private dealership network. Never publish this port publicly.
 EXPOSE 9320
 
-# Run the dashboard server:
-#   --no-open   skip browser launch (headless container)
-#   --host 0.0.0.0  bind to all interfaces inside the container (the
-#                   container itself is on a private network; the
-#                   reverse proxy / backend handles external exposure)
-#
-# AUTH MODE: --insecure is REQUIRED here. Without it, a 0.0.0.0 bind engages
-# the OAuth gate (should_require_auth → gated), which UNCONDITIONALLY rejects
-# the legacy ?token= WS credential — and the Wheelbase backend chat broker
-# authenticates exactly that way (ws://gateway:9320/api/ws?token=<shared>).
-# With --insecure the WS upgrade still enforces a constant-time comparison of
-# ?token= against HERMES_DASHBOARD_SESSION_TOKEN, and /api/* still requires
-# the X-Hermes-Session-Token header. "Insecure" refers to skipping the OAuth
-# browser-login gate, not to disabling token auth. This is acceptable ONLY
-# because the container is reachable solely on the private network (never
-# publish 9320) and the token is a high-entropy shared secret with the
-# backend. See docs/cloud-gateway.md §Auth for the full decision tree.
-CMD ["python", "-m", "hermes_cli.main", "dashboard", "--no-open", "--insecure", "--skip-build", "--host", "0.0.0.0", "--port", "9320"]
+# Run the profile router. It is the only public listener in the container:
+# backend -> router :9320 -> per-user child dashboards on 127.0.0.1:9400-9899.
+# Auth contract stays dashboard-compatible: WS uses ?token=, REST uses
+# X-Hermes-Session-Token, and every request must carry X-Wheelbase-User-Id.
+CMD ["python", "-m", "tui_gateway.profile_router"]

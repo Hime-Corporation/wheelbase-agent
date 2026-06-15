@@ -166,7 +166,7 @@ def test_prompt_background_fail_closed_on_injection_error(monkeypatch):
 
     from tui_gateway import wheelbase_inject
 
-    def _boom(task_id, ident, home):
+    def _boom(task_id, ident, home, **kwargs):
         raise RuntimeError("sandbox unavailable")
 
     monkeypatch.setattr(wheelbase_inject, "apply_session_injection", _boom)
