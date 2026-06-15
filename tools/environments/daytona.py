@@ -10,6 +10,7 @@ import math
 import os
 import shlex
 import threading
+import uuid
 from pathlib import Path
 
 from tools.environments.base import (
@@ -25,6 +26,39 @@ from tools.environments.file_sync import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+# Kill a command's whole process tree from inside the sandbox WITHOUT procps.
+# The slim Daytona image has no pkill/pgrep/ps — only the bash `kill` builtin —
+# so we read the wrapped shell's PID from a per-command file, build the
+# parent→children map from /proc/<pid>/status, and SIGKILL the root plus every
+# descendant. python3 is present in the image; its own process is a sibling of
+# the target (not a descendant), so it can never kill itself. ``__PIDFILE__`` is
+# substituted with a safe /tmp/HERMESKILL_<hex>.pid path (no shell metachars).
+_DAYTONA_KILL_TEMPLATE = """import os,signal,glob
+try:
+ root=int(open('__PIDFILE__').read().strip())
+except Exception:
+ raise SystemExit
+kids={}
+for s in glob.glob('/proc/[0-9]*/status'):
+ try:
+  pid=int(s.split('/')[2]); ppid=0
+  for ln in open(s):
+   if ln.startswith('PPid:'): ppid=int(ln.split()[1]); break
+  kids.setdefault(ppid,[]).append(pid)
+ except Exception: pass
+seen=[]
+stack=[root]
+while stack:
+ p=stack.pop()
+ if p in seen: continue
+ seen.append(p)
+ stack+=kids.get(p,[])
+for p in seen:
+ try: os.kill(p,signal.SIGKILL)
+ except Exception: pass
+"""
 
 
 class DaytonaEnvironment(BaseEnvironment):
@@ -54,6 +88,18 @@ class DaytonaEnvironment(BaseEnvironment):
         # Honoured by the terminal-tool idle reaper: an always-on sandbox is
         # kept warm (never stopped on idle) for instant next-turn response.
         self._always_on = always_on
+
+        # Hard wall-clock cap for blocking Daytona control-plane calls
+        # (get/create/start/stop/refresh_data). These otherwise have NO timeout,
+        # so a slow/unreachable Daytona control plane hangs the terminal tool
+        # forever — before the command-level timeout in _wait_for_process can
+        # ever apply. See _call_with_timeout.
+        try:
+            self._lifecycle_timeout = max(
+                5, int(os.environ.get("TERMINAL_DAYTONA_LIFECYCLE_TIMEOUT", "90"))
+            )
+        except ValueError:
+            self._lifecycle_timeout = 90
 
         try:
             from tools.lazy_deps import ensure as _lazy_ensure
@@ -92,8 +138,10 @@ class DaytonaEnvironment(BaseEnvironment):
 
         if self._persistent:
             try:
-                self._sandbox = self._daytona.get(sandbox_name)
-                self._sandbox.start()
+                self._sandbox = self._call_with_timeout(
+                    "get", lambda: self._daytona.get(sandbox_name)
+                )
+                self._call_with_timeout("start", self._sandbox.start)
                 logger.info("Daytona: resumed sandbox %s for task %s",
                             self._sandbox.id, task_id)
             except DaytonaError:
@@ -108,11 +156,13 @@ class DaytonaEnvironment(BaseEnvironment):
                     # Daytona SDK >=0.108.0 uses cursor-based pagination and
                     # list() returns an iterator. Offset-based pagination
                     # (page=1) is removed on June 10, 2026.
-                    results = self._daytona.list(labels=labels, limit=1)
+                    results = self._call_with_timeout(
+                        "list", lambda: self._daytona.list(labels=labels, limit=1)
+                    )
                     legacy = next(iter(results), None)
                     if legacy is not None:
                         self._sandbox = legacy
-                        self._sandbox.start()
+                        self._call_with_timeout("start", self._sandbox.start)
                         logger.info("Daytona: resumed legacy sandbox %s for task %s",
                                     self._sandbox.id, task_id)
                 except Exception as e:
@@ -121,14 +171,17 @@ class DaytonaEnvironment(BaseEnvironment):
                     self._sandbox = None
 
         if self._sandbox is None:
-            self._sandbox = self._daytona.create(
-                CreateSandboxFromImageParams(
-                    image=image,
-                    name=sandbox_name,
-                    labels=labels,
-                    auto_stop_interval=0,
-                    resources=resources,
-                )
+            self._sandbox = self._call_with_timeout(
+                "create",
+                lambda: self._daytona.create(
+                    CreateSandboxFromImageParams(
+                        image=image,
+                        name=sandbox_name,
+                        labels=labels,
+                        auto_stop_interval=0,
+                        resources=resources,
+                    )
+                ),
             )
             logger.info("Daytona: created sandbox %s for task %s",
                         self._sandbox.id, task_id)
@@ -225,11 +278,44 @@ class DaytonaEnvironment(BaseEnvironment):
     # Sandbox lifecycle
     # ------------------------------------------------------------------
 
+    def _call_with_timeout(self, label: str, fn):
+        """Run a blocking Daytona control-plane SDK call with a hard wall-clock cap.
+
+        The Daytona SDK's own timeouts are unreliable (see class docstring) and
+        the lifecycle calls (get/create/start/stop/refresh_data) otherwise have
+        none — a slow or unreachable Daytona control plane would hang the
+        terminal tool indefinitely, before the command-level timeout in
+        _wait_for_process can apply. Runs ``fn`` on a daemon thread (so a truly
+        stuck SDK call can't block interpreter shutdown) and raises TimeoutError
+        if it overruns, letting the caller surface an error instead of blocking.
+        """
+        box: dict = {}
+
+        def runner() -> None:
+            try:
+                box["value"] = fn()
+            except BaseException as exc:  # noqa: BLE001 — re-raised on the caller thread
+                box["error"] = exc
+
+        worker = threading.Thread(
+            target=runner, name=f"daytona-{label}", daemon=True
+        )
+        worker.start()
+        worker.join(self._lifecycle_timeout)
+        if worker.is_alive():
+            raise TimeoutError(
+                f"Daytona {label} did not complete within "
+                f"{self._lifecycle_timeout}s (control plane slow or unreachable)"
+            )
+        if "error" in box:
+            raise box["error"]
+        return box.get("value")
+
     def _ensure_sandbox_ready(self) -> None:
         """Restart sandbox if it was stopped (e.g., by a previous interrupt)."""
-        self._sandbox.refresh_data()
+        self._call_with_timeout("refresh_data", self._sandbox.refresh_data)
         if self._sandbox.state in {self._SandboxState.STOPPED, self._SandboxState.ARCHIVED}:
-            self._sandbox.start()
+            self._call_with_timeout("start", self._sandbox.start)
             logger.info("Daytona: restarted sandbox %s", self._sandbox.id)
 
     def _before_execute(self) -> None:
@@ -245,17 +331,48 @@ class DaytonaEnvironment(BaseEnvironment):
         sandbox = self._sandbox
         lock = self._lock
 
-        def cancel():
-            with lock:
-                try:
-                    sandbox.stop()
-                except Exception:
-                    pass
+        # Per-command PID file: the wrapped shell records its own PID here so
+        # cancel() can kill exactly this command's process tree (and nothing
+        # else) on interrupt/timeout. Unique name avoids collisions across
+        # concurrent commands in the same sandbox.
+        kill_tag = "HERMESKILL_" + uuid.uuid4().hex
+        pidfile = f"/tmp/{kill_tag}.pid"
 
+        def cancel():
+            # Always-on (warm) sandboxes must NOT be stopped on interrupt/timeout:
+            # stopping cold-restarts them next turn (observed as stop/start churn
+            # in prod) and defeats the point of keeping them warm. Kill only this
+            # command's process tree via the recorded PID, leaving the sandbox up.
+            # The slim image has no procps, so the kill is done by python3 walking
+            # /proc (see _DAYTONA_KILL_TEMPLATE).
+            killer = _DAYTONA_KILL_TEMPLATE.replace("__PIDFILE__", pidfile)
+            try:
+                self._call_with_timeout(
+                    "kill",
+                    lambda: sandbox.process.exec(
+                        f"python3 -c {shlex.quote(killer)}; "
+                        f"rm -f {shlex.quote(pidfile)} 2>/dev/null || true"
+                    ),
+                )
+            except Exception:
+                pass
+            # Ephemeral (non-always-on) sandboxes are still stopped as before so
+            # they are reclaimed promptly.
+            if not self._always_on:
+                with lock:
+                    try:
+                        self._call_with_timeout("stop", sandbox.stop)
+                    except Exception:
+                        pass
+
+        # Record the wrapped shell's PID before running the command so cancel()
+        # can find its process tree. `echo $$` writes the `bash -c` PID; it
+        # produces no stdout (redirected) so it cannot disturb CWD-marker parsing.
+        cmd_with_pid = f"echo $$ > {shlex.quote(pidfile)}\n{cmd_string}"
         if login:
-            shell_cmd = f"bash -l -c {shlex.quote(cmd_string)}"
+            shell_cmd = f"bash -l -c {shlex.quote(cmd_with_pid)}"
         else:
-            shell_cmd = f"bash -c {shlex.quote(cmd_string)}"
+            shell_cmd = f"bash -c {shlex.quote(cmd_with_pid)}"
 
         def exec_fn() -> tuple[str, int]:
             response = sandbox.process.exec(shell_cmd, timeout=timeout)
