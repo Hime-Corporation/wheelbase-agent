@@ -1,17 +1,66 @@
-"""bulk_inspect — fetch inspection records for a list of car IDs."""
+"""bulk_inspect — fetch inspection records for a list of car IDs.
+
+V2 status model
+---------------
+The ``vehicle_recon_intake_inspection`` table now carries a proper
+``inspection_lifecycle_status`` enum column (``draft`` | ``in_progress`` |
+``complete``) instead of the old ``completed_at``-only heuristic.
+
+State mapping (backward-tolerant — older rows whose status field is
+null/empty fall through to ``in-progress``):
+  draft        → "pending"      (record exists but not yet started)
+  in_progress  → "in-progress"
+  complete     → "completed"
+  (no row)     → "pending"
+
+V2 scoring columns (``mechanical_grade``, ``safety_status``,
+``pass_count``, ``fail_count``, ``monitor_count``, ``fixed_count``,
+``na_count``) are included in the per-car result when the row is present;
+null/missing values are omitted so callers can distinguish "not yet scored"
+from zero.
+"""
 
 from wheelbase_sdk import WheelbaseClient, WheelbaseAuthError, signed_out_result, ok, err
 
 INSPECTION_TABLE = "vehicle_recon_intake_inspection"
 
+# V2 lifecycle enum values (lowercase, as returned by PostgREST)
+_V2_STATUS_MAP = {
+    "draft": "pending",
+    "in_progress": "in-progress",
+    "in-progress": "in-progress",  # defensive: tolerate hyphen form
+    "complete": "completed",
+    "completed": "completed",      # backward compat: pre-V2 rows
+    "done": "completed",           # backward compat
+}
+
+_V2_SCORE_FIELDS = (
+    "mechanical_grade",
+    "safety_status",
+    "pass_count",
+    "fail_count",
+    "monitor_count",
+    "fixed_count",
+    "na_count",
+)
+
 
 def _derive_state(row: dict | None) -> str:
+    """Map a DB row's status field to the tool's three-value state enum."""
     if not row:
         return "pending"
-    s = str(row.get("status") or "").lower()
-    if s in ("completed", "complete", "done"):
-        return "completed"
-    return "in-progress"
+    s = str(row.get("status") or "").lower().strip()
+    return _V2_STATUS_MAP.get(s, "in-progress")
+
+
+def _extract_scores(row: dict) -> dict:
+    """Return non-null V2 scoring fields from *row* as a flat dict."""
+    scores: dict = {}
+    for field in _V2_SCORE_FIELDS:
+        val = row.get(field)
+        if val is not None:
+            scores[field] = val
+    return scores
 
 
 def bulk_inspect(args: dict, **kwargs) -> str:
@@ -29,20 +78,28 @@ def bulk_inspect(args: dict, **kwargs) -> str:
         return signed_out_result()
     try:
         results = []
+        score_select = ",".join(_V2_SCORE_FIELDS)
         for car_id in car_ids:
             try:
                 rows = client.postgrest_get(
                     INSPECTION_TABLE,
                     {
                         "inventory_car_id": f"eq.{car_id}",
-                        "select": "id,inventory_car_id,status",
+                        "select": f"id,inventory_car_id,status,{score_select}",
                         "limit": "1",
                     },
                 )
-                state = _derive_state(rows[0] if rows else None)
+                row = rows[0] if rows else None
+                state = _derive_state(row)
+                entry: dict = {"carId": car_id, "state": state}
+                if row:
+                    scores = _extract_scores(row)
+                    if scores:
+                        entry["scores"] = scores
             except Exception:  # noqa: BLE001
                 state = "pending"
-            results.append({"carId": car_id, "state": state})
+                entry = {"carId": car_id, "state": state}
+            results.append(entry)
 
         completed = sum(1 for r in results if r["state"] == "completed")
         in_progress = sum(1 for r in results if r["state"] == "in-progress")
