@@ -33,6 +33,7 @@ PROFILE_PLUGINS = (
     "wheelbase-onboarding",
     "wheelbase-auction-browser",
     "wheelbase-demand-matrix",
+    "wheelbase-inspection",
 )
 PORT_RANGE = (9400, 9899)
 

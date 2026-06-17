@@ -1,0 +1,7 @@
+name: wheelbase-inspection
+version: 1.0.0
+description: Wheelbase inspection render tools — pure validators that normalize AI-generated risk review and checklist payloads into DB-ready JSON strings. The Go backend persists the returned payloads; these tools do not touch the database.
+author: Wheelbase
+provides_tools:
+  - inspection_render_risk_review
+  - inspection_render_checklist
