@@ -3642,6 +3642,7 @@ class SessionDB:
         archived_only: bool = False,
         exclude_children: bool = False,
         exclude_sources: List[str] = None,
+        user_id: str = None,
     ) -> int:
         """Count sessions, optionally filtered by source.
 
@@ -3656,6 +3657,10 @@ class SessionDB:
         (e.g. ``["cron"]`` so the recents "load more" total matches a
         cron-excluded ``list_sessions_rich`` page and doesn't keep "load more"
         stuck on for buried scheduler sessions).
+
+        Pass ``user_id`` to scope the count to one owner's sessions (mirrors the
+        ``list_sessions_rich`` user_id filter so sidebar "total" matches the
+        rows returned for that user in multi-user gateway mode).
         """
         where_clauses = []
         params = []
@@ -3669,6 +3674,12 @@ class SessionDB:
         if source:
             where_clauses.append("s.source = ?")
             params.append(source)
+        if user_id:
+            # Multi-user cloud gateway: scope the count to one owner, mirroring
+            # list_sessions_rich's user_id filter so the total accurately
+            # reflects only that user's listable sessions.
+            where_clauses.append("s.user_id = ?")
+            params.append(user_id)
         if exclude_sources:
             placeholders = ",".join("?" for _ in exclude_sources)
             where_clauses.append(f"s.source NOT IN ({placeholders})")

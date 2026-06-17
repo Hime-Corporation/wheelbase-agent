@@ -27,6 +27,39 @@ def update_inventory_status(args: dict, **kwargs) -> str:
     except WheelbaseAuthError:
         return signed_out_result()
     try:
+        # --- read current status before patching (same embed pattern as get_car.py) ---
+        previous_status: str | None = None
+        try:
+            rows = client.postgrest_get(
+                "inventory_car",
+                {
+                    "id": f"eq.{car_id}",
+                    "select": "status_id,inventory_status_definition(code,label)",
+                    "limit": "1",
+                },
+            )
+            if rows:
+                status_def = (rows[0].get("inventory_status_definition") or {})
+                previous_status = status_def.get("label")
+        except Exception:  # noqa: BLE001 — non-fatal; we still proceed with the PATCH
+            pass
+
+        # --- read the target status label so we can return it in the result ---
+        new_status: str | None = None
+        try:
+            status_rows = client.postgrest_get(
+                "inventory_status_definition",
+                {
+                    "id": f"eq.{new_status_id}",
+                    "select": "label",
+                    "limit": "1",
+                },
+            )
+            if status_rows:
+                new_status = status_rows[0].get("label")
+        except Exception:  # noqa: BLE001 — non-fatal
+            pass
+
         now = datetime.now(timezone.utc).isoformat()
         client.postgrest_write(
             "PATCH",
@@ -55,7 +88,12 @@ def update_inventory_status(args: dict, **kwargs) -> str:
         except Exception:  # noqa: BLE001
             pass  # non-fatal — mirrors tRPC pattern
 
-        return ok({"carId": car_id, "newStatusId": new_status_id})
+        return ok({
+            "carId": car_id,
+            "newStatusId": new_status_id,
+            "previous_status": previous_status,
+            "new_status": new_status,
+        })
     except Exception as e:  # noqa: BLE001
         return err(f"update_inventory_status failed: {e}")
     finally:

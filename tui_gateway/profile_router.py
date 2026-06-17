@@ -105,6 +105,11 @@ def provision_profile(
             "provider": os.environ.get("WHEELBASE_PROFILE_PROVIDER", "openrouter"),
             "skin": os.environ.get("WHEELBASE_PROFILE_SKIN", "wheelbase"),
             "plugins": {"enabled": list(PROFILE_PLUGINS)},
+            "platform_toolsets": {
+                "cli": {
+                    "tools": ["todo"],
+                },
+            },
         }
         config_path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
 
