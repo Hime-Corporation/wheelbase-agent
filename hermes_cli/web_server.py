@@ -10897,7 +10897,15 @@ def mount_spa(application: FastAPI):
     and the SPA's runtime ``__HERMES_BASE_PATH__`` honour that prefix
     without rebuilding the bundle.
     """
-    if not WEB_DIST.exists():
+    # A headless gateway (e.g. the per-profile child dashboard spawned with
+    # ``--skip-build``) ships no built web bundle: ``web_dist`` may be absent
+    # OR present-but-incomplete (no ``assets/`` subdir). Either way there is no
+    # usable SPA to serve, so run frontend-less — otherwise the unconditional
+    # ``StaticFiles(directory=WEB_DIST / "assets")`` mount below raises
+    # ``RuntimeError: Directory '.../web_dist/assets' does not exist`` at
+    # startup and the child never becomes ready (issue: per-profile routing
+    # silently fell back to the shared launch store).
+    if not WEB_DIST.exists() or not (WEB_DIST / "assets").is_dir():
         @application.get("/{full_path:path}")
         async def no_frontend(full_path: str):
             return JSONResponse(
