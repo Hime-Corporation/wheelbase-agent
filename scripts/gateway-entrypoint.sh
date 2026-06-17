@@ -1,0 +1,75 @@
+#!/bin/sh
+# Gateway container entrypoint — runs TWO Hermes processes side by side:
+#
+#   1. tui_gateway.profile_router  — the per-user dashboard router. This is
+#      the existing, load-bearing live-chat path (backend -> :9320 -> per-
+#      user child dashboards). It is the PRIMARY process for this container.
+#   2. gateway.run                 — the OpenAI-compatible API server
+#      platform (POST /v1/responses on :8642), used by the Go backend for
+#      one-shot "AI inspection review" calls. This is a SECONDARY process.
+#
+# Failure-isolation contract (important — do not "simplify" this away):
+#   - If gateway.run crashes or misbehaves, profile_router (and therefore
+#     live chat) MUST keep running. The API server loop below is started
+#     in its own backgrounded subshell with its own retry loop, so a crash
+#     inside it can never propagate to, or take down, this script or
+#     profile_router.
+#   - If profile_router dies, the container MUST exit so the orchestrator
+#     (Dokploy/docker) restarts it — that's the critical path. We capture
+#     profile_router's PID, `wait` on that specific PID, and exit this
+#     script with its exact exit status.
+#
+# POSIX sh only (the python:3.11-slim base image's /bin/sh is dash, no
+# bash installed) — avoid bashisms such as `wait -n`, arrays, or [[ ]].
+
+set -eu
+
+# ---------------------------------------------------------------------------
+# 1. API server (gateway.run) — own HERMES_HOME so its config.yaml/.env/
+#    state never collide with profile_router's per-user profile directories
+#    under /data/hermes/profiles/*. Both live under the same mounted volume.
+# ---------------------------------------------------------------------------
+API_SERVER_HERMES_HOME="${API_SERVER_HERMES_HOME:-/data/hermes/api-server}"
+mkdir -p "$API_SERVER_HERMES_HOME"
+
+if [ ! -f "$API_SERVER_HERMES_HOME/config.yaml" ]; then
+  # Idempotent: only written on first boot. A human can hand-edit this file
+  # afterwards and it will never be clobbered by a container restart.
+  cat > "$API_SERVER_HERMES_HOME/config.yaml" <<'EOF'
+plugins:
+  enabled:
+    - wheelbase-inspection
+platform_toolsets:
+  api_server:
+    - web
+    - wheelbase_inspection
+web:
+  search_backend: ddgs
+  extract_backend: firecrawl
+EOF
+fi
+
+# Background retry loop for the API server. Runs in its own subshell ( ... ) &
+# so a crash (or even `set -e` triggering inside the loop) cannot kill the
+# parent script — only this subshell's own logic decides whether to retry.
+(
+  while true; do
+    HERMES_HOME="$API_SERVER_HERMES_HOME" python -m gateway.run || true
+    echo "[gateway-entrypoint] gateway.run (API server) exited — retrying in 3s" >&2
+    sleep 3
+  done
+) &
+
+# ---------------------------------------------------------------------------
+# 2. profile_router — the primary/critical process. Started in the
+#    foreground (backgrounded then waited on by PID, per POSIX-sh portable
+#    pattern) so its exit status becomes this script's exit status and the
+#    container dies with it, letting the orchestrator restart cleanly.
+# ---------------------------------------------------------------------------
+python -m tui_gateway.profile_router &
+ROUTER_PID=$!
+
+wait "$ROUTER_PID"
+ROUTER_STATUS=$?
+
+exit "$ROUTER_STATUS"

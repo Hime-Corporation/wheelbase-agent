@@ -82,12 +82,27 @@ RUN mkdir -p hermes_cli/web_dist/assets && \
 RUN mkdir -p /data/hermes
 VOLUME ["/data/hermes"]
 
+# ---------- Entrypoint ----------
+# scripts/gateway-entrypoint.sh was already brought in by `COPY . .` above
+# (it's part of the source tree); just make it executable here.
+# It runs profile_router (primary, critical) and gateway.run's API server
+# platform (secondary, failure-isolated) side by side — see the script's
+# header comment for the full two-process design and exit-status contract.
+RUN chmod +x scripts/gateway-entrypoint.sh
+
 # Dashboard on a fixed port so Dokploy / docker-compose can map it inside
 # the private dealership network. Never publish this port publicly.
 EXPOSE 9320
 
-# Run the profile router. It is the only public listener in the container:
-# backend -> router :9320 -> per-user child dashboards on 127.0.0.1:9400-9899.
-# Auth contract stays dashboard-compatible: WS uses ?token=, REST uses
-# X-Hermes-Session-Token, and every request must carry X-Wheelbase-User-Id.
-CMD ["python", "-m", "tui_gateway.profile_router"]
+# API server (OpenAI-compatible POST /v1/responses, used by the Go backend
+# for one-shot calls like "AI inspection review"). Same network posture as
+# 9320 — private dealership network only, never publish this port publicly.
+EXPOSE 8642
+
+# Run profile_router (primary/critical — the only public listener: backend
+# -> router :9320 -> per-user child dashboards on 127.0.0.1:9400-9899; auth
+# contract stays dashboard-compatible: WS uses ?token=, REST uses
+# X-Hermes-Session-Token, every request must carry X-Wheelbase-User-Id)
+# together with the API server platform (secondary, :8642, isolated so its
+# failures never affect profile_router). See scripts/gateway-entrypoint.sh.
+CMD ["scripts/gateway-entrypoint.sh"]
