@@ -2809,7 +2809,8 @@ def _on_tool_complete(sid: str, tool_call_id: str, name: str, args: dict, result
         result_text = _tool_result_text(result)
         if result_text:
             payload["result_text"] = result_text
-    if name == "todo":
+    is_todo = name == "todo"
+    if is_todo:
         try:
             data = json.loads(result)
             if isinstance(data, dict) and isinstance(data.get("todos"), list):
@@ -2830,7 +2831,10 @@ def _on_tool_complete(sid: str, tool_call_id: str, name: str, args: dict, result
             payload["inline_diff"] = "\n".join(rendered)
     except Exception:
         pass
-    if _tool_progress_enabled(sid) or payload.get("inline_diff"):
+    # todo tool.complete fires unconditionally so clients always receive the
+    # latest todo list regardless of whether tool_progress mode is enabled.
+    # All other tools respect the per-session tool_progress gate as before.
+    if is_todo or _tool_progress_enabled(sid) or payload.get("inline_diff"):
         _emit("tool.complete", sid, payload)
 
 
@@ -4182,6 +4186,7 @@ def _(rid, params: dict) -> dict:
         deny = frozenset({"tool"})
 
         limit = int(params.get("limit", 200) or 200)
+        offset = int(params.get("offset", 0) or 0)
         # Over-fetch modestly so per-source filtering doesn't leave us
         # short; the compression-tip projection in ``list_sessions_rich``
         # can also merge rows.
@@ -4189,15 +4194,25 @@ def _(rid, params: dict) -> dict:
         # Cloud gateway: an identified connection only ever sees its own
         # sessions; legacy connections (no identity) see everything.
         ident = _transport_identity()
+        user_id = ident.user_id if ident is not None else None
         rows = [
             s
             for s in db.list_sessions_rich(
                 source=None,
                 limit=fetch_limit,
-                user_id=ident.user_id if ident is not None else None,
+                offset=offset,
+                user_id=user_id,
             )
             if (s.get("source") or "").strip().lower() not in deny
         ][:limit]
+        # Accurate total (per-user in multi-user mode) so callers can render
+        # "load more" and pagination controls without over-fetching everything.
+        total = db.session_count(
+            exclude_children=True,
+            exclude_sources=list(deny),
+            user_id=user_id,
+        )
+        has_more = (offset + len(rows)) < total
         return _ok(
             rid,
             {
@@ -4209,9 +4224,12 @@ def _(rid, params: dict) -> dict:
                         "started_at": s.get("started_at") or 0,
                         "message_count": s.get("message_count") or 0,
                         "source": s.get("source") or "",
+                        "lineage_root_id": s.get("_lineage_root_id") or None,
                     }
                     for s in rows
-                ]
+                ],
+                "has_more": has_more,
+                "total": total,
             },
         )
     except Exception as e:

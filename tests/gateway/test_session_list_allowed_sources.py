@@ -27,6 +27,10 @@ class _StubDB:
         self.calls.append(kwargs)
         return list(self.rows)
 
+    def session_count(self, exclude_children=False, exclude_sources=None, user_id=None, **kwargs):
+        excluded = set(exclude_sources or [])
+        return sum(1 for r in self.rows if r.get("source") not in excluded)
+
 
 def _call(limit: int | None = None):
     params: dict = {}

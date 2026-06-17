@@ -23,6 +23,8 @@ def test_get_car_returns_row(monkeypatch):
     monkeypatch.setattr(mod, "WheelbaseClient", lambda: FakeClient([{"id": "c1", "make": "Toyota"}]))
     out = json.loads(mod.get_car({"carId": "c1"}))
     assert out["make"] == "Toyota"
+    # photo_urls is always present (empty list when no photos)
+    assert out["photo_urls"] == []
 
 
 def test_get_car_flattens_status_label(monkeypatch):
@@ -31,6 +33,10 @@ def test_get_car_flattens_status_label(monkeypatch):
         "make": "Audi",
         "status_id": 12,
         "inventory_status_definition": {"code": "recon", "label": "Reconditioning"},
+        "inventory_photo": [
+            {"url": "https://cdn.example.com/side.jpg", "label": "Side", "is_main": False, "sort_order": 2},
+            {"url": "https://cdn.example.com/front.jpg", "label": "Front", "is_main": True, "sort_order": 1},
+        ],
     }
     monkeypatch.setattr(mod, "WheelbaseClient", lambda: FakeClient([row]))
     out = json.loads(mod.get_car({"carId": "c1"}))
@@ -39,6 +45,12 @@ def test_get_car_flattens_status_label(monkeypatch):
     assert out["status_code"] == "recon"
     # nested embed object is flattened away
     assert "inventory_status_definition" not in out
+    # photo_urls: main photo first, then by sort_order
+    assert out["photo_urls"] == [
+        "https://cdn.example.com/front.jpg",
+        "https://cdn.example.com/side.jpg",
+    ]
+    assert "inventory_photo" not in out
 
 
 def test_get_car_status_none_when_unset(monkeypatch):
@@ -72,11 +84,18 @@ def test_register_wires_get_car():
     import wheelbase_core
 
     registered = {}
+    hooks = {}
 
     class Ctx:
         def register_tool(self, *, name, toolset, schema, handler):
             registered[name] = (toolset, schema, handler)
 
+        def register_hook(self, hook_name, callback):
+            hooks[hook_name] = callback
+
     wheelbase_core.register(Ctx())
     assert "get_car" in registered
     assert registered["get_car"][0] == "wheelbase"
+    # The approval-gating pre_tool_call hook must be registered (no-op unless
+    # WHEELBASE_APPROVAL_GATE is enabled).
+    assert "pre_tool_call" in hooks

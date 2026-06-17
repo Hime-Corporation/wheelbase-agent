@@ -27,7 +27,9 @@ def get_car(args: dict, **kwargs) -> str:
                 "id": f"eq.{car_id}",
                 # Embed the status definition (FK status_id → inventory_status_definition)
                 # so the record carries the human-readable label, not just the numeric id.
-                "select": "*,inventory_status_definition(code,label)",
+                # Also embed inventory_photo rows (one-to-many) so callers get photo URLs
+                # without a second round-trip.  The table may be empty — that's fine.
+                "select": "*,inventory_status_definition(code,label),inventory_photo(url,label,is_main,sort_order)",
                 "limit": "1",
             },
         )
@@ -39,6 +41,13 @@ def get_car(args: dict, **kwargs) -> str:
         status_def = car.pop("inventory_status_definition", None) or {}
         car["status"] = status_def.get("label")
         car["status_code"] = status_def.get("code")
+        # Build photo_urls: main photo first (is_main desc), then by sort_order asc.
+        # PostgREST returns the embedded rows as a list (empty list when none exist).
+        photos = car.pop("inventory_photo", None) or []
+        car["photo_urls"] = [
+            p["url"]
+            for p in sorted(photos, key=lambda p: (not p.get("is_main"), p.get("sort_order") or 0))
+        ]
         return ok(car)
     except Exception as e:  # noqa: BLE001 — tools must never raise
         return err(f"get_car failed: {e}")
