@@ -4171,7 +4171,35 @@ def _(rid, params: dict) -> dict:
 
 @method("session.list")
 def _(rid, params: dict) -> dict:
-    db = _get_db()
+    # The cloud gateway runs ONE "machine dashboard" whose HERMES_HOME is the
+    # machine root and serves every user's profile via per-request scoping —
+    # resume/prompt already open the caller's per-profile ``state.db`` (see
+    # ``_session_db`` and the resume handler). session.list MUST do the same:
+    # a plain ``_get_db()`` reads the machine-root store, so an identified
+    # user's entire per-profile history "disappears" from the sidebar. Prefer
+    # an explicit ``profile`` param (app-global remote mode); otherwise derive
+    # ``wb-<user_id>`` from the connection identity. Single-user / legacy
+    # connections (no identity, no profile) fall back to the shared handle.
+    ident = _transport_identity()
+    profile = (params.get("profile") or "").strip() or None
+    if profile is None and ident is not None and ident.user_id:
+        try:
+            from tui_gateway.profile_router import PROFILE_PREFIX
+        except Exception:
+            PROFILE_PREFIX = "wb-"
+        profile = f"{PROFILE_PREFIX}{ident.user_id}"
+    profile_home = _profile_home(profile) if profile else None
+    close_db = False
+    if profile_home is not None:
+        from hermes_state import SessionDB
+
+        try:
+            db, close_db = SessionDB(db_path=profile_home / "state.db"), True
+        except Exception:
+            logger.debug("session.list: failed to open profile db", exc_info=True)
+            db = _get_db()
+    else:
+        db = _get_db()
     if db is None:
         return _db_unavailable_error(rid, code=5006)
     try:
@@ -4191,9 +4219,7 @@ def _(rid, params: dict) -> dict:
         # short; the compression-tip projection in ``list_sessions_rich``
         # can also merge rows.
         fetch_limit = max(limit * 2, 200)
-        # Cloud gateway: an identified connection only ever sees its own
-        # sessions; legacy connections (no identity) see everything.
-        ident = _transport_identity()
+        # Scope to the identified owner (legacy connections see everything).
         user_id = ident.user_id if ident is not None else None
         rows = [
             s
