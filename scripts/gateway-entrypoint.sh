@@ -36,6 +36,8 @@ if [ ! -f "$API_SERVER_HERMES_HOME/config.yaml" ]; then
   # Idempotent: only written on first boot. A human can hand-edit this file
   # afterwards and it will never be clobbered by a container restart.
   cat > "$API_SERVER_HERMES_HOME/config.yaml" <<'EOF'
+model: minimax/minimax-m3
+provider: openrouter
 plugins:
   enabled:
     - wheelbase-inspection
