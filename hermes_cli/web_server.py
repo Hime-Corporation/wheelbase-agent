@@ -7103,6 +7103,69 @@ async def get_cron_delivery_targets():
     return {"targets": targets}
 
 
+@app.get("/api/cron/channels")
+async def get_cron_channels():
+    """All supported delivery channels plus which are currently configured.
+
+    Returns the full set of known delivery platforms from
+    ``cron.scheduler._KNOWN_DELIVERY_PLATFORMS``, each annotated with
+    ``available: true`` when the platform's gateway is connected and
+    ``home_target_set: true`` when its cron home channel/address is configured.
+
+    The channel selector can use this to show all options, greying out or
+    decorating unconfigured ones rather than hiding them entirely.
+
+    Response shape::
+
+        {
+            "channels": [
+                {
+                    "id": "telegram",
+                    "name": "Telegram",
+                    "available": true,
+                    "home_target_set": true
+                },
+                ...
+            ]
+        }
+    """
+    from cron.scheduler import _KNOWN_DELIVERY_PLATFORMS  # noqa: PLC0415
+
+    # Build the set of connected platforms and configured home targets from
+    # the same helpers delivery-targets uses so the two endpoints stay in sync.
+    connected: set = set()
+    home_target_set_ids: set = set()
+    try:
+        from gateway.config import load_gateway_config
+        from cron.scheduler import (  # noqa: PLC0415
+            _iter_home_target_platforms,
+            _get_home_target_chat_id,
+            _is_known_delivery_platform,
+        )
+
+        gateway_config = load_gateway_config()
+        connected = {p.value for p in gateway_config.get_connected_platforms()}
+
+        for pname in _iter_home_target_platforms():
+            if _is_known_delivery_platform(pname) and _get_home_target_chat_id(pname):
+                home_target_set_ids.add(pname)
+    except Exception:
+        _log.debug("GET /api/cron/channels: gateway config unavailable", exc_info=True)
+
+    channels = []
+    for platform_id in sorted(_KNOWN_DELIVERY_PLATFORMS):
+        channels.append(
+            {
+                "id": platform_id,
+                "name": platform_id.replace("_", " ").title(),
+                "available": platform_id in connected,
+                "home_target_set": platform_id in home_target_set_ids,
+            }
+        )
+
+    return {"channels": channels}
+
+
 @app.put("/api/cron/jobs/{job_id}")
 async def update_cron_job(job_id: str, body: CronJobUpdate, profile: Optional[str] = None):
     selected = profile or _find_cron_job_profile(job_id)
