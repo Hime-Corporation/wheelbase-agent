@@ -4346,8 +4346,18 @@ def _(rid, params: dict) -> dict:
     except (TypeError, ValueError):
         cols = 80
     # ``profile`` (app-global remote mode): resume a session that lives in another
-    # local profile's state.db. None/own profile → the launch profile (unchanged).
+    # local profile's state.db. Derive from connection identity when absent,
+    # mirroring session.list — the cloud gateway is a single machine dashboard
+    # that serves all users via per-profile DB scoping.
     profile = (params.get("profile") or "").strip() or None
+    if profile is None:
+        _resume_ident = _transport_identity()
+        if _resume_ident is not None and _resume_ident.user_id:
+            try:
+                from tui_gateway.profile_router import PROFILE_PREFIX
+            except Exception:
+                PROFILE_PREFIX = "wb-"
+            profile = f"{PROFILE_PREFIX}{_resume_ident.user_id}"
     profile_home = _profile_home(profile)
 
     # In a profile scope, the agent OWNS a long-lived db handle bound to that
