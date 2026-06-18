@@ -160,7 +160,14 @@ def provision_profile(
     if not soul_path.exists():
         soul_path.write_text(DEFAULT_SOUL, encoding="utf-8")
 
-    if first_time:
+    # Seed bundled skills on first creation, or when the skills/ dir exists but
+    # is empty (e.g. profiles migrated from the shared store before skill
+    # seeding ran). seed_profile_skills() is idempotent: its sync manifest never
+    # overwrites user-edited skills nor resurrects user-deleted ones, and the
+    # .no-bundled-skills opt-out marker is honored inside the call.
+    skills_dir = profile_dir / "skills"
+    skills_empty = not any(skills_dir.rglob("SKILL.md")) if skills_dir.is_dir() else True
+    if first_time or skills_empty:
         (seed_skills or _default_seed_skills)(profile_dir)
     return profile_dir
 
@@ -186,6 +193,12 @@ def _default_spawn(user_id: str, port: int, env: dict[str, str]) -> Any:
         "--no-open",
         "--insecure",
         "--skip-build",
+        # Keep this child scoped to its own profile dir. Without --isolated,
+        # hermes_cli's "unified profile launch" re-execs the child into the
+        # SHARED machine dashboard (HERMES_HOME reset to the volume root), so
+        # plugin discovery reads the root config.yaml instead of this profile's
+        # — and the per-profile Wheelbase plugins never load (no tools).
+        "--isolated",
         "--host",
         "127.0.0.1",
         "--port",

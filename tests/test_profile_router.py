@@ -115,6 +115,38 @@ def test_provision_model_env_override(tmp_path, monkeypatch):
     assert cfg["provider"] == "anthropic"
 
 
+def test_default_spawn_passes_isolated_flag(monkeypatch):
+    """_default_spawn must pass --isolated so hermes_cli's unified-profile
+    re-exec is suppressed and the child keeps its per-profile HERMES_HOME
+    instead of being re-execed into the shared machine dashboard. Regression
+    guard for the "per-user child has no Wheelbase tools" bug: without
+    --isolated the child reads the root config.yaml, where the Wheelbase
+    plugins are never enabled.
+    """
+    captured: list[list[str]] = []
+
+    class _Proc:
+        def poll(self):
+            return None
+
+    def fake_popen(cmd, *, env, stdin):
+        captured.append(list(cmd))
+        return _Proc()
+
+    monkeypatch.setattr("subprocess.Popen", fake_popen)
+
+    from tui_gateway.profile_router import _default_spawn
+
+    _default_spawn("user-aaaa", 9400, {})
+
+    assert len(captured) == 1
+    cmd = captured[0]
+    assert "--isolated" in cmd
+    assert "dashboard" in cmd
+    assert "--skip-build" in cmd
+    assert "--port" in cmd and "9400" in cmd
+
+
 class FakeProc:
     def __init__(self):
         self.exit_code = None

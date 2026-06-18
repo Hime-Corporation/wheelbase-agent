@@ -8,12 +8,21 @@ import pytest
 from tui_gateway import profile_router
 
 DOCKERFILE = Path(__file__).resolve().parents[1] / "Dockerfile.gateway"
+GATEWAY_ENTRYPOINT = (
+    Path(__file__).resolve().parents[1] / "scripts" / "gateway-entrypoint.sh"
+)
 
 
 def test_gateway_cmd_is_profile_router():
     text = DOCKERFILE.read_text()
-    assert 'CMD ["python", "-m", "tui_gateway.profile_router"]' in text
-    assert '"hermes_cli.main", "dashboard"' not in text.split("CMD")[-1]
+    cmd_section = text.split("CMD")[-1]
+    # The container boots via the entrypoint wrapper (which also supervises the
+    # gateway.run API server), whose primary/critical process is the profile
+    # router — see scripts/gateway-entrypoint.sh.
+    assert 'CMD ["scripts/gateway-entrypoint.sh"]' in text
+    assert "python -m tui_gateway.profile_router" in GATEWAY_ENTRYPOINT.read_text()
+    # The container root must never be a bare per-profile dashboard.
+    assert '"hermes_cli.main", "dashboard"' not in cmd_section
     assert "EXPOSE 9320" in text
 
 
