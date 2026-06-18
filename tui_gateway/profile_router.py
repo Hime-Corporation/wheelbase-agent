@@ -84,12 +84,52 @@ def _default_seed_skills(profile_dir: Path) -> None:
     seed_profile_skills(profile_dir, quiet=True)
 
 
+def _ensure_profile_plugins_enabled(config_path: Path) -> bool:
+    """Back-fill PROFILE_PLUGINS into an existing profile ``config.yaml``.
+
+    The original provision step wrote ``config.yaml`` only when absent, so a
+    profile created before a plugin was added to ``PROFILE_PLUGINS`` (or one
+    migrated from the pre-cutover shared store) keeps a stale or empty
+    ``plugins.enabled`` list. Bundled Wheelbase plugins are ``standalone`` kind,
+    so they load *only* when explicitly enabled — leaving such a profile with no
+    Wheelbase tools and no self-healing path. Merge the required plugins in
+    (order-preserving union) without disturbing any other user edits. Returns
+    ``True`` if the file was rewritten.
+    """
+    import yaml
+
+    try:
+        config = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    except (OSError, yaml.YAMLError):
+        logger.warning("could not read profile config for plugin back-fill: %s", config_path)
+        return False
+    if not isinstance(config, dict):
+        return False
+
+    plugins = config.get("plugins")
+    if not isinstance(plugins, dict):
+        plugins = {}
+    enabled = plugins.get("enabled")
+    if not isinstance(enabled, list):
+        enabled = []
+
+    missing = [p for p in PROFILE_PLUGINS if p not in enabled]
+    if not missing:
+        return False
+
+    plugins["enabled"] = list(enabled) + missing
+    config["plugins"] = plugins
+    config_path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
+    logger.info("back-filled wheelbase plugins into %s: added %s", config_path, missing)
+    return True
+
+
 def provision_profile(
     profile_dir: Path,
     *,
     seed_skills: Optional[Callable[[Path], None]] = None,
 ) -> Path:
-    """Seed one profile directory once and preserve existing user edits."""
+    """Seed a profile directory, preserving user edits but back-filling plugins."""
     import yaml
 
     from hermes_cli.profiles import _PROFILE_DIRS
@@ -113,6 +153,8 @@ def provision_profile(
             },
         }
         config_path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
+    else:
+        _ensure_profile_plugins_enabled(config_path)
 
     soul_path = profile_dir / "SOUL.md"
     if not soul_path.exists():

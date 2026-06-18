@@ -50,16 +50,57 @@ def test_provision_writes_config_with_plugins(tmp_path):
     assert seeded == [profile_dir]
 
 
-def test_provision_is_idempotent_and_preserves_user_edits(tmp_path):
+def test_provision_preserves_user_edits_but_backfills_plugins(tmp_path):
     profile_dir = tmp_path / "wb-user-aaaa"
     provision_profile(profile_dir, seed_skills=lambda p: None)
+    # User customizes model + SOUL; the config (e.g. a pre-cutover profile)
+    # carries no plugins.enabled list at all.
     (profile_dir / "config.yaml").write_text("model: custom/model\n")
     (profile_dir / "SOUL.md").write_text("MY SOUL")
 
     provision_profile(profile_dir, seed_skills=lambda p: None)
 
-    assert (profile_dir / "config.yaml").read_text() == "model: custom/model\n"
+    cfg = yaml.safe_load((profile_dir / "config.yaml").read_text())
+    # Non-plugin user edits are preserved ...
+    assert cfg["model"] == "custom/model"
     assert (profile_dir / "SOUL.md").read_text() == "MY SOUL"
+    # ... and the mandatory Wheelbase plugins are back-filled so the child
+    # actually loads its tools.
+    assert cfg["plugins"]["enabled"] == list(PROFILE_PLUGINS)
+
+
+def test_provision_idempotent_when_config_complete(tmp_path):
+    profile_dir = tmp_path / "wb-user-cccc"
+    provision_profile(profile_dir, seed_skills=lambda p: None)
+    first = (profile_dir / "config.yaml").read_text()
+
+    provision_profile(profile_dir, seed_skills=lambda p: None)
+
+    # A complete config is left byte-for-byte untouched (no needless rewrite).
+    assert (profile_dir / "config.yaml").read_text() == first
+
+
+def test_provision_backfills_partial_plugins_without_duplicates(tmp_path):
+    profile_dir = tmp_path / "wb-user-dddd"
+    profile_dir.mkdir(parents=True)
+    # Stale profile enabled only the original core plugin plus a user plugin.
+    (profile_dir / "config.yaml").write_text(
+        yaml.safe_dump(
+            {"plugins": {"enabled": ["wheelbase-core", "my-custom-plugin"]}},
+            sort_keys=False,
+        )
+    )
+
+    provision_profile(profile_dir, seed_skills=lambda p: None)
+
+    enabled = yaml.safe_load(
+        (profile_dir / "config.yaml").read_text()
+    )["plugins"]["enabled"]
+    # User entry preserved, no duplicate of the already-enabled core plugin,
+    # and every required Wheelbase plugin now present.
+    assert enabled.count("wheelbase-core") == 1
+    assert "my-custom-plugin" in enabled
+    assert set(PROFILE_PLUGINS).issubset(set(enabled))
 
 
 def test_provision_model_env_override(tmp_path, monkeypatch):
