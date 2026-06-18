@@ -412,9 +412,11 @@ def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> No
     # continuation. Fix for #20001.
     if session_id:
         try:
-            db = _get_db()
-            if db is not None:
-                db.end_session(session_id, end_reason)
+            # Profile-aware: a remote/profile session's row lives in its own
+            # state.db, not the launch store — end it there or it lingers "open".
+            with _session_db(session) as db:
+                if db is not None:
+                    db.end_session(session_id, end_reason)
         except Exception:
             pass
 
@@ -1282,6 +1284,66 @@ def _session_db(session: dict):
                 db.close()
 
 
+def _request_profile(params: dict) -> str | None:
+    """Resolve the per-profile name for a ``session.*`` RPC.
+
+    The cloud gateway is a single machine dashboard serving every user via
+    per-profile ``state.db`` files. A handler keyed by a ``session_id`` from
+    params (rather than a live session dict) must resolve the SAME per-profile
+    store that ``session.create`` / ``session.list`` / ``session.resume`` use:
+    an explicit ``profile`` param, else ``wb-<user_id>`` derived from the
+    connection identity. Returns None for single-user / legacy connections
+    (no identity, no profile) → callers fall back to the shared launch store.
+    """
+    profile = (params.get("profile") or "").strip() or None
+    if profile is None:
+        ident = _transport_identity()
+        if ident is not None and ident.user_id:
+            try:
+                from tui_gateway.profile_router import PROFILE_PREFIX
+            except Exception:
+                PROFILE_PREFIX = "wb-"
+            profile = f"{PROFILE_PREFIX}{ident.user_id}"
+    return profile
+
+
+@contextlib.contextmanager
+def _request_profile_db(params: dict):
+    """Yield the SessionDB for a ``session.*`` RPC keyed by a ``session_id``.
+
+    Mirrors ``session.list``'s db resolution for handlers that look a session up
+    by id (delete/most_recent/etc.) rather than holding a live session dict:
+    open the caller's per-profile ``state.db`` (a fresh handle closed on exit),
+    falling back to the shared ``_get_db()`` for single-user / legacy
+    connections. Yields None when the db is unavailable.
+    """
+    profile = _request_profile(params)
+    profile_home = _profile_home(profile) if profile else None
+    db, close_db = None, False
+    if profile_home is not None:
+        from hermes_state import SessionDB
+
+        try:
+            db, close_db = SessionDB(db_path=profile_home / "state.db"), True
+        except Exception:
+            logger.debug("failed to open profile db for request", exc_info=True)
+            db = _get_db()
+    else:
+        db = _get_db()
+    try:
+        yield db
+    finally:
+        if close_db and db is not None:
+            with contextlib.suppress(Exception):
+                db.close()
+
+
+def _request_profile_home(params: dict) -> Path | None:
+    """The per-profile home for a request, or None (shared launch store)."""
+    profile = _request_profile(params)
+    return _profile_home(profile) if profile else None
+
+
 def _set_session_cwd(session: dict, cwd: str) -> str:
     if session.get("wheelbase_identity") is not None:
         from tui_gateway.wheelbase_inject import contain_workspace_path
@@ -1295,12 +1357,12 @@ def _set_session_cwd(session: dict, cwd: str) -> str:
             register_task_env_overrides(session["session_key"], {"cwd": resolved})
         except Exception:
             logger.debug("failed to register sandbox cwd override", exc_info=True)
-        db = _get_db()
-        if db is not None:
-            try:
-                db.update_session_cwd(session.get("session_key", ""), resolved)
-            except Exception:
-                logger.debug("failed to persist session cwd", exc_info=True)
+        with _session_db(session) as db:
+            if db is not None:
+                try:
+                    db.update_session_cwd(session.get("session_key", ""), resolved)
+                except Exception:
+                    logger.debug("failed to persist session cwd", exc_info=True)
         return resolved
 
     resolved = os.path.abspath(os.path.expanduser(str(cwd)))
@@ -3283,7 +3345,9 @@ def _background_agent_kwargs(agent, task_id: str) -> dict:
         "service_tier": getattr(agent, "service_tier", None) or _load_service_tier(),
         "request_overrides": dict(getattr(agent, "request_overrides", {}) or {}),
         "platform": "tui",
-        "session_db": _get_db(),
+        # Profile-aware: reuse the originating agent's handle so a background /
+        # preview sub-agent persists to the same (profile) store, not launch root.
+        "session_db": getattr(agent, "_session_db", None) or _get_db(),
         "fallback_model": _agent_fallback_model(agent),
     }
 
@@ -4049,7 +4113,16 @@ def _(rid, params: dict) -> dict:
     # profile must build its agent + persist against THAT profile's home/state.db,
     # not the dashboard's launch profile. Stored on the session so _start_agent_build
     # and each turn re-bind HERMES_HOME. None/own profile → launch (unchanged).
-    profile = (params.get("profile") or "").strip() or None
+    #
+    # Cloud gateway: one machine dashboard serving every user via per-profile DB
+    # scoping. With no explicit ``profile`` (every mobile client, and desktop in
+    # own-profile mode) _request_profile derives ``wb-<user_id>`` from the
+    # connection identity, mirroring session.list (242463e33) and session.resume
+    # (d166d49a8). Without this, a new chat persists its row to the machine-root
+    # state.db and builds its agent against the machine-root HERMES_HOME, so it
+    # never appears in the user's per-profile session.list and runs against the
+    # wrong profile's skills/config — "new chat doesn't show up / wrong agent".
+    profile = _request_profile(params)
     profile_home = _profile_home(profile)
 
     # The desktop composer owns its model/effort/fast as plain UI state and ships
@@ -4181,13 +4254,7 @@ def _(rid, params: dict) -> dict:
     # ``wb-<user_id>`` from the connection identity. Single-user / legacy
     # connections (no identity, no profile) fall back to the shared handle.
     ident = _transport_identity()
-    profile = (params.get("profile") or "").strip() or None
-    if profile is None and ident is not None and ident.user_id:
-        try:
-            from tui_gateway.profile_router import PROFILE_PREFIX
-        except Exception:
-            PROFILE_PREFIX = "wb-"
-        profile = f"{PROFILE_PREFIX}{ident.user_id}"
+    profile = _request_profile(params)
     profile_home = _profile_home(profile) if profile else None
     close_db = False
     if profile_home is not None:
@@ -4260,6 +4327,13 @@ def _(rid, params: dict) -> dict:
         )
     except Exception as e:
         return _err(rid, 5006, str(e))
+    finally:
+        # Close the transient per-profile handle (the shared launch handle from
+        # _get_db() is left open). Without this the profile db connection leaked
+        # one handle per session.list call.
+        if close_db and db is not None:
+            with contextlib.suppress(Exception):
+                db.close()
 
 
 @method("session.most_recent")
@@ -4277,38 +4351,41 @@ def _(rid, params: dict) -> dict:
     null-result shape (and logged) so callers don't have to special-
     case JSON-RPC error envelopes for what is a normal "no answer".
     """
-    db = _get_db()
-    if db is None:
-        return _ok(rid, {"session_id": None})
-    try:
-        deny = frozenset({"tool"})
-        # Over-fetch by a generous bounded amount so heavy sub-agent
-        # users (lots of recent ``tool`` rows) don't get a false
-        # "no eligible session" answer.  ``session.list`` uses a
-        # similar over-fetch strategy.
-        ident = _transport_identity()
-        rows = db.list_sessions_rich(
-            source=None,
-            limit=200,
-            user_id=ident.user_id if ident is not None else None,
-        )
-        for row in rows:
-            src = (row.get("source") or "").strip().lower()
-            if src in deny:
-                continue
-            return _ok(
-                rid,
-                {
-                    "session_id": row.get("id"),
-                    "title": row.get("title") or "",
-                    "started_at": row.get("started_at") or 0,
-                    "source": row.get("source") or "",
-                },
+    # Profile-aware: read the caller's per-profile store (mirrors session.list),
+    # not the machine-root launch db — else auto-resume never finds the user's
+    # latest chat on the cloud dashboard.
+    with _request_profile_db(params) as db:
+        if db is None:
+            return _ok(rid, {"session_id": None})
+        try:
+            deny = frozenset({"tool"})
+            # Over-fetch by a generous bounded amount so heavy sub-agent
+            # users (lots of recent ``tool`` rows) don't get a false
+            # "no eligible session" answer.  ``session.list`` uses a
+            # similar over-fetch strategy.
+            ident = _transport_identity()
+            rows = db.list_sessions_rich(
+                source=None,
+                limit=200,
+                user_id=ident.user_id if ident is not None else None,
             )
-        return _ok(rid, {"session_id": None})
-    except Exception:
-        logger.exception("session.most_recent failed")
-        return _ok(rid, {"session_id": None})
+            for row in rows:
+                src = (row.get("source") or "").strip().lower()
+                if src in deny:
+                    continue
+                return _ok(
+                    rid,
+                    {
+                        "session_id": row.get("id"),
+                        "title": row.get("title") or "",
+                        "started_at": row.get("started_at") or 0,
+                        "source": row.get("source") or "",
+                    },
+                )
+            return _ok(rid, {"session_id": None})
+        except Exception:
+            logger.exception("session.most_recent failed")
+            return _ok(rid, {"session_id": None})
 
 
 @method("identity.update")
@@ -4349,15 +4426,7 @@ def _(rid, params: dict) -> dict:
     # local profile's state.db. Derive from connection identity when absent,
     # mirroring session.list — the cloud gateway is a single machine dashboard
     # that serves all users via per-profile DB scoping.
-    profile = (params.get("profile") or "").strip() or None
-    if profile is None:
-        _resume_ident = _transport_identity()
-        if _resume_ident is not None and _resume_ident.user_id:
-            try:
-                from tui_gateway.profile_router import PROFILE_PREFIX
-            except Exception:
-                PROFILE_PREFIX = "wb-"
-            profile = f"{PROFILE_PREFIX}{_resume_ident.user_id}"
+    profile = _request_profile(params)
     profile_home = _profile_home(profile)
 
     # In a profile scope, the agent OWNS a long-lived db handle bound to that
@@ -4704,12 +4773,12 @@ def _message_preview(history: list) -> str:
 
 def _session_live_title(session: dict, key: str) -> str:
     title = str(session.get("pending_title") or "").strip()
-    db = _get_db()
-    if db is not None:
-        try:
-            title = str(db.get_session_title(key) or title or "").strip()
-        except Exception:
-            pass
+    with _session_db(session) as db:
+        if db is not None:
+            try:
+                title = str(db.get_session_title(key) or title or "").strip()
+            except Exception:
+                pass
     return title
 
 
@@ -4871,9 +4940,6 @@ def _(rid, params: dict) -> dict:
     target = params.get("session_id", "")
     if not target:
         return _err(rid, 4006, "session_id required")
-    db = _get_db()
-    if db is None:
-        return _db_unavailable_error(rid, code=5036)
     # Block deletion of any session currently bound to a live TUI session
     # in this process.  The picker hides the active session anyway, but a
     # racing caller could still target it.  Snapshot via ``list(...)``
@@ -4889,11 +4955,18 @@ def _(rid, params: dict) -> dict:
     active = {s.get("session_key") for s in snapshot if s.get("session_key")}
     if target in active:
         return _err(rid, 4023, "cannot delete an active session")
-    sessions_dir = get_hermes_home() / "sessions"
-    try:
-        deleted = db.delete_session(target, sessions_dir=sessions_dir)
-    except Exception as e:
-        return _err(rid, 5036, f"delete failed: {e}")
+    # Profile-aware: the row AND its transcript files live in the caller's
+    # per-profile store, not the machine-root launch db (mirrors session.list).
+    # Resolve both from the connection identity or deletes 404 on the dashboard.
+    profile_home = _request_profile_home(params)
+    sessions_dir = (profile_home or get_hermes_home()) / "sessions"
+    with _request_profile_db(params) as db:
+        if db is None:
+            return _db_unavailable_error(rid, code=5036)
+        try:
+            deleted = db.delete_session(target, sessions_dir=sessions_dir)
+        except Exception as e:
+            return _err(rid, 5036, f"delete failed: {e}")
     if not deleted:
         return _err(rid, 4007, "session not found")
     return _ok(rid, {"deleted": target})
@@ -4904,62 +4977,64 @@ def _(rid, params: dict) -> dict:
     session, err = _sess_nowait(params, rid)
     if err:
         return err
-    db = _get_db()
-    if db is None:
-        return _db_unavailable_error(rid, code=5007)
-    key = session["session_key"]
-    if "title" not in params:
-        fallback = session.get("pending_title") or ""
-        try:
-            resolved_title = db.get_session_title(key) or ""
-            if fallback:
-                if db.set_session_title(key, fallback):
-                    session["pending_title"] = None
-                    resolved_title = fallback
-                else:
-                    existing_row = db.get_session(key)
-                    existing_title = ((existing_row or {}).get("title") or "").strip()
-                    if existing_title == fallback:
+    # Profile-aware: a remote/profile session's title lives in its own state.db,
+    # not the launch store — read/write it there or titles silently vanish.
+    with _session_db(session) as db:
+        if db is None:
+            return _db_unavailable_error(rid, code=5007)
+        key = session["session_key"]
+        if "title" not in params:
+            fallback = session.get("pending_title") or ""
+            try:
+                resolved_title = db.get_session_title(key) or ""
+                if fallback:
+                    if db.set_session_title(key, fallback):
                         session["pending_title"] = None
                         resolved_title = fallback
-                    elif not resolved_title:
-                        resolved_title = fallback
-            elif resolved_title:
-                session["pending_title"] = None
-        except Exception:
-            resolved_title = fallback
-        return _ok(
-            rid,
-            {
-                "title": resolved_title,
-                "session_key": key,
-            },
-        )
-    title = (params.get("title", "") or "").strip()
-    if not title:
-        return _err(rid, 4021, "title required")
-    try:
-        if db.set_session_title(key, title):
-            session["pending_title"] = None
-            return _ok(rid, {"pending": False, "title": title})
-        # rowcount == 0 can mean "same value" as well as "missing row".
-        # Queue only when the session row truly does not exist yet.
-        existing_row = db.get_session(key)
-        if existing_row:
-            session["pending_title"] = None
+                    else:
+                        existing_row = db.get_session(key)
+                        existing_title = ((existing_row or {}).get("title") or "").strip()
+                        if existing_title == fallback:
+                            session["pending_title"] = None
+                            resolved_title = fallback
+                        elif not resolved_title:
+                            resolved_title = fallback
+                elif resolved_title:
+                    session["pending_title"] = None
+            except Exception:
+                resolved_title = fallback
             return _ok(
                 rid,
                 {
-                    "pending": False,
-                    "title": (existing_row.get("title") or title),
+                    "title": resolved_title,
+                    "session_key": key,
                 },
             )
-        session["pending_title"] = title
-        return _ok(rid, {"pending": True, "title": title})
-    except ValueError as e:
-        return _err(rid, 4022, str(e))
-    except Exception as e:
-        return _err(rid, 5007, str(e))
+        title = (params.get("title", "") or "").strip()
+        if not title:
+            return _err(rid, 4021, "title required")
+        try:
+            if db.set_session_title(key, title):
+                session["pending_title"] = None
+                return _ok(rid, {"pending": False, "title": title})
+            # rowcount == 0 can mean "same value" as well as "missing row".
+            # Queue only when the session row truly does not exist yet.
+            existing_row = db.get_session(key)
+            if existing_row:
+                session["pending_title"] = None
+                return _ok(
+                    rid,
+                    {
+                        "pending": False,
+                        "title": (existing_row.get("title") or title),
+                    },
+                )
+            session["pending_title"] = title
+            return _ok(rid, {"pending": True, "title": title})
+        except ValueError as e:
+            return _err(rid, 4022, str(e))
+        except Exception as e:
+            return _err(rid, 5007, str(e))
 
 
 @method("handoff.request")
@@ -5169,7 +5244,8 @@ def _(rid, params: dict) -> dict:
     key = session.get("session_key") or params.get("session_id") or ""
     agent = session.get("agent")
     meta = {}
-    db = _get_db()
+    # Profile-aware: read meta from the session's own state.db (profile store).
+    db = getattr(agent, "_session_db", None) or _get_db()
     if db and key:
         try:
             meta = db.get_session(key) or {}
@@ -5221,14 +5297,15 @@ def _(rid, params: dict) -> dict:
     if err:
         return err
     history = list(session.get("history", []))
-    db = _get_db()
-    if db is not None and session.get("session_key"):
-        try:
-            history = db.get_messages_as_conversation(
-                session["session_key"], include_ancestors=True
-            )
-        except Exception:
-            pass
+    # Profile-aware: read the transcript from the session's own state.db.
+    with _session_db(session) as db:
+        if db is not None and session.get("session_key"):
+            try:
+                history = db.get_messages_as_conversation(
+                    session["session_key"], include_ancestors=True
+                )
+            except Exception:
+                pass
     return _ok(
         rid,
         {
@@ -5434,9 +5511,6 @@ def _(rid, params: dict) -> dict:
     session, err = _sess(params, rid)
     if err:
         return err
-    db = _get_db()
-    if db is None:
-        return _db_unavailable_error(rid, code=5008)
     old_key = session["session_key"]
     with session["history_lock"]:
         history = [dict(msg) for msg in session.get("history", [])]
@@ -5448,55 +5522,91 @@ def _(rid, params: dict) -> dict:
     if limit_message is not None:
         return _err(rid, 4090, limit_message)
     branch_name = params.get("name", "")
+    # Profile-aware: branch into the parent session's own store + HERMES_HOME,
+    # not the machine-root launch db — else the branch never appears in the
+    # user's session.list and its agent runs against the wrong profile's config.
+    profile_home = session.get("profile_home")
     try:
-        if branch_name:
-            title = branch_name
-        else:
-            current = db.get_session_title(old_key) or "branch"
-            title = (
-                db.get_next_title_in_lineage(current)
-                if hasattr(db, "get_next_title_in_lineage")
-                else f"{current} (branch)"
+        with _session_db(session) as db:
+            if db is None:
+                if lease is not None:
+                    lease.release()
+                return _db_unavailable_error(rid, code=5008)
+            if branch_name:
+                title = branch_name
+            else:
+                current = db.get_session_title(old_key) or "branch"
+                title = (
+                    db.get_next_title_in_lineage(current)
+                    if hasattr(db, "get_next_title_in_lineage")
+                    else f"{current} (branch)"
+                )
+            db.create_session(
+                new_key,
+                source="tui",
+                model=_resolve_model(),
+                # Stable _branched_from marker so list_sessions_rich() keeps the
+                # branch visible in /resume and /sessions. The TUI branch leaves
+                # the parent live (no end_reason='branched'), so the legacy
+                # end_reason heuristic never matches it — the marker is the only
+                # thing that surfaces TUI branches. See issue #20856.
+                model_config={"_branched_from": old_key},
+                parent_session_id=old_key,
+                cwd=_session_cwd(session),
             )
-        db.create_session(
-            new_key,
-            source="tui",
-            model=_resolve_model(),
-            # Stable _branched_from marker so list_sessions_rich() keeps the
-            # branch visible in /resume and /sessions. The TUI branch leaves
-            # the parent live (no end_reason='branched'), so the legacy
-            # end_reason heuristic never matches it — the marker is the only
-            # thing that surfaces TUI branches. See issue #20856.
-            model_config={"_branched_from": old_key},
-            parent_session_id=old_key,
-            cwd=_session_cwd(session),
-        )
-        for msg in history:
-            db.append_message(
-                session_id=new_key,
-                role=msg.get("role", "user"),
-                content=msg.get("content"),
-            )
-        db.set_session_title(new_key, title)
+            for msg in history:
+                db.append_message(
+                    session_id=new_key,
+                    role=msg.get("role", "user"),
+                    content=msg.get("content"),
+                )
+            db.set_session_title(new_key, title)
     except Exception as e:
         if lease is not None:
             lease.release()
         return _err(rid, 5008, f"branch failed: {e}")
+    # Build the branch agent against the parent's profile (HERMES_HOME + its
+    # state.db), and stamp profile_home on the new session so each turn re-binds.
+    # Bound before the try so the error-path cleanup can always see it.
+    branch_session_db = None
+    home_token = set_hermes_home_override(str(profile_home)) if profile_home else None
     try:
         tokens = _set_session_context(new_key)
         try:
-            agent = _make_agent(new_sid, new_key, session_id=new_key)
+            if profile_home:
+                from hermes_state import SessionDB
+
+                branch_session_db = SessionDB(db_path=Path(profile_home) / "state.db")
+            agent = _make_agent(
+                new_sid, new_key, session_id=new_key, session_db=branch_session_db
+            )
         finally:
             _clear_session_context(tokens)
         _init_session(
-            new_sid, new_key, agent, list(history), cols=session.get("cols", 80)
+            new_sid,
+            new_key,
+            agent,
+            list(history),
+            cols=session.get("cols", 80),
+            session_db=branch_session_db,
         )
         if new_sid in _sessions:
             _sessions[new_sid]["active_session_lease"] = lease
+            if profile_home:
+                _sessions[new_sid]["profile_home"] = str(profile_home)
     except Exception as e:
         if lease is not None:
             lease.release()
+        # On success the branch agent owns branch_session_db; on failure it
+        # never took ownership, so close it here or a failed branch leaks a
+        # SQLite handle (the agent's close() does not free it).
+        if branch_session_db is not None:
+            with contextlib.suppress(Exception):
+                branch_session_db.close()
         return _err(rid, 5000, f"agent init failed on branch: {e}")
+    finally:
+        if home_token is not None:
+            reset_hermes_home_override(home_token)
     return _ok(rid, {"session_id": new_sid, "title": title, "parent": old_key})
 
 
@@ -5817,9 +5927,12 @@ def _(rid, params: dict) -> dict:
             truncated = history[: user_indices[ordinal]]
             session["history"] = truncated
             session["history_version"] = int(session.get("history_version", 0)) + 1
-            if (db := _get_db()) is not None:
+            # Profile-aware: persist the truncation to the session's own
+            # state.db (agent handle = profile store on the cloud dashboard).
+            _edit_db = getattr(session.get("agent"), "_session_db", None) or _get_db()
+            if _edit_db is not None:
                 try:
-                    db.replace_messages(session["session_key"], truncated)
+                    _edit_db.replace_messages(session["session_key"], truncated)
                 except Exception as exc:
                     print(f"[tui_gateway] prompt.submit: replace_messages failed: {exc}", file=sys.stderr)
         session["running"] = True
@@ -6338,7 +6451,9 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
             # Apply pending_title now that the DB row exists.
             _pending = session.get("pending_title")
             if _pending and status == "complete":
-                _pdb = _get_db()
+                # Profile-aware: the agent's own handle is bound to the
+                # session's state.db (profile store on the cloud dashboard).
+                _pdb = getattr(agent, "_session_db", None) or _get_db()
                 if _pdb:
                     _session_key = session.get("session_key") or sid
                     try:
@@ -6367,7 +6482,7 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                     from agent.title_generator import maybe_auto_title
 
                     maybe_auto_title(
-                        _get_db(),
+                        getattr(agent, "_session_db", None) or _get_db(),
                         session.get("session_key") or sid,
                         text,
                         raw,
@@ -6437,7 +6552,9 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                 from tui_gateway.wheelbase_usage import report_session_usage
 
                 report_session_usage(
-                    _get_db(), session.get("session_key") or "", session.get("wheelbase_identity")
+                    getattr(agent, "_session_db", None) or _get_db(),
+                    session.get("session_key") or "",
+                    session.get("wheelbase_identity"),
                 )
             except Exception:
                 logger.debug("usage report dispatch failed", exc_info=True)
@@ -8677,7 +8794,9 @@ def _(rid, params: dict) -> dict:
             return _err(
                 rid, 4009, "session busy — /interrupt the current turn before /undo"
             )
-        db = _get_db()
+        # Profile-aware: the agent's handle is bound to the session's own
+        # state.db (profile store on the cloud dashboard), not the launch db.
+        db = getattr(session.get("agent"), "_session_db", None) or _get_db()
         if db is None:
             return _db_unavailable_error(rid, code=5008)
         session_key = session.get("session_key", "")
@@ -9862,26 +9981,27 @@ def _(rid, params: dict) -> dict:
 @method("insights.get")
 def _(rid, params: dict) -> dict:
     days = params.get("days", 30)
-    db = _get_db()
-    if db is None:
-        return _db_unavailable_error(rid, code=5017)
-    try:
-        cutoff = time.time() - days * 86400
-        rows = [
-            s
-            for s in db.list_sessions_rich(limit=500)
-            if (s.get("started_at") or 0) >= cutoff
-        ]
-        return _ok(
-            rid,
-            {
-                "days": days,
-                "sessions": len(rows),
-                "messages": sum(s.get("message_count", 0) for s in rows),
-            },
-        )
-    except Exception as e:
-        return _err(rid, 5017, str(e))
+    # Profile-aware: aggregate the caller's per-profile store, not launch root.
+    with _request_profile_db(params) as db:
+        if db is None:
+            return _db_unavailable_error(rid, code=5017)
+        try:
+            cutoff = time.time() - days * 86400
+            rows = [
+                s
+                for s in db.list_sessions_rich(limit=500)
+                if (s.get("started_at") or 0) >= cutoff
+            ]
+            return _ok(
+                rid,
+                {
+                    "days": days,
+                    "sessions": len(rows),
+                    "messages": sum(s.get("message_count", 0) for s in rows),
+                },
+            )
+        except Exception as e:
+            return _err(rid, 5017, str(e))
 
 
 # ── Methods: rollback ────────────────────────────────────────────────
