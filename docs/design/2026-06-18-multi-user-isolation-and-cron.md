@@ -242,6 +242,21 @@ To bound load when many profiles have jobs due in the same minute, the sweep
 caps concurrent `cron tick` subprocesses (configurable; **default 8**). Excess
 due profiles run on the next sweep. Confirm the cap value during implementation.
 
+### 5.6 Deploy (implemented)
+
+- **Host-cron fallback** — in addition to the in-router sweep thread, run the
+  same sweep from host/k8s cron every minute as a restart-safety net. The
+  per-home `cron/.tick.lock` makes the double-run with the router thread safe:
+
+  ```cron
+  * * * * * cd /app && HERMES_HOME=/data/hermes /usr/bin/env python -m tui_gateway.profile_cron >> /var/log/hermes-cron-sweep.log 2>&1
+  ```
+
+- **Unattended-run timeout** — set a bounded `HERMES_CRON_TIMEOUT` on the
+  tenant container (e.g. `HERMES_CRON_TIMEOUT=600`) so a scheduled job whose
+  Daytona sandbox is stuck/archived fails closed instead of hanging (§5.4).
+  This is a container env var, not code.
+
 ## 6. Data Flow & Error Handling
 
 - **Session read path:** request → router (auth) → child (own `HERMES_HOME`) →
