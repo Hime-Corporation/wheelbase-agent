@@ -50,6 +50,24 @@ def test_provision_writes_config_with_plugins(tmp_path):
     assert seeded == [profile_dir]
 
 
+def test_main_starts_cron_sweep_thread(tmp_path, monkeypatch):
+    import threading
+
+    import tui_gateway.profile_router as pr
+
+    monkeypatch.setenv("HERMES_DASHBOARD_SESSION_TOKEN", "tok")
+    monkeypatch.setattr(pr, "profiles_root", lambda: tmp_path)
+
+    captured = {}
+
+    def fake_serve(app, host, port):
+        captured["thread_names"] = {t.name for t in threading.enumerate()}
+
+    pr.main(serve=fake_serve)
+
+    assert "profile-router-cron-sweep" in captured["thread_names"]
+
+
 def test_provision_writes_disabled_toolsets(tmp_path):
     from tui_gateway.profile_router import PROFILE_DISABLED_TOOLSETS
 

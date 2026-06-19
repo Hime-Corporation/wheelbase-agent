@@ -588,6 +588,18 @@ def main(
         daemon=True,
     ).start()
 
+    # Per-user children are dashboard processes that never tick cron; this
+    # sweep fires each profile's due jobs regardless of whether its child is
+    # alive. Local import avoids a circular dependency (profile_cron imports
+    # PROFILE_PREFIX/profiles_root from this module).
+    from tui_gateway.profile_cron import CronSweeper
+
+    threading.Thread(
+        target=CronSweeper(profiles_root()).sweep_forever,
+        name="profile-router-cron-sweep",
+        daemon=True,
+    ).start()
+
     port = int(os.environ.get("PORT", "9320"))
     serve(build_app(manager), "0.0.0.0", port)
 
