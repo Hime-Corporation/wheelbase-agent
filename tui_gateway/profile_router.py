@@ -35,6 +35,12 @@ PROFILE_PLUGINS = (
     "wheelbase-demand-matrix",
     "wheelbase-inspection",
 )
+# Toolsets removed from every per-user (wb-<uid>) profile. session_search can
+# open ANY profile's state.db by path (in-process, bypasses the Daytona
+# sandbox), so it must never be exposed to a non-admin user. The admin runs as
+# the Hermes root profile, which never goes through provision_profile and so
+# keeps session_search.
+PROFILE_DISABLED_TOOLSETS = ("session_search",)
 PORT_RANGE = (9400, 9899)
 
 DEFAULT_SOUL = """\
@@ -124,6 +130,43 @@ def _ensure_profile_plugins_enabled(config_path: Path) -> bool:
     return True
 
 
+def _ensure_session_search_disabled(config_path: Path) -> bool:
+    """Back-fill PROFILE_DISABLED_TOOLSETS into an existing profile config.yaml.
+
+    User (wb-<uid>) profiles must not expose cross-profile read tools such as
+    session_search. Profiles created before this guard (or migrated from the
+    shared store) carry no ``agent.disabled_toolsets`` list. Merge the required
+    disables in (order-preserving union) without disturbing other edits. Returns
+    ``True`` if the file was rewritten.
+    """
+    import yaml
+
+    try:
+        config = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    except (OSError, yaml.YAMLError):
+        logger.warning("could not read profile config for toolset back-fill: %s", config_path)
+        return False
+    if not isinstance(config, dict):
+        return False
+
+    agent = config.get("agent")
+    if not isinstance(agent, dict):
+        agent = {}
+    disabled = agent.get("disabled_toolsets")
+    if not isinstance(disabled, list):
+        disabled = []
+
+    missing = [t for t in PROFILE_DISABLED_TOOLSETS if t not in disabled]
+    if not missing:
+        return False
+
+    agent["disabled_toolsets"] = list(disabled) + missing
+    config["agent"] = agent
+    config_path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
+    logger.info("disabled cross-profile toolsets in %s: added %s", config_path, missing)
+    return True
+
+
 def provision_profile(
     profile_dir: Path,
     *,
@@ -146,6 +189,7 @@ def provision_profile(
             "provider": os.environ.get("WHEELBASE_PROFILE_PROVIDER", "openrouter"),
             "skin": os.environ.get("WHEELBASE_PROFILE_SKIN", "wheelbase"),
             "plugins": {"enabled": list(PROFILE_PLUGINS)},
+            "agent": {"disabled_toolsets": list(PROFILE_DISABLED_TOOLSETS)},
             "platform_toolsets": {
                 "cli": {
                     "tools": ["todo"],
@@ -155,6 +199,7 @@ def provision_profile(
         config_path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
     else:
         _ensure_profile_plugins_enabled(config_path)
+        _ensure_session_search_disabled(config_path)
 
     soul_path = profile_dir / "SOUL.md"
     if not soul_path.exists():

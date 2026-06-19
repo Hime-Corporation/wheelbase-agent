@@ -50,6 +50,47 @@ def test_provision_writes_config_with_plugins(tmp_path):
     assert seeded == [profile_dir]
 
 
+def test_provision_writes_disabled_toolsets(tmp_path):
+    from tui_gateway.profile_router import PROFILE_DISABLED_TOOLSETS
+
+    profile_dir = tmp_path / "wb-user-aaaa"
+    provision_profile(profile_dir, seed_skills=lambda p: None)
+
+    cfg = yaml.safe_load((profile_dir / "config.yaml").read_text())
+    assert cfg["agent"]["disabled_toolsets"] == list(PROFILE_DISABLED_TOOLSETS)
+    assert "session_search" in cfg["agent"]["disabled_toolsets"]
+
+
+def test_provision_backfills_disabled_toolsets_for_existing_profile(tmp_path):
+    from tui_gateway.profile_router import PROFILE_DISABLED_TOOLSETS
+
+    profile_dir = tmp_path / "wb-user-bbbb"
+    profile_dir.mkdir(parents=True)
+    # Pre-guard profile: model only, no agent block at all.
+    (profile_dir / "config.yaml").write_text("model: custom/model\n")
+
+    provision_profile(profile_dir, seed_skills=lambda p: None)
+
+    cfg = yaml.safe_load((profile_dir / "config.yaml").read_text())
+    assert cfg["model"] == "custom/model"
+    assert cfg["agent"]["disabled_toolsets"] == list(PROFILE_DISABLED_TOOLSETS)
+
+
+def test_provision_preserves_other_disabled_toolsets(tmp_path):
+    profile_dir = tmp_path / "wb-user-ccc1"
+    profile_dir.mkdir(parents=True)
+    (profile_dir / "config.yaml").write_text(
+        yaml.safe_dump({"agent": {"disabled_toolsets": ["web"]}}, sort_keys=False),
+        encoding="utf-8",
+    )
+
+    provision_profile(profile_dir, seed_skills=lambda p: None)
+
+    cfg = yaml.safe_load((profile_dir / "config.yaml").read_text())
+    # Order-preserving union: existing disable kept, session_search appended once.
+    assert cfg["agent"]["disabled_toolsets"] == ["web", "session_search"]
+
+
 def test_provision_preserves_user_edits_but_backfills_plugins(tmp_path):
     profile_dir = tmp_path / "wb-user-aaaa"
     provision_profile(profile_dir, seed_skills=lambda p: None)
