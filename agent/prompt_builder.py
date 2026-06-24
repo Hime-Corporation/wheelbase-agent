@@ -819,6 +819,61 @@ PLATFORM_HINTS = {
 }
 
 # ---------------------------------------------------------------------------
+# Wheelbase canvas protocol — teach the agent how to trigger the desktop
+# canvas/artifacts rail in the Wheelbase app.
+#
+# The Wheelbase desktop parses two special markdown href schemes from
+# assistant prose and routes them to the canvas panel (right-side rail):
+#
+#   [Preview: <label>](#preview/<encodeURIComponent(target)>)
+#     Opens a local gateway file path or an https:// URL in the canvas rail.
+#     target is a gateway-local path (e.g. /data/hermes/report.html) or a
+#     full URL. The desktop fetches gateway-local files via the authenticated
+#     hermesApi REST bridge.
+#
+#   [<label>](#media:<encodeURIComponent(path_or_url)>)
+#     Embeds a remote media asset (image, PDF) inline in the chat AND makes
+#     it available in the artifacts panel. Use for remote https:// URLs or
+#     gateway-local image paths. Images (png/jpg/webp/svg) appear inline;
+#     PDFs and other files open in the file pane.
+#
+# Both schemes are URL-encoded: encodeURIComponent("/data/report.html")
+# produces "%2Fdata%2Freport.html". The desktop strips these links from the
+# visible message so the user never sees the raw markdown.
+#
+# This hint is injected into the system prompt when Wheelbase tools are
+# loaded so the agent can trigger the canvas pipeline in practice.
+# ---------------------------------------------------------------------------
+
+WHEELBASE_CANVAS_PROTOCOL_HINT = (
+    "## Wheelbase canvas links\n"
+    "When you generate a report, chart, PDF, or any file artifact during this "
+    "conversation, reference it with a canvas link so the Wheelbase desktop "
+    "opens it automatically in the side panel — the user should not have to ask.\n\n"
+    "**HTML / file artifacts (gateway-local paths):**\n"
+    "  [Preview: Report Title](#preview/%2Fdata%2Fhermes%2Freport.html)\n"
+    "Replace the encoded path with encodeURIComponent of the actual absolute path "
+    "the agent wrote (e.g. /data/hermes/inventory-report-2026-06-24.html → "
+    "#preview/%2Fdata%2Fhermes%2Finventory-report-2026-06-24.html). "
+    "The label text after 'Preview: ' is shown as the tab title in the rail; "
+    "make it short and descriptive (e.g. 'Preview: Inventory Report'). "
+    "The 'Preview:' prefix followed by a space is required.\n\n"
+    "**Remote media (https:// URLs):**\n"
+    "  [Vehicle Photo](#media:https%3A%2F%2Fcdn.example.com%2Fimg.jpg)\n"
+    "Use #media: for any remote image or PDF URL. The URL must be "
+    "percent-encoded (encodeURIComponent). Images appear inline in the chat; "
+    "PDFs open in the file pane.\n\n"
+    "Rules:\n"
+    "- Emit at most one #preview/ link per response (the last one wins).\n"
+    "- Place the canvas link inline in your prose after describing the artifact; "
+    "do not put it on a line by itself or inside a code block.\n"
+    "- Never emit these links for files that do not exist yet; only link to "
+    "artifacts you have actually written to disk or URLs you have verified.\n"
+    "- For local files, the path must be the absolute path on the gateway "
+    "host (e.g. /data/hermes/...), not a sandbox-relative path."
+)
+
+# ---------------------------------------------------------------------------
 # Environment hints — execution-environment awareness for the agent.
 # Unlike PLATFORM_HINTS (which describe the messaging channel), these describe
 # the machine/OS the agent's tools actually run on.

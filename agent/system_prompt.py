@@ -41,6 +41,7 @@ from agent.prompt_builder import (
     TASK_COMPLETION_GUIDANCE,
     TOOL_USE_ENFORCEMENT_GUIDANCE,
     TOOL_USE_ENFORCEMENT_MODELS,
+    WHEELBASE_CANVAS_PROTOCOL_HINT,
     drain_truncation_warnings,
 )
 from agent.runtime_cwd import resolve_context_cwd
@@ -204,6 +205,14 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         tool_guidance.append(KANBAN_GUIDANCE)
     if tool_guidance:
         stable_parts.append(" ".join(tool_guidance))
+
+    # Wheelbase canvas protocol — inject when any Wheelbase inventory/work tool
+    # is loaded so the agent knows how to trigger the desktop canvas rail.
+    # Gated on a single stable toolset sentinel (inventory_search) to keep the
+    # check O(1) and byte-stable across sessions. The hint is part of the stable
+    # tier so it is covered by upstream prompt caching.
+    if "inventory_search" in agent.valid_tool_names:
+        stable_parts.append(WHEELBASE_CANVAS_PROTOCOL_HINT)
 
     # Steering only lands inside tool results, so it's only reachable when the
     # agent has tools. Static text → byte-stable prompt (no cache hit).
