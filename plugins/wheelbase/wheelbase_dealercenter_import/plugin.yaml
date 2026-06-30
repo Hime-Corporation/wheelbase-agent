@@ -1,4 +1,4 @@
-name: wheelbase_dealercenter_import
+name: wheelbase-dealercenter-import
 version: 1.0.0
 description: >
   Activates DealerCenter historic inventory import tools when the

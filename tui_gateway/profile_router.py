@@ -34,6 +34,7 @@ PROFILE_PLUGINS = (
     "wheelbase-auction-browser",
     "wheelbase-demand-matrix",
     "wheelbase-inspection",
+    "wheelbase-dealercenter-import",
 )
 # Toolsets removed from every per-user (wb-<uid>) profile. session_search can
 # open ANY profile's state.db by path (in-process, bypasses the Daytona
