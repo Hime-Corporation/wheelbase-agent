@@ -84,12 +84,18 @@ def test_generate_demand_score_signed_out(monkeypatch):
     assert out["error"] == "not_signed_in"
 
 
-def test_generate_demand_score_invalid_car_ids():
+def test_generate_demand_score_car_ids_ignored(monkeypatch):
+    """carIds is no longer a recognised param — passing it (even empty) must not error."""
+    fake = FakeClient()
+    monkeypatch.setattr(mod, "WheelbaseClient", lambda: fake)
     out = json.loads(mod.generate_demand_score({"carIds": []}))
-    assert "error" in out
+    assert "error" not in out
 
 
-def test_generate_demand_score_too_many_car_ids():
-    out = json.loads(mod.generate_demand_score({"carIds": ["c"] * 201}))
-    assert "error" in out
-    assert "200" in out["error"]
+def test_generate_demand_score_car_ids_not_forwarded_to_backend(monkeypatch):
+    """carIds must not appear in the body sent to the Go API."""
+    fake = FakeClient()
+    monkeypatch.setattr(mod, "WheelbaseClient", lambda: fake)
+    mod.generate_demand_score({"carIds": ["c1", "c2"]})
+    body = fake.go_api_calls[0]["body"]
+    assert "carIds" not in body

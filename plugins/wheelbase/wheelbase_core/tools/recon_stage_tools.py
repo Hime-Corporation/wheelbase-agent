@@ -6,6 +6,7 @@ Three handlers for manipulating recon stages and findings.
 from wheelbase_sdk import WheelbaseClient, WheelbaseAuthError, signed_out_result, ok, err
 
 _VALID_HOLD_TYPES = {"parts", "vendor", "approval", "transport"}
+_VALID_STATUSES = {"todo", "ready", "in_progress", "blocked", "done", "skipped", "cancelled"}
 
 
 def complete_stage(args: dict, **kwargs) -> str:
@@ -44,6 +45,8 @@ def update_stage(args: dict, **kwargs) -> str:
         return err(f"holdType must be one of {sorted(_VALID_HOLD_TYPES)}")
 
     status = args.get("status")
+    if status is not None and status not in _VALID_STATUSES:
+        return err(f"status must be one of {sorted(_VALID_STATUSES)}")
 
     try:
         client = WheelbaseClient()

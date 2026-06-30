@@ -14,21 +14,6 @@ from wheelbase_sdk import WheelbaseClient, WheelbaseAuthError, signed_out_result
 
 
 def generate_demand_score(args: dict, **kwargs) -> str:
-    car_ids = args.get("carIds")
-    if car_ids is not None:
-        if not isinstance(car_ids, list) or len(car_ids) == 0:
-            return err("carIds must be a non-empty array of strings")
-        if not all(isinstance(c, str) for c in car_ids):
-            return err("carIds must be a non-empty array of strings")
-        if len(car_ids) > 200:
-            return err("carIds may contain at most 200 entries")
-
-    market = args.get("market")
-    if market is not None:
-        if not isinstance(market, str):
-            return err("market must be a string")
-        market = market.strip() or None
-
     try:
         client = WheelbaseClient()
     except WheelbaseAuthError:

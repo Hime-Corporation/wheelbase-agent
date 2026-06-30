@@ -168,23 +168,30 @@ GET_RUNLIST_CARS = {
 ASSESS_RUNLIST = {
     "name": "assess_runlist",
     "description": (
-        "Assess all vehicles in a runlist with an agent-side scoring pass. "
-        "Iterates each car in the runlist, applies a scoring heuristic (optionally guided "
-        "by free-form criteria text), and returns a summary with top score and average. "
-        "Long-running — supports cancellation."
+        "Trigger a backend IMX scoring pass for all vehicles in a runlist "
+        "(POST /v1/ai/imx/runlist). The backend computes per-car IMX scores, persists "
+        "them to runlist_car_imx_score, and returns the full scoring output including "
+        "per-car scores, tiers, raw IMX values, and category matches."
     ),
     "parameters": {
         "type": "object",
         "properties": {
             "runlistId": {
                 "type": "string",
-                "description": "UUID of the runlist to assess.",
+                "description": "UUID of the runlist to score.",
             },
-            "criteria": {
+            "provider": {
                 "type": "string",
                 "description": (
-                    "Optional free-form scoring guidance (e.g. 'Prefer low-mileage SUVs'). "
-                    "Applied as a make/model text match for bonus scoring in v1."
+                    "Optional embedding provider for the scoring pass "
+                    "(e.g. 'gemini'). Backend default applies when omitted."
+                ),
+            },
+            "mode": {
+                "type": "string",
+                "description": (
+                    "Optional scoring mode (e.g. 'hybrid'). "
+                    "Backend default applies when omitted."
                 ),
             },
         },
@@ -536,31 +543,64 @@ SEND_TO_VENDOR = {
 GENERATE_DEMAND_SCORE = {
     "name": "generate_demand_score",
     "description": (
-        "Generate demand scores for inventory vehicles based on their IMX score, "
-        "mileage, and optional market context. "
-        "If carIds is omitted, scores all active inventory (capped at 200 vehicles, "
-        "ordered newest first). Returns final scored list in details.scores."
+        "Rank all active inventory vehicles via the backend AI demand-matrix service "
+        "(POST /v1/ai/rank/matrix). The backend pulls tenant demand categories, computes "
+        "gap ratios between inventory supply and configured demand targets, then ranks "
+        "vehicles by how well they fill under-supplied categories. Returns the ranked list "
+        "and a summary. Use topK to limit results; use categoryOverrides to supply current "
+        "category counts when you already have them."
     ),
     "parameters": {
         "type": "object",
         "properties": {
-            "carIds": {
-                "type": "array",
-                "items": {"type": "string"},
+            "topK": {
+                "type": "integer",
                 "description": (
-                    "Optional list of inventory car UUIDs to score. If omitted, "
-                    "all active inventory is scored (max 200)."
+                    "Number of top-ranked vehicles to return. Defaults to 50 when omitted."
                 ),
-                "minItems": 1,
-                "maxItems": 200,
+                "minimum": 1,
             },
-            "market": {
+            "provider": {
                 "type": "string",
+                "enum": ["gemini", "openai"],
                 "description": (
-                    "Optional free-form market descriptor (e.g. 'Northeast', "
-                    "'Dallas metro'). Used as context for scoring."
+                    "Embedding provider used for the ranking pass. "
+                    "Defaults to 'gemini' when omitted."
                 ),
-                "maxLength": 200,
+            },
+            "mode": {
+                "type": "string",
+                "enum": ["hybrid", "sql"],
+                "description": (
+                    "Ranking mode. 'hybrid' combines vector + lexical signals; "
+                    "'sql' uses SQL-only scoring. Defaults to 'hybrid' when omitted."
+                ),
+            },
+            "minGapRatio": {
+                "type": "number",
+                "description": (
+                    "Minimum gap ratio a demand category must exceed to be included "
+                    "in ranking. Defaults to 0.1 when omitted."
+                ),
+                "minimum": 0,
+                "maximum": 1,
+            },
+            "categoryOverrides": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "key": {"type": "string"},
+                        "current": {"type": "integer"},
+                    },
+                    "required": ["key", "current"],
+                    "additionalProperties": False,
+                },
+                "description": (
+                    "Optional per-category current-count overrides. When provided, the "
+                    "backend uses these counts instead of querying inventory. Each entry "
+                    "is {key: string, current: integer}."
+                ),
             },
         },
         "required": [],
@@ -741,8 +781,9 @@ ADD_WORK_ITEM_COMMENT = {
     "name": "add_work_item_comment",
     "description": (
         "Add a comment to a work item. Use this to record notes, status updates, or "
-        "context on any work item (task, recon stage, finding, work order, etc.). The "
-        "comment is attributed to the signed-in user."
+        "context on any work item (task, recon stage, finding, work order, etc.). "
+        "The comment records content and the work item it belongs to; "
+        "authorship is managed server-side."
     ),
     "parameters": {
         "type": "object",

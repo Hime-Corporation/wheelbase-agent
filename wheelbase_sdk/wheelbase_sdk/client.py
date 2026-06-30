@@ -109,7 +109,12 @@ class WheelbaseClient:
                 _range, total_str = content_range.split("/", 1)
                 if total_str != "*":
                     total = int(total_str)
-                    candidate = offset + limit
+                    # Derive next offset from the last index in the page rather than
+                    # offset+limit, so a short page (server max-rows < limit) doesn't
+                    # skip the rows between last+1 and offset+limit.
+                    _, last_str = _range.split("-", 1)
+                    last = int(last_str)
+                    candidate = last + 1
                     if candidate < total:
                         next_offset = candidate
             except (ValueError, AttributeError):

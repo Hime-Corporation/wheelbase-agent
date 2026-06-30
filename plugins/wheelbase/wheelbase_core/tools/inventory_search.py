@@ -54,6 +54,8 @@ def inventory_search(args: dict, **kwargs) -> str:
                 f"stock_number.ilike.%{safe_q}%"
             )
             params["or"] = f"({or_value})"
+            # Stable ordering in text-query mode so paginated results don't shift.
+            params["order"] = "created_at.desc"
         else:
             # No text query — return most recent active inventory
             params["order"] = "created_at.desc"

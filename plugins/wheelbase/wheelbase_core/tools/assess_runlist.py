@@ -12,18 +12,12 @@ def assess_runlist(args: dict, **kwargs) -> str:
     if not runlist_id:
         return err("runlistId must be a non-empty UUID string")
 
-    criteria = args.get("criteria")
-    if criteria is not None:
-        criteria = str(criteria).strip() or None
-
     try:
         client = WheelbaseClient()
     except WheelbaseAuthError:
         return signed_out_result()
     try:
         body: dict = {"runlistId": runlist_id}
-        if criteria:
-            body["criteria"] = criteria
         provider = args.get("provider")
         if provider:
             body["provider"] = str(provider)

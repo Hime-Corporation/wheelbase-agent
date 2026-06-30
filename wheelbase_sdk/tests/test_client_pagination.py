@@ -103,3 +103,13 @@ def test_wildcard_total_returns_none_next_offset(tmp_path, monkeypatch):
     c = _make_client(monkeypatch, tmp_path, "0-49/*")
     _, next_offset = c.postgrest_get_page("inventory_car", {}, limit=50)
     assert next_offset is None
+
+
+def test_short_page_next_offset_derived_from_last_index(tmp_path, monkeypatch):
+    """Short page: requested limit=50 but server returned only rows 0-19 of 200.
+
+    next_offset must be 20 (last+1), not 50 (offset+limit), so no rows are skipped.
+    """
+    c = _make_client(monkeypatch, tmp_path, "0-19/200")
+    _, next_offset = c.postgrest_get_page("inventory_car", {}, limit=50, offset=0)
+    assert next_offset == 20
