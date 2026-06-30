@@ -1,5 +1,5 @@
 #!/bin/sh
-# Gateway container entrypoint — runs TWO Hermes processes side by side:
+# Gateway container entrypoint — runs up to THREE Hermes processes side by side:
 #
 #   1. tui_gateway.profile_router  — the per-user dashboard router. This is
 #      the existing, load-bearing live-chat path (backend -> :9320 -> per-
@@ -7,17 +7,30 @@
 #   2. gateway.run                 — the OpenAI-compatible API server
 #      platform (POST /v1/responses on :8642), used by the Go backend for
 #      one-shot "AI inspection review" calls. This is a SECONDARY process.
+#   3. gateway.run (Telegram)      — the @hermesauto_bot messaging gateway,
+#      the shared "main" Wheelbase agent on Telegram. Only started when
+#      WB_TELEGRAM_BOT_TOKEN is set. Also a SECONDARY process.
 #
 # Failure-isolation contract (important — do not "simplify" this away):
-#   - If gateway.run crashes or misbehaves, profile_router (and therefore
-#     live chat) MUST keep running. The API server loop below is started
-#     in its own backgrounded subshell with its own retry loop, so a crash
-#     inside it can never propagate to, or take down, this script or
-#     profile_router.
+#   - If a SECONDARY gateway.run process (API server OR Telegram) crashes or
+#     misbehaves, profile_router (and therefore live chat) MUST keep running.
+#     Each secondary loop below is started in its own backgrounded subshell
+#     with its own retry loop, so a crash inside it can never propagate to,
+#     or take down, this script or profile_router.
 #   - If profile_router dies, the container MUST exit so the orchestrator
 #     (Dokploy/docker) restarts it — that's the critical path. We capture
 #     profile_router's PID, `wait` on that specific PID, and exit this
 #     script with its exact exit status.
+#
+# Per-process secret scoping (important — do not move these to global env):
+#   gateway.run auto-ENABLES a messaging platform whenever its trigger env
+#   var is present (TELEGRAM_BOT_TOKEN -> Telegram auto-connects). Both the
+#   API-server process AND the Telegram process are gateway.run, so a
+#   GLOBAL TELEGRAM_BOT_TOKEN would make BOTH try to poll the same bot ->
+#   Telegram 409 Conflict. We therefore inject the token into ONLY the
+#   Telegram subshell (mapping WB_TELEGRAM_BOT_TOKEN -> TELEGRAM_BOT_TOKEN
+#   there), and force API_SERVER_ENABLED=false in that subshell so it never
+#   double-binds the API server's :8642.
 #
 # POSIX sh only (the python:3.11-slim base image's /bin/sh is dash, no
 # bash installed) — avoid bashisms such as `wait -n`, arrays, or [[ ]].
@@ -61,6 +74,75 @@ fi
     sleep 3
   done
 ) &
+
+# ---------------------------------------------------------------------------
+# 1b. Telegram gateway (gateway.run) — the shared "main" Wheelbase agent on
+#     Telegram (@hermesauto_bot). Own HERMES_HOME so its config.yaml/state
+#     never collide with profile_router's per-user profiles or the API
+#     server. No-op unless WB_TELEGRAM_BOT_TOKEN is set, so this block is
+#     inert on any deployment that hasn't opted into Telegram.
+# ---------------------------------------------------------------------------
+if [ -n "${WB_TELEGRAM_BOT_TOKEN:-}" ]; then
+  TELEGRAM_HERMES_HOME="${TELEGRAM_HERMES_HOME:-/data/hermes/telegram}"
+  mkdir -p "$TELEGRAM_HERMES_HOME"
+
+  if [ ! -f "$TELEGRAM_HERMES_HOME/config.yaml" ]; then
+    # Idempotent: only written on first boot; hand-edits survive restarts.
+    # Model/persona/plugins mirror the per-user profile (provision_profile)
+    # except the model, pinned to z-ai/glm-5.2 per owner request.
+    cat > "$TELEGRAM_HERMES_HOME/config.yaml" <<'EOF'
+model: z-ai/glm-5.2
+provider: openrouter
+skin: wheelbase
+plugins:
+  enabled:
+    - wheelbase-core
+    - wheelbase-onboarding
+    - wheelbase-auction-browser
+    - wheelbase-demand-matrix
+    - wheelbase-inspection
+    - wheelbase-dealercenter-import
+telegram:
+  # Owner DMs the bot directly = free-flow (DMs never need an @mention).
+  # Group "Hermes AI Integration" (-1004395037275): the bot stays silent
+  # unless a member @mentions @hermesauto_bot or replies to it.
+  require_mention: true
+  exclusive_bot_mentions: true
+web:
+  search_backend: ddgs
+  extract_backend: firecrawl
+EOF
+  fi
+
+  # Seed the shared "main" Wheelbase persona on first boot (matches
+  # tui_gateway.profile_router.DEFAULT_SOUL).
+  if [ ! -f "$TELEGRAM_HERMES_HOME/SOUL.md" ]; then
+    cat > "$TELEGRAM_HERMES_HOME/SOUL.md" <<'EOF'
+# Wheelbase Dealership Agent
+
+You are the Wheelbase agent for a car dealership. Help dealership staff manage
+inventory, source vehicles at auction, analyze market demand, and run daily
+operations. Use Wheelbase tools whenever they apply. Be concise, accurate, and
+concrete.
+EOF
+  fi
+
+  # Background retry loop, failure-isolated like the API server above.
+  # Secret scoping: TELEGRAM_BOT_TOKEN is injected HERE ONLY (never global),
+  # API_SERVER_ENABLED=false stops this process from double-binding :8642,
+  # and Daytona is dropped in favor of a local terminal backend.
+  (
+    while true; do
+      HERMES_HOME="$TELEGRAM_HERMES_HOME" \
+      TELEGRAM_BOT_TOKEN="$WB_TELEGRAM_BOT_TOKEN" \
+      API_SERVER_ENABLED=false \
+      TERMINAL_ENV=local \
+        python -m gateway.run || true
+      echo "[gateway-entrypoint] gateway.run (Telegram) exited — retrying in 3s" >&2
+      sleep 3
+    done
+  ) &
+fi
 
 # ---------------------------------------------------------------------------
 # 2. profile_router — the primary/critical process. Started in the
