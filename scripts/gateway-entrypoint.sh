@@ -125,6 +125,22 @@ tts:
 web:
   search_backend: ddgs
   extract_backend: firecrawl
+gateway:
+  streaming:
+    # Progressive token-by-token replies. transport: auto = native animated
+    # draft preview in DMs (Bot API 9.5 sendMessageDraft); edit-based
+    # progressive updates in the @mention-gated group (Telegram restricts
+    # drafts to private chats, so the group always uses the edit path).
+    enabled: true
+    transport: auto
+  platforms:
+    telegram:
+      extra:
+        # Native rendering for tables / task lists / <details> / block math
+        # via sendRichMessage (Bot API 10.1). Transparently falls back to
+        # MarkdownV2 if Telegram rejects the call or content exceeds the limit.
+        rich_messages: true
+        rich_drafts: false   # keep off: rich draft frames can overlay on desktop
 EOF
   fi
 
