@@ -54,10 +54,16 @@ _CENTS_FIELDS = frozenset({
     "recon_actual_cents",
 })
 
-# Fields that store dates (will be normalised to ISO 8601 date string).
+# Fields that store dates (will be normalised to RFC3339 UTC timestamp).
 _DATE_FIELDS = frozenset({
     "sold_at",
     "acquired_at",
+})
+
+# Fields that must be emitted as integers (Go decodes them as int / *int).
+_INT_FIELDS = frozenset({
+    "year",
+    "odometer",
 })
 
 # Common date formats found in DealerCenter exports.
@@ -86,16 +92,31 @@ def _money_to_cents(value: str) -> int | None:
 
 
 def _parse_date(value: str) -> str | None:
-    """Return an ISO 8601 date string or None if unparseable."""
+    """Return a full RFC3339 UTC timestamp or None if unparseable.
+
+    DealerCenter exports contain date-only values; we append midnight UTC so
+    the Go backend can decode them as ``*time.Time`` (which requires RFC3339).
+    """
     if not value:
         return None
     value = value.strip()
     for fmt in _DATE_FORMATS:
         try:
-            return datetime.strptime(value, fmt).date().isoformat()
+            return datetime.strptime(value, fmt).date().isoformat() + "T00:00:00Z"
         except ValueError:
             continue
     return None
+
+
+def _to_int(value: str) -> int | None:
+    """Convert a numeric string (possibly with commas) to int, or None."""
+    if not value:
+        return None
+    cleaned = value.replace(",", "").strip()
+    try:
+        return int(float(cleaned))
+    except (ValueError, TypeError):
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -188,6 +209,8 @@ def normalize_rows(raw: list[dict]) -> tuple[list[dict], list[str]]:
                 row[dest] = _money_to_cents(v)
             elif dest in _DATE_FIELDS:
                 row[dest] = _parse_date(v)
+            elif dest in _INT_FIELDS:
+                row[dest] = _to_int(v)
             else:
                 row[dest] = v or None
 

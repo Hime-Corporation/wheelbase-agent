@@ -95,13 +95,14 @@ class TestNormalizeRows:
         assert rows[0]["freight_cents"] == 35_000
         assert rows[0]["recon_actual_cents"] == 150_000
 
-    def test_date_to_iso(self, tmp_path):
+    def test_date_to_rfc3339(self, tmp_path):
         p = tmp_path / "export.csv"
         _write_csv(p, [self._sample_row()])
         raw = parse_export(str(p))
         rows, _ = normalize_rows(raw)
-        assert rows[0]["sold_at"] == "2022-03-15"
-        assert rows[0]["acquired_at"] == "2022-01-10"
+        # Must be full RFC3339 UTC so Go *time.Time can decode.
+        assert rows[0]["sold_at"] == "2022-03-15T00:00:00Z"
+        assert rows[0]["acquired_at"] == "2022-01-10T00:00:00Z"
 
     def test_disposition_sold_when_sold_date_present(self, tmp_path):
         p = tmp_path / "export.csv"
@@ -177,3 +178,97 @@ class TestNormalizeRows:
         rows, _ = normalize_rows(raw)
         assert rows[0]["purchase_price_cents"] == 800_000
         assert rows[0]["sale_price_cents"] == 1_050_000
+
+
+# ---------------------------------------------------------------------------
+# Contract tests — Go backend type compatibility
+# ---------------------------------------------------------------------------
+
+class TestGoBackendContractTypes:
+    """Verify JSON types match Go decoder expectations.
+
+    Go decodes: year int, odometer *int, sold_at/*acquired_at *time.Time (RFC3339).
+    All *_cents fields are already int from _money_to_cents.
+    """
+
+    def _sample_row(self, **overrides):
+        defaults = {
+            "VIN": "1HGCM82633A123456",
+            "Stock #": "S999",
+            "Year": "2020",
+            "Make": "Toyota",
+            "Model": "Camry",
+            "Mileage": "32,100",
+            "Purchase Price": "$14,000.00",
+            "Sale Price": "$17,500.00",
+            "Sold Date": "05/20/2021",
+            "Acquired Date": "03/01/2021",
+        }
+        defaults.update(overrides)
+        return defaults
+
+    def test_year_is_int(self, tmp_path):
+        p = tmp_path / "export.csv"
+        _write_csv(p, [self._sample_row()])
+        rows, _ = normalize_rows(parse_export(str(p)))
+        assert isinstance(rows[0]["year"], int), "year must be int for Go decoder"
+        assert rows[0]["year"] == 2020
+
+    def test_year_unparseable_becomes_none(self, tmp_path):
+        p = tmp_path / "export.csv"
+        _write_csv(p, [self._sample_row(**{"Year": "N/A"})])
+        rows, _ = normalize_rows(parse_export(str(p)))
+        assert rows[0].get("year") is None
+
+    def test_odometer_is_int(self, tmp_path):
+        p = tmp_path / "export.csv"
+        _write_csv(p, [self._sample_row()])
+        rows, _ = normalize_rows(parse_export(str(p)))
+        assert isinstance(rows[0]["odometer"], int), "odometer must be int for Go *int decoder"
+        assert rows[0]["odometer"] == 32100
+
+    def test_odometer_without_commas_is_int(self, tmp_path):
+        p = tmp_path / "export.csv"
+        _write_csv(p, [self._sample_row(**{"Mileage": "5000"})])
+        rows, _ = normalize_rows(parse_export(str(p)))
+        assert isinstance(rows[0]["odometer"], int)
+        assert rows[0]["odometer"] == 5000
+
+    def test_odometer_unparseable_becomes_none(self, tmp_path):
+        p = tmp_path / "export.csv"
+        _write_csv(p, [self._sample_row(**{"Mileage": ""})])
+        rows, _ = normalize_rows(parse_export(str(p)))
+        assert rows[0].get("odometer") is None
+
+    def test_sold_at_is_rfc3339(self, tmp_path):
+        p = tmp_path / "export.csv"
+        _write_csv(p, [self._sample_row()])
+        rows, _ = normalize_rows(parse_export(str(p)))
+        sold = rows[0]["sold_at"]
+        assert sold is not None
+        assert "T" in sold, "sold_at must contain 'T' separator for RFC3339"
+        assert sold.endswith("Z"), "sold_at must end with 'Z' (UTC) for Go *time.Time"
+        assert sold == "2021-05-20T00:00:00Z"
+
+    def test_acquired_at_is_rfc3339(self, tmp_path):
+        p = tmp_path / "export.csv"
+        _write_csv(p, [self._sample_row()])
+        rows, _ = normalize_rows(parse_export(str(p)))
+        acq = rows[0]["acquired_at"]
+        assert acq is not None
+        assert "T" in acq
+        assert acq.endswith("Z")
+        assert acq == "2021-03-01T00:00:00Z"
+
+    def test_date_absent_is_none(self, tmp_path):
+        p = tmp_path / "export.csv"
+        _write_csv(p, [self._sample_row(**{"Sold Date": ""})])
+        rows, _ = normalize_rows(parse_export(str(p)))
+        assert rows[0].get("sold_at") is None
+
+    def test_cents_fields_are_int(self, tmp_path):
+        p = tmp_path / "export.csv"
+        _write_csv(p, [self._sample_row()])
+        rows, _ = normalize_rows(parse_export(str(p)))
+        assert isinstance(rows[0]["purchase_price_cents"], int)
+        assert isinstance(rows[0]["sale_price_cents"], int)
