@@ -1,0 +1,14 @@
+name: wheelbase_dealercenter_import
+version: 1.0.0
+description: >
+  Activates DealerCenter historic inventory import tools when the
+  dealercenter-import marker file is present in the agent workspace.
+  Provides tools to confirm browser CDP readiness, drive a historic
+  export from DealerCenter, and ingest the resulting file into Wheelbase.
+author: Wheelbase
+provides_tools:
+  - dc_connect
+  - dc_export_historic
+  - dc_ingest
+provides_hooks:
+  - pre_tool_call
