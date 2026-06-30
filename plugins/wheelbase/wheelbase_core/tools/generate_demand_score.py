@@ -1,22 +1,16 @@
-"""generate_demand_score — score inventory cars using v1 IMX/mileage heuristic.
+"""generate_demand_score — rank inventory via the backend AI demand-matrix service.
 
-v1 placeholder formula (intentionally simple until demand matrix model is ready):
-  base = imx_score (default 50 if null)
-  mileage_penalty = max(0, (mileage - 30000) / 10000)  [every 10k miles over 30k → -1 pt]
-  market_bonus = 2 if market string provided, else 0
-  score = clamp(round(base - mileage_penalty + market_bonus), 0, 100)
+Calls POST /v1/ai/rank/matrix which ranks vehicles from structured demand signals
+using the tenant's configured demand categories. Backend request body shape
+(services.RankByDemandMatrixInput):
+  topK              int               -- number of top vehicles to return (default 50)
+  provider          string            -- embedding provider ("gemini", etc.)
+  mode              string            -- "hybrid" | "sql" | etc.
+  categoryOverrides []{ key, current} -- optional per-category current-count overrides
+  minGapRatio       float             -- minimum gap ratio filter (default 0.1)
 """
 
 from wheelbase_sdk import WheelbaseClient, WheelbaseAuthError, signed_out_result, ok, err
-
-
-def _compute_score(car: dict, market: str | None) -> int:
-    base = car.get("imx_score")
-    base = base if isinstance(base, (int, float)) else 50
-    mileage = car.get("mileage")
-    mileage_penalty = max(0.0, (mileage - 30_000) / 10_000) if isinstance(mileage, (int, float)) else 0.0
-    market_bonus = 2 if market else 0
-    return max(0, min(100, round(base - mileage_penalty + market_bonus)))
 
 
 def generate_demand_score(args: dict, **kwargs) -> str:
@@ -40,36 +34,30 @@ def generate_demand_score(args: dict, **kwargs) -> str:
     except WheelbaseAuthError:
         return signed_out_result()
     try:
-        if car_ids:
-            cars = client.postgrest_get(
-                "inventory_car",
-                {
-                    "select": "id,year,make,model,trim,mileage,imx_score",
-                    "id": f"in.({','.join(car_ids)})",
-                },
-            )
-        else:
-            cars = client.postgrest_get(
-                "inventory_car",
-                {
-                    "select": "id,year,make,model,trim,mileage,imx_score",
-                    "is_archived": "eq.false",
-                    "order": "created_at.desc",
-                    "limit": "200",
-                },
-            )
+        body: dict = {}
 
-        cars = cars or []
-        if not cars:
-            return ok({"scores": [], "summary": "No cars to score — inventory is empty or no matching cars found."})
+        raw_top_k = args.get("topK")
+        if raw_top_k is not None:
+            body["topK"] = int(raw_top_k)
 
-        scores = [{"carId": c["id"], "score": _compute_score(c, market)} for c in cars]
-        summary = (
-            f"Scored {len(scores)} vehicle{'s' if len(scores) != 1 else ''}"
-            + (f" for market: {market}" if market else "")
-            + "."
-        )
-        return ok({"scores": scores, "summary": summary})
+        provider = args.get("provider")
+        if provider:
+            body["provider"] = str(provider)
+
+        mode = args.get("mode")
+        if mode:
+            body["mode"] = str(mode)
+
+        min_gap_ratio = args.get("minGapRatio")
+        if min_gap_ratio is not None:
+            body["minGapRatio"] = float(min_gap_ratio)
+
+        category_overrides = args.get("categoryOverrides")
+        if category_overrides is not None:
+            body["categoryOverrides"] = category_overrides
+
+        result = client.go_api("POST", "/v1/ai/rank/matrix", body=body)
+        return ok(result)
     except Exception as e:  # noqa: BLE001
         return err(f"generate_demand_score failed: {e}")
     finally:

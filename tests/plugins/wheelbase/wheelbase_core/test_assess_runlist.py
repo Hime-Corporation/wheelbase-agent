@@ -1,4 +1,4 @@
-"""Tests for assess_runlist tool."""
+"""Tests for assess_runlist tool — backend AI (go_api) implementation."""
 
 import json
 
@@ -7,43 +7,61 @@ from wheelbase_sdk.errors import WheelbaseAuthError
 
 
 class FakeClient:
-    def __init__(self, rows=None):
-        self._rows = rows or []
+    def __init__(self, response=None):
+        self._response = response or {"runlistId": "rl1", "scores": []}
+        self.go_api_calls = []
 
-    def postgrest_get(self, table, params):
-        return self._rows
+    def go_api(self, method, path, *, body=None, params=None):
+        self.go_api_calls.append({"method": method, "path": path, "body": body, "params": params})
+        return self._response
 
     def close(self):
         pass
 
 
-def test_assess_runlist_summary(monkeypatch):
-    rows = [
-        {"id": "c1", "make": "Honda", "model": "Civic", "year": 2020, "imx_score": 70},
-        {"id": "c2", "make": "Toyota", "model": "Camry", "year": 2019, "imx_score": 80},
-    ]
-    monkeypatch.setattr(mod, "WheelbaseClient", lambda: FakeClient(rows))
+def test_assess_runlist_calls_go_api(monkeypatch):
+    """assess_runlist delegates to the backend /v1/ai/imx/runlist endpoint."""
+    fake = FakeClient()
+    monkeypatch.setattr(mod, "WheelbaseClient", lambda: fake)
     out = json.loads(mod.assess_runlist({"runlistId": "rl1"}))
-    assert out["assessed"] == 2
-    assert out["topScore"] == 80
-    assert out["avgScore"] == 75
+    assert out["runlistId"] == "rl1"
+    assert len(fake.go_api_calls) == 1
+    call = fake.go_api_calls[0]
+    assert call["method"] == "POST"
+    assert call["path"] == "/v1/ai/imx/runlist"
 
 
-def test_assess_runlist_criteria_bonus(monkeypatch):
-    rows = [
-        {"id": "c1", "make": "Honda", "model": "Civic", "year": 2020, "imx_score": 70},
-    ]
-    monkeypatch.setattr(mod, "WheelbaseClient", lambda: FakeClient(rows))
-    out = json.loads(mod.assess_runlist({"runlistId": "rl1", "criteria": "Honda"}))
-    # criteria matches → bonus 10 pts, 70+10=80
-    assert out["topScore"] == 80
+def test_assess_runlist_sends_runlist_id_in_body(monkeypatch):
+    fake = FakeClient()
+    monkeypatch.setattr(mod, "WheelbaseClient", lambda: fake)
+    mod.assess_runlist({"runlistId": "abc-123"})
+    body = fake.go_api_calls[0]["body"]
+    assert body["runlistId"] == "abc-123"
 
 
-def test_assess_runlist_empty(monkeypatch):
-    monkeypatch.setattr(mod, "WheelbaseClient", lambda: FakeClient([]))
+def test_assess_runlist_sends_criteria_in_body_when_provided(monkeypatch):
+    fake = FakeClient()
+    monkeypatch.setattr(mod, "WheelbaseClient", lambda: fake)
+    mod.assess_runlist({"runlistId": "rl1", "criteria": "low mileage sedan"})
+    body = fake.go_api_calls[0]["body"]
+    assert body.get("criteria") == "low mileage sedan"
+
+
+def test_assess_runlist_omits_criteria_when_blank(monkeypatch):
+    fake = FakeClient()
+    monkeypatch.setattr(mod, "WheelbaseClient", lambda: fake)
+    mod.assess_runlist({"runlistId": "rl1", "criteria": ""})
+    body = fake.go_api_calls[0]["body"]
+    assert "criteria" not in body
+
+
+def test_assess_runlist_returns_backend_result(monkeypatch):
+    backend_payload = {"runlistId": "rl1", "scores": [{"carId": "c1", "score": 0.9}]}
+    fake = FakeClient(response=backend_payload)
+    monkeypatch.setattr(mod, "WheelbaseClient", lambda: fake)
     out = json.loads(mod.assess_runlist({"runlistId": "rl1"}))
-    assert out["assessed"] == 0
-    assert "No cars" in out["summary"]
+    assert out["scores"][0]["carId"] == "c1"
+    assert out["scores"][0]["score"] == 0.9
 
 
 def test_assess_runlist_signed_out(monkeypatch):

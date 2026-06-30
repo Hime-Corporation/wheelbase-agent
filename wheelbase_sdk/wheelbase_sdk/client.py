@@ -73,6 +73,50 @@ class WheelbaseClient:
         r.raise_for_status()
         return r.json() if r.content else None
 
+    def postgrest_get_page(
+        self,
+        table: str,
+        params: dict[str, str],
+        *,
+        limit: int,
+        offset: int = 0,
+    ) -> tuple[list[dict], int | None]:
+        """Paginated PostgREST GET with exact count via Content-Range header.
+
+        Adds ``limit`` / ``offset`` query params and ``Prefer: count=exact`` so
+        PostgREST returns the total row count in the ``Content-Range`` response
+        header (format: ``<first>-<last>/<total>`` e.g. ``0-49/200``).
+
+        Returns ``(rows, next_offset)`` where ``next_offset`` is ``None`` when
+        the current page is the last one (or the header is absent/unparseable).
+        Leaves the caller-supplied ``params`` dict unchanged.
+        """
+        merged = {**params, "limit": str(limit), "offset": str(offset)}
+        headers = {**self._pg_headers(), "Prefer": "count=exact"}
+        r = self._http.get(
+            f"{self._supabase_url}/rest/v1/{table}",
+            params=merged,
+            headers=headers,
+        )
+        r.raise_for_status()
+        rows: list[dict] = r.json()
+
+        next_offset: int | None = None
+        content_range = r.headers.get("Content-Range") or r.headers.get("content-range")
+        if content_range:
+            # Format: "<first>-<last>/<total>" (e.g. "0-49/200") or "<first>-<last>/*"
+            try:
+                _range, total_str = content_range.split("/", 1)
+                if total_str != "*":
+                    total = int(total_str)
+                    candidate = offset + limit
+                    if candidate < total:
+                        next_offset = candidate
+            except (ValueError, AttributeError):
+                pass
+
+        return rows, next_offset
+
     # ── Go API ────────────────────────────────────────────────────────────────
     def go_api(
         self,

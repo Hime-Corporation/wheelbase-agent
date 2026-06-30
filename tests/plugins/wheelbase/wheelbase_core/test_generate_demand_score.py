@@ -1,4 +1,4 @@
-"""Tests for generate_demand_score tool."""
+"""Tests for generate_demand_score tool — backend AI (go_api) implementation."""
 
 import json
 
@@ -7,65 +7,72 @@ from wheelbase_sdk.errors import WheelbaseAuthError
 
 
 class FakeClient:
-    def __init__(self, rows=None):
-        self._rows = rows or []
-        self.last_params = None
+    def __init__(self, response=None):
+        self._response = response or {"ranked": [], "summary": "ok"}
+        self.go_api_calls = []
 
-    def postgrest_get(self, table, params):
-        self.last_params = params
-        return self._rows
+    def go_api(self, method, path, *, body=None, params=None):
+        self.go_api_calls.append({"method": method, "path": path, "body": body, "params": params})
+        return self._response
 
     def close(self):
         pass
 
 
-def test_generate_demand_score_returns_scores(monkeypatch):
-    rows = [
-        {"id": "c1", "year": 2020, "make": "Honda", "model": "Civic", "trim": None, "mileage": 25000, "imx_score": 70}
-    ]
-    monkeypatch.setattr(mod, "WheelbaseClient", lambda: FakeClient(rows))
+def test_generate_demand_score_calls_go_api(monkeypatch):
+    """generate_demand_score delegates to the backend /v1/ai/rank/matrix endpoint."""
+    fake = FakeClient()
+    monkeypatch.setattr(mod, "WheelbaseClient", lambda: fake)
     out = json.loads(mod.generate_demand_score({}))
-    assert len(out["scores"]) == 1
-    assert out["scores"][0]["carId"] == "c1"
-    assert isinstance(out["scores"][0]["score"], int)
+    assert len(fake.go_api_calls) == 1
+    call = fake.go_api_calls[0]
+    assert call["method"] == "POST"
+    assert call["path"] == "/v1/ai/rank/matrix"
 
 
-def test_generate_demand_score_specific_car_ids(monkeypatch):
-    rows = [{"id": "c1", "year": 2020, "make": "Honda", "model": "Civic", "trim": None, "mileage": 50000, "imx_score": 60}]
-    client = FakeClient(rows)
-    monkeypatch.setattr(mod, "WheelbaseClient", lambda: client)
-    out = json.loads(mod.generate_demand_score({"carIds": ["c1"]}))
-    assert len(out["scores"]) == 1
-    # carIds query uses `in` param
-    assert "in." in client.last_params.get("id", "")
+def test_generate_demand_score_returns_backend_result(monkeypatch):
+    backend_payload = {"ranked": [{"carId": "c1", "score": 0.85}], "summary": "1 vehicle ranked"}
+    fake = FakeClient(response=backend_payload)
+    monkeypatch.setattr(mod, "WheelbaseClient", lambda: fake)
+    out = json.loads(mod.generate_demand_score({}))
+    assert out["ranked"][0]["carId"] == "c1"
+    assert out["ranked"][0]["score"] == 0.85
 
 
-def test_generate_demand_score_all_inventory_params(monkeypatch):
-    client = FakeClient([])
-    monkeypatch.setattr(mod, "WheelbaseClient", lambda: client)
+def test_generate_demand_score_passes_top_k(monkeypatch):
+    fake = FakeClient()
+    monkeypatch.setattr(mod, "WheelbaseClient", lambda: fake)
+    mod.generate_demand_score({"topK": 20})
+    body = fake.go_api_calls[0]["body"]
+    assert body["topK"] == 20
+
+
+def test_generate_demand_score_passes_provider_and_mode(monkeypatch):
+    fake = FakeClient()
+    monkeypatch.setattr(mod, "WheelbaseClient", lambda: fake)
+    mod.generate_demand_score({"provider": "gemini", "mode": "hybrid"})
+    body = fake.go_api_calls[0]["body"]
+    assert body["provider"] == "gemini"
+    assert body["mode"] == "hybrid"
+
+
+def test_generate_demand_score_passes_min_gap_ratio(monkeypatch):
+    fake = FakeClient()
+    monkeypatch.setattr(mod, "WheelbaseClient", lambda: fake)
+    mod.generate_demand_score({"minGapRatio": 0.2})
+    body = fake.go_api_calls[0]["body"]
+    assert body["minGapRatio"] == 0.2
+
+
+def test_generate_demand_score_empty_body_when_no_args(monkeypatch):
+    """No args → body is empty dict (backend applies defaults)."""
+    fake = FakeClient()
+    monkeypatch.setattr(mod, "WheelbaseClient", lambda: fake)
     mod.generate_demand_score({})
-    assert client.last_params.get("is_archived") == "eq.false"
-    assert client.last_params.get("limit") == "200"
-
-
-def test_generate_demand_score_market_bonus(monkeypatch):
-    rows = [{"id": "c1", "year": 2020, "make": "Honda", "model": "Civic", "trim": None, "mileage": 0, "imx_score": 50}]
-    monkeypatch.setattr(mod, "WheelbaseClient", lambda: FakeClient(rows))
-    out_no_market = json.loads(mod.generate_demand_score({}))
-    score_no_market = out_no_market["scores"][0]["score"]
-
-    monkeypatch.setattr(mod, "WheelbaseClient", lambda: FakeClient(rows))
-    out_market = json.loads(mod.generate_demand_score({"market": "Dallas"}))
-    score_with_market = out_market["scores"][0]["score"]
-
-    assert score_with_market == score_no_market + 2
-
-
-def test_generate_demand_score_empty_inventory(monkeypatch):
-    monkeypatch.setattr(mod, "WheelbaseClient", lambda: FakeClient([]))
-    out = json.loads(mod.generate_demand_score({}))
-    assert out["scores"] == []
-    assert "No cars" in out["summary"]
+    body = fake.go_api_calls[0]["body"]
+    assert isinstance(body, dict)
+    assert "topK" not in body
+    assert "provider" not in body
 
 
 def test_generate_demand_score_signed_out(monkeypatch):
