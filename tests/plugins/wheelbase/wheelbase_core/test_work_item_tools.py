@@ -11,6 +11,10 @@ import wheelbase_core.tools.create_work_item as mod
 
 class _FakeClient:
     def __init__(self): self.calls = []
+    def postgrest_get(self, table, params):
+        self.calls.append(("GET", table, params))
+        # Return a row with tenant_id for both inventory_car and work_item lookups.
+        return [{"tenant_id": "tenant-abc"}]
     def postgrest_write(self, method, table, *, body=None, params=None, prefer="return=representation"):
         self.calls.append((method, table, body, params))
         return [{"id": "wi-1", "title": body["title"], "status": body["status"], "type": body["type"]}]
@@ -26,12 +30,18 @@ def test_create_work_item_defaults_to_task(monkeypatch):
     # ok() returns the dict directly (no "ok" wrapper)
     assert "error" not in out
     assert out["workItemId"] == "wi-1"
-    method, table, body, _ = fake.calls[0]
+    # First call is the tenant_id lookup via inventory_car (root item, carId provided)
+    get_call = fake.calls[0]
+    assert get_call[0] == "GET"
+    assert get_call[1] == "inventory_car"
+    # Second call is the INSERT
+    method, table, body, _ = fake.calls[1]
     assert table == "work_item"
     assert body["type"] == "task"
     assert body["status"] == "todo"
     assert body["inventory_car_id"] == "car-1"
     assert body["title"] == "Replace tires"
+    assert body["tenant_id"] == "tenant-abc"
 
 
 def test_create_work_item_child_requires_parent(monkeypatch):

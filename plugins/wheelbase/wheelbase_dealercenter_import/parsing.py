@@ -66,6 +66,19 @@ _INT_FIELDS = frozenset({
     "odometer",
 })
 
+# Disposition value normalisation: DealerCenter label → backend enum.
+_DISPOSITION_MAP: dict[str, str] = {
+    "sold": "sold",
+    "in stock": "active",
+    "instock": "active",
+    "available": "active",
+    "active": "active",
+    "wholesale": "wholesaled",
+    "wholesaled": "wholesaled",
+    "unwound": "unwound",
+    "unwind": "unwound",
+}
+
 # Common date formats found in DealerCenter exports.
 _DATE_FORMATS = [
     "%m/%d/%Y",
@@ -214,8 +227,13 @@ def normalize_rows(raw: list[dict]) -> tuple[list[dict], list[str]]:
             else:
                 row[dest] = v or None
 
-        # Infer disposition when not already set by the export.
-        if "disposition" not in row or not row["disposition"]:
+        # Normalise disposition: map DealerCenter labels to backend enum values.
+        raw_disposition = row.get("disposition")
+        if raw_disposition:
+            normalised_disp = _DISPOSITION_MAP.get(raw_disposition.lower().strip())
+            row["disposition"] = normalised_disp if normalised_disp is not None else "other"
+        else:
+            # Infer from sold date when disposition is absent/empty.
             row["disposition"] = "sold" if row.get("sold_at") else "active"
 
         normalised.append(row)

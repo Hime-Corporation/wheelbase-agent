@@ -272,3 +272,60 @@ class TestGoBackendContractTypes:
         rows, _ = normalize_rows(parse_export(str(p)))
         assert isinstance(rows[0]["purchase_price_cents"], int)
         assert isinstance(rows[0]["sale_price_cents"], int)
+
+
+# ---------------------------------------------------------------------------
+# Disposition normalisation — DealerCenter labels → backend enum
+# ---------------------------------------------------------------------------
+
+class TestDispositionNormalisation:
+    """Verify DealerCenter disposition/status values map to backend enum strings."""
+
+    def _row_with_disposition(self, disposition_value: str) -> dict:
+        return {
+            "VIN": "1HGCM82633A123456",
+            "Stock #": "S1",
+            "Disposition": disposition_value,
+        }
+
+    def _normalise(self, raw_rows: list[dict]) -> list[dict]:
+        rows, _ = normalize_rows(raw_rows)
+        return rows
+
+    def test_sold_maps_to_sold(self):
+        rows = self._normalise([self._row_with_disposition("Sold")])
+        assert rows[0]["disposition"] == "sold"
+
+    def test_in_stock_maps_to_active(self):
+        rows = self._normalise([self._row_with_disposition("In Stock")])
+        assert rows[0]["disposition"] == "active"
+
+    def test_wholesale_maps_to_wholesaled(self):
+        rows = self._normalise([self._row_with_disposition("Wholesale")])
+        assert rows[0]["disposition"] == "wholesaled"
+
+    def test_wholesaled_maps_to_wholesaled(self):
+        rows = self._normalise([self._row_with_disposition("Wholesaled")])
+        assert rows[0]["disposition"] == "wholesaled"
+
+    def test_available_maps_to_active(self):
+        rows = self._normalise([self._row_with_disposition("Available")])
+        assert rows[0]["disposition"] == "active"
+
+    def test_active_maps_to_active(self):
+        rows = self._normalise([self._row_with_disposition("Active")])
+        assert rows[0]["disposition"] == "active"
+
+    def test_unwound_maps_to_unwound(self):
+        rows = self._normalise([self._row_with_disposition("Unwound")])
+        assert rows[0]["disposition"] == "unwound"
+
+    def test_unknown_value_maps_to_other(self):
+        rows = self._normalise([self._row_with_disposition("Pending")])
+        assert rows[0]["disposition"] == "other"
+
+    def test_empty_disposition_falls_back_to_inference(self):
+        """Empty disposition → infer from sold_at presence."""
+        row = {"VIN": "1HGCM82633A123456", "Disposition": "", "Sold Date": ""}
+        rows, _ = normalize_rows([row])
+        assert rows[0]["disposition"] == "active"

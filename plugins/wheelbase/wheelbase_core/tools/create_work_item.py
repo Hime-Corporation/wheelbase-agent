@@ -40,8 +40,27 @@ def create_work_item(args: dict, **kwargs) -> str:
     except WheelbaseAuthError:
         return signed_out_result()
     try:
+        # Resolve tenant_id — required NOT NULL, no DB default.
+        if parent_id:
+            rows = client.postgrest_get(
+                "work_item",
+                {"id": f"eq.{parent_id}", "select": "tenant_id", "limit": "1"},
+            )
+            if not rows:
+                return err("Parent work item not found")
+            tenant_id = rows[0].get("tenant_id")
+        else:
+            rows = client.postgrest_get(
+                "inventory_car",
+                {"id": f"eq.{car_id}", "select": "tenant_id", "limit": "1"},
+            )
+            if not rows:
+                return err(f"Vehicle not found: {car_id}")
+            tenant_id = rows[0].get("tenant_id")
+
         body: dict = {"title": title, "type": wtype, "status": "todo",
-                      "priority": priority, "source": "manual"}
+                      "priority": priority, "source": "manual",
+                      "tenant_id": tenant_id}
         if car_id: body["inventory_car_id"] = car_id
         if parent_id: body["parent_id"] = parent_id
         if args.get("description") is not None: body["description"] = args["description"]

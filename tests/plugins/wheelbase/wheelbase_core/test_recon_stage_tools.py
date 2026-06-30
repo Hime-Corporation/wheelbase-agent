@@ -179,6 +179,10 @@ def test_create_finding_sets_type_finding(monkeypatch):
 
     class _FakeWBClient:
         def __init__(self): self.calls = []
+        def postgrest_get(self, table, params):
+            # Serve tenant_id for the parent work_item lookup.
+            self.calls.append(("GET", table, params))
+            return [{"tenant_id": "tenant-abc"}]
         def postgrest_write(self, method, table, *, body=None, params=None, prefer="return=representation"):
             self.calls.append((method, table, body))
             return [{"id": "wi-new", "title": body["title"], "status": "todo", "type": body["type"]}]
