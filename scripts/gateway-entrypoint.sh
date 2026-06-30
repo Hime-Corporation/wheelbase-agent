@@ -103,6 +103,14 @@ plugins:
     - wheelbase-demand-matrix
     - wheelbase-inspection
     - wheelbase-dealercenter-import
+auxiliary:
+  # glm-5.2 is text-only, so route image analysis (vision_analyze) to a
+  # vision-capable model on the SAME OpenRouter key. Without this, the default
+  # provider:auto falls back to the text-only main model and inbound photos
+  # error out ("No LLM provider configured for task=vision provider=auto").
+  vision:
+    provider: openrouter
+    model: google/gemini-3-flash-preview
 telegram:
   # Owner DMs the bot directly = free-flow (DMs never need an @mention).
   # Group "Hermes AI Integration" (-1004395037275): the bot stays silent
