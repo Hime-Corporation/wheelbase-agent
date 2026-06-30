@@ -77,28 +77,36 @@ def bulk_inspect(args: dict, **kwargs) -> str:
     except WheelbaseAuthError:
         return signed_out_result()
     try:
-        results = []
         score_select = ",".join(_V2_SCORE_FIELDS)
+        # Single batched query — one round-trip for all car IDs (no N+1).
+        ids_csv = ",".join(car_ids)
+        try:
+            rows = client.postgrest_get(
+                INSPECTION_TABLE,
+                {
+                    "inventory_car_id": f"in.({ids_csv})",
+                    "select": f"id,inventory_car_id,status,{score_select}",
+                },
+            )
+        except Exception:  # noqa: BLE001
+            rows = []
+
+        # Build lookup keyed by inventory_car_id for O(1) per-car access.
+        row_map: dict[str, dict] = {}
+        for row in (rows or []):
+            cid = row.get("inventory_car_id")
+            if cid:
+                row_map[cid] = row
+
+        results = []
         for car_id in car_ids:
-            try:
-                rows = client.postgrest_get(
-                    INSPECTION_TABLE,
-                    {
-                        "inventory_car_id": f"eq.{car_id}",
-                        "select": f"id,inventory_car_id,status,{score_select}",
-                        "limit": "1",
-                    },
-                )
-                row = rows[0] if rows else None
-                state = _derive_state(row)
-                entry: dict = {"carId": car_id, "state": state}
-                if row:
-                    scores = _extract_scores(row)
-                    if scores:
-                        entry["scores"] = scores
-            except Exception:  # noqa: BLE001
-                state = "pending"
-                entry = {"carId": car_id, "state": state}
+            row = row_map.get(car_id)  # None when no inspection exists → "pending"
+            state = _derive_state(row)
+            entry: dict = {"carId": car_id, "state": state}
+            if row:
+                scores = _extract_scores(row)
+                if scores:
+                    entry["scores"] = scores
             results.append(entry)
 
         completed = sum(1 for r in results if r["state"] == "completed")

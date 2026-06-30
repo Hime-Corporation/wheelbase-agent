@@ -48,6 +48,21 @@ def get_car(args: dict, **kwargs) -> str:
             p["url"]
             for p in sorted(photos, key=lambda p: (not p.get("is_main"), p.get("sort_order") or 0))
         ]
+
+        # Fetch financial summary from the inventory_car_financials view.
+        try:
+            fin_rows = client.postgrest_get(
+                "inventory_car_financials",
+                {
+                    "id": f"eq.{car_id}",
+                    "select": "total_cost_cents,gross_profit_cents,margin_pct,days_in_stock",
+                    "limit": "1",
+                },
+            )
+            car["financials"] = fin_rows[0] if fin_rows else {}
+        except Exception:  # noqa: BLE001 — non-fatal; view may not exist in all envs
+            car["financials"] = {}
+
         return ok(car)
     except Exception as e:  # noqa: BLE001 — tools must never raise
         return err(f"get_car failed: {e}")

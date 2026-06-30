@@ -15,7 +15,7 @@ def get_vendor(args: dict, **kwargs) -> str:
     try:
         rows = client.postgrest_get(
             "vendor",
-            {"id": f"eq.{vendor_id}", "select": "*", "limit": "1"},
+            {"id": f"eq.{vendor_id}", "select": "id,name,vendor_type,phone,email,city,state,notes", "limit": "1"},
         )
         if not rows:
             return err(f"Vendor not found: {vendor_id}", vendorId=vendor_id)

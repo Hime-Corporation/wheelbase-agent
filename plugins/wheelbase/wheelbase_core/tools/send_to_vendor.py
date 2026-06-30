@@ -1,9 +1,9 @@
-"""send_to_vendor — assign a work order to a vendor and set status to 'scheduled'.
+"""send_to_vendor — assign a work_item to a vendor and set status to 'scheduled'.
 
 Two-step mutation (mirroring legacy send-to-vendor.ts):
-  Step 1: PATCH vendor_id + optional scheduled_at on the work order.
-  Step 2: PATCH status = "scheduled" on the same work order.
-Status is 'scheduled' NOT 'sent' — 'sent' is not in the work_order status enum.
+  Step 1: PATCH vendor_id + optional scheduled_at on the work item.
+  Step 2: PATCH status = "scheduled" on the same work item.
+Status is 'scheduled' NOT 'sent' — 'sent' is not in the work_item status enum.
 """
 
 from wheelbase_sdk import WheelbaseClient, WheelbaseAuthError, signed_out_result, ok, err
@@ -33,14 +33,14 @@ def send_to_vendor(args: dict, **kwargs) -> str:
 
         client.postgrest_write(
             "PATCH",
-            "work_order",
+            "work_item",
             body=step1_body,
             params={"id": f"eq.{work_order_id}"},
             prefer="return=minimal",
         )
         client.postgrest_write(
             "PATCH",
-            "work_order",
+            "work_item",
             body={"status": "scheduled"},
             params={"id": f"eq.{work_order_id}"},
             prefer="return=minimal",

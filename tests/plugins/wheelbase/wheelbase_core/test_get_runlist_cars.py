@@ -72,3 +72,33 @@ def test_get_runlist_cars_missing_runlist_id():
     out = json.loads(mod.get_runlist_cars({}))
     assert "error" in out
     assert "runlistId" in out["error"]
+
+
+def test_get_runlist_cars_distinct_runlist_car_id_and_car_id(monkeypatch):
+    """Items must carry runlistCarId (junction row id) and carId (inventory_car_id) as distinct keys."""
+    rows = [
+        {
+            "id": "junction-row-uuid",
+            "runlist_id": "rl1",
+            "inventory_car_id": "car-uuid",
+            "year": 2022,
+            "make": "Toyota",
+            "model": "Camry",
+            "vin": "VIN123",
+            "stock_number": "S001",
+            "archived_at": None,
+            "asking_price_cents": None,
+            "imx_score": None,
+        }
+    ]
+    client = FakeClient(rows)
+    monkeypatch.setattr(mod, "WheelbaseClient", lambda: client)
+    out = json.loads(mod.get_runlist_cars({"runlistId": "rl1"}))
+    assert isinstance(out, list) and len(out) == 1
+    item = out[0]
+    assert "runlistCarId" in item, "runlistCarId (junction row id) must be present"
+    assert "carId" in item, "carId (inventory_car_id) must be present"
+    assert item["runlistCarId"] == "junction-row-uuid"
+    assert item["carId"] == "car-uuid"
+    # They must NOT be the same value (the bug this test guards against).
+    assert item["runlistCarId"] != item["carId"]

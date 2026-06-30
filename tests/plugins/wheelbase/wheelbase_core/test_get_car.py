@@ -7,13 +7,17 @@ from wheelbase_sdk.errors import WheelbaseAuthError
 
 
 class FakeClient:
-    def __init__(self, rows):
+    def __init__(self, rows, fin_rows=None):
         self._rows = rows
+        self._fin_rows = fin_rows if fin_rows is not None else []
 
     def postgrest_get(self, table, params):
-        assert table == "inventory_car"
-        assert params["id"].startswith("eq.")
-        return self._rows
+        if table == "inventory_car":
+            assert params["id"].startswith("eq.")
+            return self._rows
+        if table == "inventory_car_financials":
+            return self._fin_rows
+        return []
 
     def close(self):
         pass
@@ -78,6 +82,53 @@ def test_get_car_signed_out(monkeypatch):
 def test_get_car_validates_car_id():
     out = json.loads(mod.get_car({"carId": ""}))
     assert out["error"].startswith("carId")
+
+
+
+
+# ---------------------------------------------------------------------------
+# Financials view (inventory_car_financials)
+# ---------------------------------------------------------------------------
+
+def test_get_car_returns_financials_key(monkeypatch):
+    """get_car must include a 'financials' key in the response."""
+    fin_row = {
+        "total_cost_cents": 1500000,
+        "gross_profit_cents": 300000,
+        "margin_pct": 0.20,
+        "days_in_stock": 15,
+    }
+    client = FakeClient(rows=[{"id": "c1", "make": "Toyota", "status_id": None}], fin_rows=[fin_row])
+    monkeypatch.setattr(mod, "WheelbaseClient", lambda: client)
+    out = json.loads(mod.get_car({"carId": "c1"}))
+    assert "error" not in out
+    assert "financials" in out
+
+
+def test_get_car_financials_contains_expected_keys(monkeypatch):
+    """financials must include total_cost_cents, gross_profit_cents, margin_pct, days_in_stock."""
+    fin_row = {
+        "total_cost_cents": 1500000,
+        "gross_profit_cents": 300000,
+        "margin_pct": 0.20,
+        "days_in_stock": 15,
+    }
+    client = FakeClient(rows=[{"id": "c1", "make": "Toyota", "status_id": None}], fin_rows=[fin_row])
+    monkeypatch.setattr(mod, "WheelbaseClient", lambda: client)
+    out = json.loads(mod.get_car({"carId": "c1"}))
+    fin = out["financials"]
+    for key in ("total_cost_cents", "gross_profit_cents", "margin_pct", "days_in_stock"):
+        assert key in fin, f"Missing financials key: {key}"
+    assert fin["margin_pct"] == 0.20
+
+
+def test_get_car_financials_empty_when_view_returns_nothing(monkeypatch):
+    """If the financials view returns no rows, financials is {} (not an error)."""
+    client = FakeClient(rows=[{"id": "c1", "make": "Ford", "status_id": None}], fin_rows=[])
+    monkeypatch.setattr(mod, "WheelbaseClient", lambda: client)
+    out = json.loads(mod.get_car({"carId": "c1"}))
+    assert "error" not in out
+    assert out["financials"] == {}
 
 
 def test_register_wires_get_car():

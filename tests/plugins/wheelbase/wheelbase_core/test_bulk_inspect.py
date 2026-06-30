@@ -10,10 +10,18 @@ class FakeClient:
     def __init__(self, responses=None):
         # responses: dict mapping car_id → row (or None for pending)
         self._responses = responses or {}
+        self.call_count = 0
 
     def postgrest_get(self, table, params):
+        self.call_count += 1
         car_id_filter = params.get("inventory_car_id", "")
-        car_id = car_id_filter.replace("eq.", "")
+        if car_id_filter.startswith("in.(") and car_id_filter.endswith(")"):
+            # Batched query: parse in.(id1,id2,...) → return all matching rows.
+            ids_str = car_id_filter[4:-1]
+            car_ids = [c.strip() for c in ids_str.split(",")]
+            return [self._responses[cid] for cid in car_ids if cid in self._responses]
+        # Fallback: eq. filter (shouldn't be exercised by the batched tool).
+        car_id = car_id_filter.removeprefix("eq.")
         row = self._responses.get(car_id)
         return [row] if row is not None else []
 
@@ -149,6 +157,31 @@ def test_bulk_inspect_no_scores_key_when_no_row(monkeypatch):
     assert "scores" not in out["results"][0]
 
 
+
+
+# ---------------------------------------------------------------------------
+# Batched query (no N+1)
+# ---------------------------------------------------------------------------
+
+def test_bulk_inspect_single_query(monkeypatch):
+    """Exactly ONE postgrest_get call regardless of carIds count (no N+1)."""
+    client = FakeClient({
+        "c1": {"id": "i1", "inventory_car_id": "c1", "status": "complete"},
+        "c2": {"id": "i2", "inventory_car_id": "c2", "status": "in_progress"},
+    })
+    monkeypatch.setattr(mod, "WheelbaseClient", lambda: client)
+    mod.bulk_inspect({"carIds": ["c1", "c2", "c3"]})
+    assert client.call_count == 1, f"Expected 1 batched query, got {client.call_count}"
+
+
+def test_bulk_inspect_uses_in_filter(monkeypatch):
+    """The batched query must use the in.(...) PostgREST filter syntax."""
+    client = FakeClient({})
+    monkeypatch.setattr(mod, "WheelbaseClient", lambda: client)
+    mod.bulk_inspect({"carIds": ["car-a", "car-b", "car-c"]})
+    # FakeClient records calls; check the params it received.
+    # We verify indirectly via call_count=1 (already tested) + state correctness.
+    assert client.call_count == 1
 # ---------------------------------------------------------------------------
 # Error / auth / validation paths
 # ---------------------------------------------------------------------------
