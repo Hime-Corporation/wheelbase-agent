@@ -24,12 +24,12 @@ def get_runlist_cars(args: dict, **kwargs) -> str:
     try:
         # Select both the junction row id and the inventory_car_id separately
         # so callers always get distinct runlistCarId vs carId.
-        # asking_price_cents and imx_score are included when the view exposes them.
+        # imx_score is included; asking_price_cents does not exist on this view.
         params: dict[str, str] = {
             "select": (
                 "id,runlist_id,inventory_car_id,"
                 "year,make,model,vin,stock_number,archived_at,"
-                "asking_price_cents,imx_score"
+                "imx_score"
             ),
             "runlist_id": f"eq.{runlist_id}",
             "archived_at": "is.null",
@@ -54,9 +54,7 @@ def get_runlist_cars(args: dict, **kwargs) -> str:
                 "vin": r.get("vin"),
                 "stockNumber": r.get("stock_number"),
             }
-            # Include optional price/score columns only when present in the view row.
-            if r.get("asking_price_cents") is not None:
-                entry["askingPriceCents"] = r["asking_price_cents"]
+            # Include optional score column only when present in the view row.
             if r.get("imx_score") is not None:
                 entry["imxScore"] = r["imx_score"]
             summaries.append(entry)

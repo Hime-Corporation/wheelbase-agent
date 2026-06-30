@@ -11,9 +11,11 @@ class FakeClient:
         # responses: dict mapping car_id → row (or None for pending)
         self._responses = responses or {}
         self.call_count = 0
+        self.last_params = None
 
     def postgrest_get(self, table, params):
         self.call_count += 1
+        self.last_params = params
         car_id_filter = params.get("inventory_car_id", "")
         if car_id_filter.startswith("in.(") and car_id_filter.endswith(")"):
             # Batched query: parse in.(id1,id2,...) → return all matching rows.
@@ -179,9 +181,11 @@ def test_bulk_inspect_uses_in_filter(monkeypatch):
     client = FakeClient({})
     monkeypatch.setattr(mod, "WheelbaseClient", lambda: client)
     mod.bulk_inspect({"carIds": ["car-a", "car-b", "car-c"]})
-    # FakeClient records calls; check the params it received.
-    # We verify indirectly via call_count=1 (already tested) + state correctness.
     assert client.call_count == 1
+    assert client.last_params is not None
+    assert client.last_params["inventory_car_id"].startswith("in.("), (
+        f"Expected in.(...) filter, got: {client.last_params.get('inventory_car_id')!r}"
+    )
 # ---------------------------------------------------------------------------
 # Error / auth / validation paths
 # ---------------------------------------------------------------------------

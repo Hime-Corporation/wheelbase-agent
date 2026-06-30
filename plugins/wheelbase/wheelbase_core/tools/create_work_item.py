@@ -32,7 +32,7 @@ def create_work_item(args: dict, **kwargs) -> str:
         return err(f"priority must be one of {sorted(_PRIORITIES)}")
 
     est = args.get("estCostCents")
-    if est is not None and (not isinstance(est, int) or est < 0):
+    if est is not None and (isinstance(est, bool) or not isinstance(est, int) or est < 0):
         return err("estCostCents must be a non-negative integer")
 
     try:

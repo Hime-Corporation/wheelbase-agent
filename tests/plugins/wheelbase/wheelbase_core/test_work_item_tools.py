@@ -69,6 +69,49 @@ def test_get_work_item_queries_work_item_table(monkeypatch):
     assert fake.calls[0][1]["inventory_car_id"] == "eq.car-1"
 
 
+def test_get_work_item_flat_mode_no_effective_status(monkeypatch):
+    """Flat mode (no tree arg) must query the base `work_item` table and NOT select effective_status."""
+    import wheelbase_core.tools.get_work_item as gmod
+
+    class _C(_FakeClient):
+        def postgrest_get(self, table, params):
+            self.calls.append((table, params))
+            return [{"id": "wi-1", "type": "task", "status": "todo"}]
+
+    fake = _C()
+    monkeypatch.setattr(gmod, "WheelbaseClient", lambda: fake)
+    out = json.loads(gmod.get_work_item({"carId": "car-1"}))
+    assert "error" not in out
+    table, params = fake.calls[0]
+    assert table == "work_item", f"Expected 'work_item', got '{table}'"
+    select = params.get("select", "")
+    assert "effective_status" not in select, (
+        f"Flat mode must not select effective_status (base table lacks it); got: {select!r}"
+    )
+
+
+def test_get_work_item_tree_mode_uses_view_and_effective_status(monkeypatch):
+    """Tree mode must query `work_item_tree` view and include effective_status, depth, root_id."""
+    import wheelbase_core.tools.get_work_item as gmod
+
+    class _C(_FakeClient):
+        def postgrest_get(self, table, params):
+            self.calls.append((table, params))
+            return [{"id": "wi-1", "type": "task", "status": "todo", "effective_status": "todo",
+                     "depth": 0, "root_id": "wi-1"}]
+
+    fake = _C()
+    monkeypatch.setattr(gmod, "WheelbaseClient", lambda: fake)
+    out = json.loads(gmod.get_work_item({"carId": "car-1", "tree": True}))
+    assert "error" not in out
+    table, params = fake.calls[0]
+    assert table == "work_item_tree", f"Expected 'work_item_tree', got '{table}'"
+    select = params.get("select", "")
+    assert "effective_status" in select, f"Tree mode must select effective_status; got: {select!r}"
+    assert "depth" in select, f"Tree mode must select depth; got: {select!r}"
+    assert "root_id" in select, f"Tree mode must select root_id; got: {select!r}"
+
+
 # ── delete_work_item ──────────────────────────────────────────────────────────
 
 def test_delete_work_item_prefetches_children(monkeypatch):
