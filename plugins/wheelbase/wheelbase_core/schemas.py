@@ -227,97 +227,161 @@ ARCHIVE_RUNLIST_CARS = {
     },
 }
 
-CREATE_WORK_ORDER = {
-    "name": "create_work_order",
+CREATE_WORK_ITEM = {
+    "name": "create_work_item",
     "description": (
-        "Create a new work order for a specific vehicle. Returns the created work order "
-        "id and summary. Executes immediately without requiring confirmation. "
-        "Safe-write operation."
+        "Create a new work item in the unified work_item table for a vehicle. "
+        "Supports tasks, reminders, findings, work orders, and work order lines. "
+        "Root items (task, reminder) require carId; child items (finding, work_order, "
+        "work_order_line) require parentId. Executes immediately without confirmation."
     ),
     "parameters": {
         "type": "object",
         "properties": {
             "carId": {
                 "type": "string",
-                "description": "UUID of the inventory car to create the work order for.",
+                "description": (
+                    "UUID of the inventory car. Required for root items (task, reminder). "
+                    "Optional for child items that inherit car from the parent."
+                ),
             },
             "title": {
                 "type": "string",
-                "description": "Short title describing the work to be done.",
+                "description": "Short title describing the work item (required, non-empty).",
+            },
+            "type": {
+                "type": "string",
+                "enum": ["task", "work_order", "reminder", "finding", "work_order_line"],
+                "description": (
+                    "Work item type. Root types: task, reminder. "
+                    "Child types (require parentId): finding, work_order, work_order_line. "
+                    "Defaults to 'task'."
+                ),
+            },
+            "parentId": {
+                "type": "string",
+                "description": (
+                    "UUID of the parent work_item. Required for child types "
+                    "(finding, work_order, work_order_line). Must not be set for root types."
+                ),
             },
             "description": {
                 "type": "string",
-                "description": "Optional detailed description of the work.",
+                "description": "Optional detailed description of the work item.",
+            },
+            "priority": {
+                "type": "string",
+                "enum": ["low", "medium", "high", "urgent"],
+                "description": "Priority level. Defaults to 'medium'.",
+            },
+            "estCostCents": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "Optional estimated cost in cents (non-negative integer).",
             },
             "vendorId": {
                 "type": "string",
-                "description": (
-                    "Optional UUID of the vendor (shop) assigned to this work order."
-                ),
+                "description": "Optional UUID of the vendor assigned to this work item.",
             },
-            "scheduledAt": {
+            "dueAt": {
                 "type": "string",
                 "description": (
-                    "Optional ISO date string for when the work is scheduled "
-                    "(e.g. '2026-06-15T10:00:00Z')."
+                    "Optional ISO 8601 date-time string for when the item is due "
+                    "(e.g. '2026-07-01T10:00:00Z')."
                 ),
             },
+            "stageDefinitionId": {
+                "type": "string",
+                "description": "Optional UUID of the stage definition to associate with this item.",
+            },
         },
-        "required": ["carId", "title"],
+        "required": ["title"],
         "additionalProperties": False,
     },
 }
 
-GET_WORK_ORDER = {
-    "name": "get_work_order",
+GET_WORK_ITEM = {
+    "name": "get_work_item",
     "description": (
-        "Retrieve work orders for a specific vehicle (car). Returns a list of work order "
-        "summaries including id, title, status, vendor_id, and scheduled_at. "
-        "Optionally filter by status."
+        "Read work_item rows for a vehicle or fetch a specific item by ID. "
+        "Optionally returns the nested tree view (tree=true) via the work_item_tree view. "
+        "At least one of carId or workItemId is required."
     ),
     "parameters": {
         "type": "object",
         "properties": {
             "carId": {
                 "type": "string",
-                "description": "UUID of the inventory car whose work orders to retrieve.",
+                "description": "UUID of the inventory car whose work items to retrieve.",
+            },
+            "workItemId": {
+                "type": "string",
+                "description": "UUID of a specific work item to retrieve.",
+            },
+            "type": {
+                "type": "string",
+                "description": "Optional: filter results by work item type (e.g. 'task', 'finding').",
             },
             "status": {
                 "type": "string",
-                "enum": ["draft", "open", "scheduled", "in_progress", "completed", "cancelled"],
+                "description": "Optional: filter results by status (e.g. 'todo', 'done').",
+            },
+            "tree": {
+                "type": "boolean",
                 "description": (
-                    "Optional status filter. One of: draft, open, scheduled, "
-                    "in_progress, completed, cancelled."
+                    "If true, query the work_item_tree view for nested/hierarchical results. "
+                    "Defaults to false (flat work_item table)."
                 ),
             },
+            "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 500,
+                "description": "Maximum number of results to return. Default 100.",
+            },
+            "offset": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "Pagination offset. Default 0.",
+            },
         },
-        "required": ["carId"],
+        "required": [],
         "additionalProperties": False,
     },
 }
 
-DELETE_WORK_ORDER = {
-    "name": "delete_work_order",
+DELETE_WORK_ITEM = {
+    "name": "delete_work_item",
     "description": (
-        "Permanently delete a work order by ID. This action is irreversible. "
-        "REQUIRES user confirmation before executing."
+        "Permanently delete a work item and its child items (cascade). "
+        "Pre-fetches the item title and child count before deletion so the result "
+        "describes what was removed. REQUIRES user confirmation before executing."
     ),
     "parameters": {
         "type": "object",
         "properties": {
-            "workOrderId": {
+            "workItemId": {
                 "type": "string",
-                "description": "UUID of the work order to delete.",
-            },
-            "carId": {
-                "type": "string",
-                "description": (
-                    "UUID of the inventory car the work order belongs to "
-                    "(used for UI routing after deletion)."
-                ),
+                "description": "UUID of the work item to delete.",
             },
         },
-        "required": ["workOrderId", "carId"],
+        "required": ["workItemId"],
+        "additionalProperties": False,
+    },
+}
+
+LIST_INVENTORY_STATUSES = {
+    "name": "list_inventory_statuses",
+    "description": (
+        "Return all configured inventory status definitions for the dealership. "
+        "Results are ordered by sort_order ascending and include id, code, label, "
+        "and sort_order. Use this to resolve status codes/labels or to populate a "
+        "status picker before calling update_inventory_status."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": [],
         "additionalProperties": False,
     },
 }

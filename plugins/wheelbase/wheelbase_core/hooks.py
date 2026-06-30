@@ -6,7 +6,7 @@ wheelbase tools require explicit user approval before the agent is
 allowed to execute them:
 
   - ``send_to_vendor``
-  - ``delete_work_order``
+  - ``delete_work_item``
 
 The hook returns ``{"action": "pending_approval", ...}`` for those tools.
 ``hermes_cli.plugins.get_pre_tool_call_block_message`` recognises that
@@ -35,13 +35,13 @@ logger = logging.getLogger(__name__)
 # Tools that require human approval before execution.
 _APPROVAL_REQUIRED_TOOLS = frozenset({
     "send_to_vendor",
-    "delete_work_order",
+    "delete_work_item",
 })
 
 # Human-readable descriptions shown in the approval.request event.
 _TOOL_DESCRIPTIONS = {
     "send_to_vendor": "Send a vehicle to an external vendor (irreversible dispatch)",
-    "delete_work_order": "Permanently delete a work order record",
+    "delete_work_item": "Permanently delete a work item and its child items (cascade)",
 }
 
 # Guard: read once at module import so the hook is O(1) per call.

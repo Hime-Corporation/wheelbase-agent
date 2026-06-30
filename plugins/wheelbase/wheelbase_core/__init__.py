@@ -13,9 +13,10 @@ from .tools import list_runlists as list_runlists_tool
 from .tools import get_runlist_cars as get_runlist_cars_tool
 from .tools import assess_runlist as assess_runlist_tool
 from .tools import archive_runlist_cars as archive_runlist_cars_tool
-from .tools import create_work_order as create_work_order_tool
-from .tools import get_work_order as get_work_order_tool
-from .tools import delete_work_order as delete_work_order_tool
+from .tools import create_work_item as create_work_item_tool
+from .tools import get_work_item as get_work_item_tool
+from .tools import delete_work_item as delete_work_item_tool
+from .tools import list_inventory_statuses as list_inventory_statuses_tool
 from .tools import create_inspection_note as create_inspection_note_tool
 from .tools import bulk_inspect as bulk_inspect_tool
 from .tools import list_vendors as list_vendors_tool
@@ -75,22 +76,28 @@ def register(ctx):
         handler=archive_runlist_cars_tool.archive_runlist_cars,
     )
     ctx.register_tool(
-        name="create_work_order",
+        name="create_work_item",
         toolset="wheelbase",
-        schema=schemas.CREATE_WORK_ORDER,
-        handler=create_work_order_tool.create_work_order,
+        schema=schemas.CREATE_WORK_ITEM,
+        handler=create_work_item_tool.create_work_item,
     )
     ctx.register_tool(
-        name="get_work_order",
+        name="get_work_item",
         toolset="wheelbase",
-        schema=schemas.GET_WORK_ORDER,
-        handler=get_work_order_tool.get_work_order,
+        schema=schemas.GET_WORK_ITEM,
+        handler=get_work_item_tool.get_work_item,
     )
     ctx.register_tool(
-        name="delete_work_order",
+        name="delete_work_item",
         toolset="wheelbase",
-        schema=schemas.DELETE_WORK_ORDER,
-        handler=delete_work_order_tool.delete_work_order,
+        schema=schemas.DELETE_WORK_ITEM,
+        handler=delete_work_item_tool.delete_work_item,
+    )
+    ctx.register_tool(
+        name="list_inventory_statuses",
+        toolset="wheelbase",
+        schema=schemas.LIST_INVENTORY_STATUSES,
+        handler=list_inventory_statuses_tool.list_inventory_statuses,
     )
     ctx.register_tool(
         name="create_inspection_note",
