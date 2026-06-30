@@ -11,6 +11,7 @@ from gateway.session import SessionSource
 def _make_adapter(
     require_mention=None,
     free_response_chats=None,
+    free_response_topics=None,
     mention_patterns=None,
     exclusive_bot_mentions=None,
     ignored_threads=None,
@@ -30,6 +31,8 @@ def _make_adapter(
         extra["require_mention"] = require_mention
     if free_response_chats is not None:
         extra["free_response_chats"] = free_response_chats
+    if free_response_topics is not None:
+        extra["free_response_topics"] = free_response_topics
     if mention_patterns is not None:
         extra["mention_patterns"] = mention_patterns
     if exclusive_bot_mentions is not None:
@@ -541,6 +544,24 @@ def test_free_response_chats_bypass_mention_requirement():
 
     assert adapter._should_process_message(_group_message("hello everyone", chat_id=-200)) is True
     assert adapter._should_process_message(_group_message("hello everyone", chat_id=-201)) is False
+
+
+def test_free_response_topics_bypass_mention_only_in_listed_topics():
+    # Per-user topics 4/289 are free-flow; General (thread 1) and unlisted
+    # topics still require a mention even though they're in the same group.
+    adapter = _make_adapter(require_mention=True, free_response_topics=["4", "289"])
+
+    # Listed per-user topics: unmentioned message is processed.
+    assert adapter._should_process_message(_group_message("hi", thread_id=4)) is True
+    assert adapter._should_process_message(_group_message("hi", thread_id=289)) is True
+    # General topic (thread 1) and an unlisted topic: silent without a mention.
+    assert adapter._should_process_message(_group_message("hi", thread_id=1)) is False
+    assert adapter._should_process_message(_group_message("hi", thread_id=999)) is False
+    # General still responds when mentioned.
+    mentioned = _group_message(
+        "hi @hermes_bot", thread_id=1, entities=[_mention_entity("hi @hermes_bot")]
+    )
+    assert adapter._should_process_message(mentioned) is True
 
 
 def test_guest_mode_allows_only_direct_mentions_outside_allowed_chats():

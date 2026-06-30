@@ -136,6 +136,11 @@ gateway:
   platforms:
     telegram:
       extra:
+        # Per-user topics chat the agent free-flow (no @mention needed); each
+        # forum topic is its own isolated parallel session. The General topic
+        # (thread 1) is NOT listed, so it stays mention-gated via
+        # require_mention above. Simon=4, Yura=289, Mark=290, Igor=291.
+        free_response_topics: ["4", "289", "290", "291"]
         # Native rendering for tables / task lists / <details> / block math
         # via sendRichMessage (Bot API 10.1). Transparently falls back to
         # MarkdownV2 if Telegram rejects the call or content exceeds the limit.

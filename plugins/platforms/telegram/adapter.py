@@ -5960,6 +5960,22 @@ class TelegramAdapter(BasePlatformAdapter):
             return {str(part).strip() for part in raw if str(part).strip()}
         return {part.strip() for part in str(raw).split(",") if part.strip()}
 
+    def _telegram_free_response_topics(self) -> set[str]:
+        """Return forum topic (thread) IDs that bypass ``require_mention``.
+
+        Unlike ``free_response_chats`` (whole-chat), this is per-topic: it lets
+        specific forum topics run free-flow (no @mention needed) while the rest
+        of the same group — notably the General topic — still honors
+        ``require_mention``. Used for per-user topics where each member chats
+        the agent directly while shared topics stay mention-gated.
+        """
+        raw = self.config.extra.get("free_response_topics")
+        if raw is None:
+            raw = os.getenv("TELEGRAM_FREE_RESPONSE_TOPICS", "")
+        if isinstance(raw, list):
+            return {str(part).strip() for part in raw if str(part).strip()}
+        return {part.strip() for part in str(raw).split(",") if part.strip()}
+
     def _telegram_allowed_chats(self) -> set[str]:
         """Return the whitelist of group/supergroup chat IDs the bot will respond in.
 
@@ -6651,6 +6667,10 @@ class TelegramAdapter(BasePlatformAdapter):
         if guest_mention:
             return True
         if chat_id_str in self._telegram_free_response_chats():
+            return True
+        # Per-topic free-flow: listed forum topics bypass require_mention (e.g.
+        # per-user topics) while other topics (General) stay mention-gated.
+        if thread_id is not None and str(thread_id) in self._telegram_free_response_topics():
             return True
         if not self._telegram_require_mention():
             return True
