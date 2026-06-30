@@ -29,8 +29,9 @@
 #   GLOBAL TELEGRAM_BOT_TOKEN would make BOTH try to poll the same bot ->
 #   Telegram 409 Conflict. We therefore inject the token into ONLY the
 #   Telegram subshell (mapping WB_TELEGRAM_BOT_TOKEN -> TELEGRAM_BOT_TOKEN
-#   there), and force API_SERVER_ENABLED=false in that subshell so it never
-#   double-binds the API server's :8642.
+#   there), and `env -u` the inherited API_SERVER_* vars in that subshell so
+#   it never enables a second api_server adapter and double-binds :8642
+#   (config.py enables api_server on API_SERVER_KEY OR API_SERVER_ENABLED).
 #
 # POSIX sh only (the python:3.11-slim base image's /bin/sh is dash, no
 # bash installed) — avoid bashisms such as `wait -n`, arrays, or [[ ]].
@@ -108,6 +109,11 @@ telegram:
   # unless a member @mentions @hermesauto_bot or replies to it.
   require_mention: true
   exclusive_bot_mentions: true
+tts:
+  # Voice output via ElevenLabs (reads ELEVENLABS_API_KEY from env). Uses the
+  # built-in defaults — Adam voice (pNInz6obpgDQGcFmaJgB) + eleven_multilingual_v2
+  # — and is delivered as native Telegram voice bubbles (Opus, no ffmpeg needed).
+  provider: elevenlabs
 web:
   search_backend: ddgs
   extract_backend: firecrawl
@@ -128,15 +134,20 @@ EOF
   fi
 
   # Background retry loop, failure-isolated like the API server above.
-  # Secret scoping: TELEGRAM_BOT_TOKEN is injected HERE ONLY (never global),
-  # API_SERVER_ENABLED=false stops this process from double-binding :8642,
-  # and Daytona is dropped in favor of a local terminal backend.
+  # Secret scoping: TELEGRAM_BOT_TOKEN is injected HERE ONLY (never global).
+  # We must UNSET the API-server trigger vars rather than just disable them:
+  # config.py enables the api_server platform when API_SERVER_KEY *or*
+  # API_SERVER_ENABLED is truthy, so the inherited API_SERVER_KEY would still
+  # turn it on and collide with the real API-server process on :8642 (which in
+  # turn aborts this process's startup before Telegram connects). `env -u`
+  # strips them so Telegram is the only enabled platform here. Daytona is
+  # dropped in favor of a local terminal backend.
   (
     while true; do
-      HERMES_HOME="$TELEGRAM_HERMES_HOME" \
-      TELEGRAM_BOT_TOKEN="$WB_TELEGRAM_BOT_TOKEN" \
-      API_SERVER_ENABLED=false \
-      TERMINAL_ENV=local \
+      env -u API_SERVER_KEY -u API_SERVER_ENABLED -u API_SERVER_PORT \
+        HERMES_HOME="$TELEGRAM_HERMES_HOME" \
+        TELEGRAM_BOT_TOKEN="$WB_TELEGRAM_BOT_TOKEN" \
+        TERMINAL_ENV=local \
         python -m gateway.run || true
       echo "[gateway-entrypoint] gateway.run (Telegram) exited — retrying in 3s" >&2
       sleep 3
