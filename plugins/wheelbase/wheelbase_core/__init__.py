@@ -23,6 +23,12 @@ from .tools import list_vendors as list_vendors_tool
 from .tools import get_vendor as get_vendor_tool
 from .tools import send_to_vendor as send_to_vendor_tool
 from .tools import generate_demand_score as generate_demand_score_tool
+from .tools import get_recon_board as get_recon_board_tool
+from .tools import start_recon as start_recon_tool
+from .tools import recon_stage_tools as recon_stage_tools_tool
+from .tools import add_work_item_comment as add_work_item_comment_tool
+from .tools import query_work as query_work_tool
+from .tools import inventory_stats as inventory_stats_tool
 
 
 def register(ctx):
@@ -134,4 +140,58 @@ def register(ctx):
         toolset="wheelbase",
         schema=schemas.GENERATE_DEMAND_SCORE,
         handler=generate_demand_score_tool.generate_demand_score,
+    )
+    ctx.register_tool(
+        name="get_recon_board",
+        toolset="wheelbase",
+        schema=schemas.GET_RECON_BOARD,
+        handler=get_recon_board_tool.get_recon_board,
+    )
+    ctx.register_tool(
+        name="start_recon",
+        toolset="wheelbase",
+        schema=schemas.START_RECON,
+        handler=start_recon_tool.start_recon,
+    )
+    ctx.register_tool(
+        name="complete_stage",
+        toolset="wheelbase",
+        schema=schemas.COMPLETE_STAGE,
+        handler=recon_stage_tools_tool.complete_stage,
+    )
+    ctx.register_tool(
+        name="update_stage",
+        toolset="wheelbase",
+        schema=schemas.UPDATE_STAGE,
+        handler=recon_stage_tools_tool.update_stage,
+    )
+    ctx.register_tool(
+        name="create_finding",
+        toolset="wheelbase",
+        schema=schemas.CREATE_FINDING,
+        handler=recon_stage_tools_tool.create_finding,
+    )
+    ctx.register_tool(
+        name="add_work_item_comment",
+        toolset="wheelbase",
+        schema=schemas.ADD_WORK_ITEM_COMMENT,
+        handler=add_work_item_comment_tool.add_work_item_comment,
+    )
+    ctx.register_tool(
+        name="query_work",
+        toolset="wheelbase",
+        schema=schemas.QUERY_WORK,
+        handler=query_work_tool.query_work,
+    )
+    ctx.register_tool(
+        name="get_inventory_stats",
+        toolset="wheelbase",
+        schema=schemas.GET_INVENTORY_STATS,
+        handler=inventory_stats_tool.get_inventory_stats,
+    )
+    ctx.register_tool(
+        name="get_inventory_filter_options",
+        toolset="wheelbase",
+        schema=schemas.GET_INVENTORY_FILTER_OPTIONS,
+        handler=inventory_stats_tool.get_inventory_filter_options,
     )

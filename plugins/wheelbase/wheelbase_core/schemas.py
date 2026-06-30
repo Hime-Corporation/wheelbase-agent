@@ -567,3 +567,314 @@ GENERATE_DEMAND_SCORE = {
         "additionalProperties": False,
     },
 }
+
+GET_RECON_BOARD = {
+    "name": "get_recon_board",
+    "description": (
+        "Retrieve the reconditioning board for a single vehicle as a nested tree. "
+        "Returns the recon run root with its stages, and findings/work orders nested "
+        "under each stage (from the work_item_tree view). Use this to review a car's "
+        "recon progress, stage status, holds, and rolled-up cost estimates. If the car "
+        "has no recon run yet, a flat list of its work items is returned instead — call "
+        "start_recon to kick off reconditioning."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "carId": {
+                "type": "string",
+                "description": "UUID of the inventory car whose recon board to retrieve.",
+            },
+        },
+        "required": ["carId"],
+        "additionalProperties": False,
+    },
+}
+
+START_RECON = {
+    "name": "start_recon",
+    "description": (
+        "Begin reconditioning for a vehicle by setting its inventory status to 'recon'. "
+        "The backend trigger automatically creates the recon run and its stages. Use this "
+        "when a car needs to enter the recon workflow. The recon status ID is resolved "
+        "automatically; only pass reconStatusId to override it."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "carId": {
+                "type": "string",
+                "description": "UUID of the inventory car to move into recon.",
+            },
+            "reconStatusId": {
+                "type": "number",
+                "description": (
+                    "Optional: explicit inventory status ID for 'recon'. "
+                    "If omitted, it is resolved automatically from the status definitions."
+                ),
+            },
+        },
+        "required": ["carId"],
+        "additionalProperties": False,
+    },
+}
+
+COMPLETE_STAGE = {
+    "name": "complete_stage",
+    "description": (
+        "Mark a recon stage as done by setting its status to 'done'. Use this when a "
+        "reconditioning stage (e.g. mechanical, detail) has been finished. To set other "
+        "statuses or place a hold, use update_stage instead."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "stageId": {
+                "type": "string",
+                "description": "UUID of the recon stage (work_item) to mark complete.",
+            },
+        },
+        "required": ["stageId"],
+        "additionalProperties": False,
+    },
+}
+
+UPDATE_STAGE = {
+    "name": "update_stage",
+    "description": (
+        "Update mutable fields on a recon stage: status, hold type/reason, assignee, "
+        "vendor, or estimated cost. Use this to place a stage on hold (set holdType — the "
+        "stage is automatically set to 'blocked' unless you also pass an explicit status), "
+        "reassign work, attach a vendor, or revise a cost estimate."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "stageId": {
+                "type": "string",
+                "description": "UUID of the recon stage (work_item) to update.",
+            },
+            "status": {
+                "type": "string",
+                "enum": [
+                    "todo",
+                    "ready",
+                    "in_progress",
+                    "blocked",
+                    "done",
+                    "skipped",
+                    "cancelled",
+                ],
+                "description": "Optional new status for the stage.",
+            },
+            "holdType": {
+                "type": "string",
+                "enum": ["parts", "vendor", "approval", "transport"],
+                "description": (
+                    "Optional hold reason category. If set without an explicit status, "
+                    "the stage is forced to 'blocked'."
+                ),
+            },
+            "holdReason": {
+                "type": "string",
+                "description": "Optional free-form explanation for the hold.",
+            },
+            "assignedToUserId": {
+                "type": "string",
+                "description": "Optional UUID of the user to assign this stage to.",
+            },
+            "vendorId": {
+                "type": "string",
+                "description": "Optional UUID of the vendor responsible for this stage.",
+            },
+            "estCostCents": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "Optional estimated cost in cents (non-negative integer).",
+            },
+        },
+        "required": ["stageId"],
+        "additionalProperties": False,
+    },
+}
+
+CREATE_FINDING = {
+    "name": "create_finding",
+    "description": (
+        "Record a finding discovered during reconditioning under a recon stage. A finding "
+        "is a defect or item of work uncovered during inspection (e.g. 'worn brake pads'). "
+        "Findings are child work items and require a parent stage. Use this to log issues "
+        "as they are found so they roll up into the recon board."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "parentId": {
+                "type": "string",
+                "description": "UUID of the parent recon stage (work_item) for this finding.",
+            },
+            "title": {
+                "type": "string",
+                "description": "Short description of the finding (required, non-empty).",
+            },
+            "estCostCents": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "Optional estimated cost to remedy in cents (non-negative integer).",
+            },
+            "priority": {
+                "type": "string",
+                "enum": ["low", "medium", "high", "urgent"],
+                "description": "Optional priority of the finding. Defaults to 'medium'.",
+            },
+            "carId": {
+                "type": "string",
+                "description": "Optional UUID of the inventory car (inherited from parent if omitted).",
+            },
+        },
+        "required": ["parentId", "title"],
+        "additionalProperties": False,
+    },
+}
+
+ADD_WORK_ITEM_COMMENT = {
+    "name": "add_work_item_comment",
+    "description": (
+        "Add a comment to a work item. Use this to record notes, status updates, or "
+        "context on any work item (task, recon stage, finding, work order, etc.). The "
+        "comment is attributed to the signed-in user."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "workItemId": {
+                "type": "string",
+                "description": "UUID of the work item to comment on.",
+            },
+            "content": {
+                "type": "string",
+                "description": "Comment text (required, non-empty).",
+            },
+        },
+        "required": ["workItemId", "content"],
+        "additionalProperties": False,
+    },
+}
+
+QUERY_WORK = {
+    "name": "query_work",
+    "description": (
+        "Query work items across the dealership with optional filters. Use this to find "
+        "work by status, type, vendor, assignee, or due-date range — for example overdue "
+        "tasks, all blocked stages, or every work order for a vendor. Results are ordered "
+        "by due date and paginated. To read a single car's work items, use get_work_item."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "status": {
+                "type": "string",
+                "enum": [
+                    "todo",
+                    "ready",
+                    "in_progress",
+                    "blocked",
+                    "done",
+                    "skipped",
+                    "cancelled",
+                ],
+                "description": "Optional: filter by work item status.",
+            },
+            "type": {
+                "type": "string",
+                "enum": [
+                    "recon_run",
+                    "stage",
+                    "task",
+                    "work_order",
+                    "work_order_line",
+                    "finding",
+                    "reminder",
+                ],
+                "description": "Optional: filter by work item type.",
+            },
+            "vendorId": {
+                "type": "string",
+                "description": "Optional: filter by assigned vendor UUID.",
+            },
+            "assignedToUserId": {
+                "type": "string",
+                "description": "Optional: filter by assigned user UUID.",
+            },
+            "dueBefore": {
+                "type": "string",
+                "description": "Optional: only items due on or before this ISO 8601 date-time.",
+            },
+            "dueAfter": {
+                "type": "string",
+                "description": "Optional: only items due on or after this ISO 8601 date-time.",
+            },
+            "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Maximum number of results to return. Default 50.",
+            },
+            "offset": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "Pagination offset. Default 0.",
+            },
+        },
+        "required": [],
+        "additionalProperties": False,
+    },
+}
+
+GET_INVENTORY_STATS = {
+    "name": "get_inventory_stats",
+    "description": (
+        "Get summary statistics for a dealership's inventory (counts, value, age, status "
+        "breakdown, etc.) via the get_inventory_stats RPC. Use this for an at-a-glance "
+        "overview of the lot. If the user belongs to exactly one dealership the context is "
+        "resolved automatically; otherwise pass dealershipId."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "dealershipId": {
+                "type": "string",
+                "description": (
+                    "Optional UUID of the dealership. Required only when the user belongs "
+                    "to more than one dealership."
+                ),
+            },
+        },
+        "required": [],
+        "additionalProperties": False,
+    },
+}
+
+GET_INVENTORY_FILTER_OPTIONS = {
+    "name": "get_inventory_filter_options",
+    "description": (
+        "Get the available filter values for a dealership's inventory (makes, models, "
+        "statuses, year range, etc.) via the get_inventory_filter_options RPC. Use this to "
+        "discover valid filter options before searching or to populate a filter UI. If the "
+        "user belongs to exactly one dealership the context is resolved automatically; "
+        "otherwise pass dealershipId."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "dealershipId": {
+                "type": "string",
+                "description": (
+                    "Optional UUID of the dealership. Required only when the user belongs "
+                    "to more than one dealership."
+                ),
+            },
+        },
+        "required": [],
+        "additionalProperties": False,
+    },
+}

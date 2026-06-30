@@ -20,3 +20,12 @@ provides_tools:
   - get_vendor
   - send_to_vendor
   - generate_demand_score
+  - get_recon_board
+  - start_recon
+  - complete_stage
+  - update_stage
+  - create_finding
+  - add_work_item_comment
+  - query_work
+  - get_inventory_stats
+  - get_inventory_filter_options
