@@ -92,9 +92,19 @@ if [ -n "${WB_TELEGRAM_BOT_TOKEN:-}" ]; then
     # Model/persona/plugins mirror the per-user profile (provision_profile)
     # except the model, pinned to z-ai/glm-5.2 per owner request.
     cat > "$TELEGRAM_HERMES_HOME/config.yaml" <<'EOF'
-model: z-ai/glm-5.2
+model: deepseek/deepseek-v4-pro
 provider: openrouter
+provider_routing:
+  # Prefer the first-party DeepSeek endpoint: it is the ONLY provider with
+  # implicit prompt caching (cache-read ~$0.004/M) — critical since ~99% of
+  # spend is the re-sent conversation prefix each turn. `order` (not `only`)
+  # falls back to other providers if DeepSeek is down (those turns cost more
+  # but don't fail).
+  order: ["DeepSeek"]
 skin: wheelbase
+delegation:
+  # delegate_task subagents run on the cheap/fast Flash model instead of Pro.
+  model: deepseek/deepseek-v4-flash
 plugins:
   enabled:
     - wheelbase-core
@@ -104,13 +114,28 @@ plugins:
     - wheelbase-inspection
     - wheelbase-dealercenter-import
 auxiliary:
-  # glm-5.2 is text-only, so route image analysis (vision_analyze) to a
-  # vision-capable model on the SAME OpenRouter key. Without this, the default
-  # provider:auto falls back to the text-only main model and inbound photos
-  # error out ("No LLM provider configured for task=vision provider=auto").
+  # DeepSeek is text-only, so route image analysis (vision_analyze) to a
+  # vision-capable model on the SAME OpenRouter key. Do NOT point this at
+  # DeepSeek — inbound photos would error ("No LLM provider for task=vision").
   vision:
     provider: openrouter
     model: google/gemini-3-flash-preview
+  # Keep the expensive per-turn side-forks OFF the main model: context
+  # compression + the background self-improvement review run on cheap Flash,
+  # pinned to the caching DeepSeek endpoint. (These were silently running on
+  # the pricey main model before — part of the spend.)
+  compression:
+    provider: openrouter
+    model: deepseek/deepseek-v4-flash
+    extra_body:
+      provider:
+        order: ["DeepSeek"]
+  background_review:
+    provider: openrouter
+    model: deepseek/deepseek-v4-flash
+    extra_body:
+      provider:
+        order: ["DeepSeek"]
 image_gen:
   # Text-to-image + image editing via the bundled OpenRouter backend plugin
   # (plugins/image_gen/openrouter, auto-loads; uses OPENROUTER_API_KEY already
@@ -134,12 +159,12 @@ web:
   extract_backend: firecrawl
 gateway:
   streaming:
-    # Progressive token-by-token replies. transport: auto = native animated
-    # draft preview in DMs (Bot API 9.5 sendMessageDraft); edit-based
-    # progressive updates in the @mention-gated group (Telegram restricts
-    # drafts to private chats, so the group always uses the edit path).
+    # Progressive token-by-token replies via edit-based updates. `edit` (not
+    # `auto`/`draft`) issues fewer Telegram API calls than rich draft frames,
+    # which was tripping Telegram flood-control (38s stalls) under heavy
+    # streaming. Works in both DMs and the group.
     enabled: true
-    transport: auto
+    transport: edit
   platforms:
     telegram:
       extra:
