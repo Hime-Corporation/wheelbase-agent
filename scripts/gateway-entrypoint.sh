@@ -111,6 +111,13 @@ auxiliary:
   vision:
     provider: openrouter
     model: google/gemini-3-flash-preview
+image_gen:
+  # Text-to-image + image editing via the bundled OpenRouter backend plugin
+  # (plugins/image_gen/openrouter, auto-loads; uses OPENROUTER_API_KEY already
+  # in env). Gemini 3.1 Flash Image (~$0.07/image).
+  provider: openrouter
+  openrouter:
+    model: google/gemini-3.1-flash-image
 telegram:
   # Owner DMs the bot directly = free-flow (DMs never need an @mention).
   # Group "Hermes AI Integration" (-1004395037275): the bot stays silent

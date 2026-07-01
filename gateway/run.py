@@ -12957,7 +12957,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         adapter: Optional[Any] = None,
     ) -> Optional[Dict[str, Any]]:
         """Build thread metadata for synthetic sends that only have routing state."""
+        # Telegram forum "General" topic is reported as thread_id=None (some
+        # groups) or "1" (others); BOTH map to message_thread_id=None on sends
+        # (thread id 1 is rejected — "message thread not found"). So media/file
+        # sends to General have no message_thread_id to route by and would land
+        # DETACHED in the main area (invisible from the General topic view).
+        # Carry the trigger message id as a reply anchor so attachments thread
+        # into General, mirroring how text replies already route.
+        _tg_general = (
+            platform == Platform.TELEGRAM
+            and chat_type in {"group", "supergroup", "forum"}
+            and (thread_id is None or str(thread_id) == "1")
+            and reply_to_message_id is not None
+        )
         if thread_id is None:
+            if _tg_general:
+                return {
+                    "thread_id": None,
+                    "telegram_reply_to_message_id": str(reply_to_message_id),
+                    "telegram_general_reply_fallback": True,
+                }
             return None
         metadata: Dict[str, Any] = {"thread_id": thread_id}
         if self._is_telegram_dm_topic_target(
@@ -12976,6 +12995,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 metadata["direct_messages_topic_id"] = tid
             if reply_to_message_id is not None:
                 metadata["telegram_reply_to_message_id"] = str(reply_to_message_id)
+        elif _tg_general:
+            metadata["telegram_reply_to_message_id"] = str(reply_to_message_id)
+            metadata["telegram_general_reply_fallback"] = True
         return metadata
 
     @staticmethod

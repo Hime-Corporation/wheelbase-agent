@@ -767,6 +767,13 @@ class TelegramAdapter(BasePlatformAdapter):
             if reply_to_mode == "off":
                 return None
             return cls._metadata_reply_to_message_id(metadata)
+        # Forum General topic: sends omit message_thread_id, so the reply anchor
+        # is the only thing that threads media into the General topic (otherwise
+        # the file lands detached in the main area).
+        if metadata and metadata.get("telegram_general_reply_fallback"):
+            if reply_to_mode == "off":
+                return None
+            return cls._metadata_reply_to_message_id(metadata)
         return None
 
     @classmethod
