@@ -90,19 +90,18 @@ if [ -n "${WB_TELEGRAM_BOT_TOKEN:-}" ]; then
   if [ ! -f "$TELEGRAM_HERMES_HOME/config.yaml" ]; then
     # Idempotent: only written on first boot; hand-edits survive restarts.
     # Model/persona/plugins mirror the per-user profile (provision_profile)
-    # except the model, pinned to z-ai/glm-5.2 per owner request.
+    # except the model — owner runs this on their personal ChatGPT
+    # subscription via the openai-codex OAuth provider (2026-07-01). Auth
+    # lives in $TELEGRAM_HERMES_HOME/auth.json, set up separately via
+    # `hermes auth add openai-codex`; this file only pins the routing.
+    # Hard-pinned (no DeepSeek/OpenRouter fallback) — if the ChatGPT-plan
+    # Codex quota is exhausted, turns error rather than falling back and
+    # incurring per-token API spend. Covers ALL Telegram users of this bot
+    # (owner DMs + the free_response_topics teammates below), not just the
+    # owner — accepted knowingly by the owner (2026-07-01).
     cat > "$TELEGRAM_HERMES_HOME/config.yaml" <<'EOF'
-model: deepseek/deepseek-v4-pro
-provider: openrouter
-provider_routing:
-  # Hard-pin the first-party DeepSeek endpoint — the ONLY provider with
-  # implicit prompt caching (cache-read ~$0.004/M), verified engaging (99.7%
-  # cache hit on a repeated prefix). `only` guarantees every request lands on
-  # DeepSeek so caching is always consistent (never scatters to a non-caching
-  # provider). Tradeoff: if DeepSeek is down (~0.05%) requests error instead of
-  # falling back. Requires the OpenRouter account data policy to allow DeepSeek
-  # (owner enabled that 2026-07-01).
-  only: ["DeepSeek"]
+model: gpt-5.5
+provider: openai-codex
 skin: wheelbase
 delegation:
   # delegate_task subagents run on the cheap/fast Flash model instead of Pro.
