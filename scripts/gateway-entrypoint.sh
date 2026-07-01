@@ -95,12 +95,14 @@ if [ -n "${WB_TELEGRAM_BOT_TOKEN:-}" ]; then
 model: deepseek/deepseek-v4-pro
 provider: openrouter
 provider_routing:
-  # Prefer the first-party DeepSeek endpoint: it is the ONLY provider with
-  # implicit prompt caching (cache-read ~$0.004/M) — critical since ~99% of
-  # spend is the re-sent conversation prefix each turn. `order` (not `only`)
-  # falls back to other providers if DeepSeek is down (those turns cost more
-  # but don't fail).
-  order: ["DeepSeek"]
+  # Hard-pin the first-party DeepSeek endpoint — the ONLY provider with
+  # implicit prompt caching (cache-read ~$0.004/M), verified engaging (99.7%
+  # cache hit on a repeated prefix). `only` guarantees every request lands on
+  # DeepSeek so caching is always consistent (never scatters to a non-caching
+  # provider). Tradeoff: if DeepSeek is down (~0.05%) requests error instead of
+  # falling back. Requires the OpenRouter account data policy to allow DeepSeek
+  # (owner enabled that 2026-07-01).
+  only: ["DeepSeek"]
 skin: wheelbase
 delegation:
   # delegate_task subagents run on the cheap/fast Flash model instead of Pro.
@@ -129,13 +131,13 @@ auxiliary:
     model: deepseek/deepseek-v4-flash
     extra_body:
       provider:
-        order: ["DeepSeek"]
+        only: ["DeepSeek"]
   background_review:
     provider: openrouter
     model: deepseek/deepseek-v4-flash
     extra_body:
       provider:
-        order: ["DeepSeek"]
+        only: ["DeepSeek"]
 image_gen:
   # Text-to-image + image editing via the bundled OpenRouter backend plugin
   # (plugins/image_gen/openrouter, auto-loads; uses OPENROUTER_API_KEY already
