@@ -19,14 +19,47 @@ ENV HERMES_HOME=/data/hermes
 
 # System deps: git (required for skills/plugin update), curl (health checks /
 # script downloads), docker CLI (TERMINAL_ENV=docker shells out to `docker`
-# to spawn per-user sandbox containers).
+# to spawn per-user sandbox containers). gnupg is needed to add the GitHub
+# CLI apt repo below; the rest are general-purpose shell/coding-agent tools
+# (unzip/jq/ripgrep for ad-hoc scripting, openssh-client for git-over-ssh,
+# build-essential for native npm/bun module compilation, nano as a minimal
+# interactive editor) requested so the un-sandboxed Telegram gateway process
+# (TERMINAL_ENV=local, no Daytona/docker sandbox) has a useful shell baseline.
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         git \
         curl \
         docker.io \
-        ca-certificates && \
+        ca-certificates \
+        gnupg \
+        unzip \
+        jq \
+        ripgrep \
+        openssh-client \
+        build-essential \
+        nano && \
     rm -rf /var/lib/apt/lists/*
+
+# GitHub CLI (gh) — official apt repo per cli.github.com/manual/installation.
+RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+        -o /usr/share/keyrings/githubcli-archive-keyring.gpg && \
+    chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg && \
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+        > /etc/apt/sources.list.d/github-cli.list && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends gh && \
+    rm -rf /var/lib/apt/lists/*
+
+# Node.js (current LTS) — NodeSource setup script; npm is bundled.
+RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && \
+    apt-get install -y --no-install-recommends nodejs && \
+    rm -rf /var/lib/apt/lists/*
+
+# bun — pinned to the same version as the umbrella repo's packageManager
+# field (bun@1.3.13) for consistency across the project.
+ENV BUN_INSTALL="/root/.bun"
+ENV PATH="${BUN_INSTALL}/bin:${PATH}"
+RUN curl -fsSL https://bun.sh/install | bash -s "bun-v1.3.13"
 
 WORKDIR /opt/hermes-gateway
 
