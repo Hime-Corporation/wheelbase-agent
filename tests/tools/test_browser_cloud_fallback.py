@@ -30,7 +30,7 @@ class TestCloudProviderRuntimeFallback:
         provider = Mock()
         provider.create_session.side_effect = RuntimeError("401 Unauthorized")
         monkeypatch.setattr(browser_tool, "_get_cloud_provider", lambda: provider)
-        monkeypatch.setattr(browser_tool, "_get_cdp_override", lambda: None)
+        monkeypatch.setattr(browser_tool, "_get_cdp_override", lambda *a, **k: None)
 
         session = browser_tool._get_session_info("task-1")
 
@@ -52,7 +52,7 @@ class TestCloudProviderRuntimeFallback:
             "features": {"browser_use": True},
         }
         monkeypatch.setattr(browser_tool, "_get_cloud_provider", lambda: provider)
-        monkeypatch.setattr(browser_tool, "_get_cdp_override", lambda: None)
+        monkeypatch.setattr(browser_tool, "_get_cdp_override", lambda *a, **k: None)
 
         session = browser_tool._get_session_info("task-2")
 
@@ -67,7 +67,7 @@ class TestCloudProviderRuntimeFallback:
         provider = Mock()
         provider.create_session.side_effect = RuntimeError("cloud boom")
         monkeypatch.setattr(browser_tool, "_get_cloud_provider", lambda: provider)
-        monkeypatch.setattr(browser_tool, "_get_cdp_override", lambda: None)
+        monkeypatch.setattr(browser_tool, "_get_cdp_override", lambda *a, **k: None)
         monkeypatch.setattr(
             browser_tool, "_create_local_session",
             Mock(side_effect=OSError("no chromium")),
@@ -81,7 +81,7 @@ class TestCloudProviderRuntimeFallback:
         _reset_session_state(monkeypatch)
 
         monkeypatch.setattr(browser_tool, "_get_cloud_provider", lambda: None)
-        monkeypatch.setattr(browser_tool, "_get_cdp_override", lambda: None)
+        monkeypatch.setattr(browser_tool, "_get_cdp_override", lambda *a, **k: None)
 
         session = browser_tool._get_session_info("task-4")
 
@@ -94,7 +94,7 @@ class TestCloudProviderRuntimeFallback:
 
         provider = Mock()
         monkeypatch.setattr(browser_tool, "_get_cloud_provider", lambda: provider)
-        monkeypatch.setattr(browser_tool, "_get_cdp_override", lambda: "ws://host:9222/devtools/browser/abc")
+        monkeypatch.setattr(browser_tool, "_get_cdp_override", lambda *a, **k: "ws://host:9222/devtools/browser/abc")
 
         session = browser_tool._get_session_info("task-5")
 
@@ -110,7 +110,7 @@ class TestCloudProviderRuntimeFallback:
         })
         provider = BrowserUseProviderFake()
         monkeypatch.setattr(browser_tool, "_get_cloud_provider", lambda: provider)
-        monkeypatch.setattr(browser_tool, "_get_cdp_override", lambda: None)
+        monkeypatch.setattr(browser_tool, "_get_cdp_override", lambda *a, **k: None)
 
         with caplog.at_level(logging.WARNING, logger="tools.browser_tool"):
             session = browser_tool._get_session_info("task-6")
@@ -140,7 +140,7 @@ class TestCloudProviderRuntimeFallback:
         provider = Mock()
         provider.create_session.side_effect = create_session_flaky
         monkeypatch.setattr(browser_tool, "_get_cloud_provider", lambda: provider)
-        monkeypatch.setattr(browser_tool, "_get_cdp_override", lambda: None)
+        monkeypatch.setattr(browser_tool, "_get_cdp_override", lambda *a, **k: None)
 
         # First call fails → fallback
         s1 = browser_tool._get_session_info("task-a")
@@ -158,7 +158,7 @@ class TestCloudProviderRuntimeFallback:
         provider = Mock()
         provider.create_session.return_value = None
         monkeypatch.setattr(browser_tool, "_get_cloud_provider", lambda: provider)
-        monkeypatch.setattr(browser_tool, "_get_cdp_override", lambda: None)
+        monkeypatch.setattr(browser_tool, "_get_cdp_override", lambda *a, **k: None)
 
         session = browser_tool._get_session_info("task-7")
 
