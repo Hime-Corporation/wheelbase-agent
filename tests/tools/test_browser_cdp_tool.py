@@ -135,7 +135,7 @@ def cdp_server(monkeypatch):
     server = _CDPServer()
     ws_url = server.start()
     monkeypatch.setattr(
-        browser_cdp_tool, "_resolve_cdp_endpoint", lambda: ws_url
+        browser_cdp_tool, "_resolve_cdp_endpoint", lambda *a, **k: ws_url
     )
     try:
         yield server
@@ -163,7 +163,7 @@ def test_non_string_method_returns_error():
 
 def test_non_dict_params_returns_error(monkeypatch):
     monkeypatch.setattr(
-        browser_cdp_tool, "_resolve_cdp_endpoint", lambda: "ws://localhost:9999"
+        browser_cdp_tool, "_resolve_cdp_endpoint", lambda *a, **k: "ws://localhost:9999"
     )
     result = json.loads(
         browser_cdp_tool.browser_cdp(method="Target.getTargets", params="not-a-dict")  # type: ignore[arg-type]
@@ -178,7 +178,7 @@ def test_non_dict_params_returns_error(monkeypatch):
 
 
 def test_no_endpoint_returns_helpful_error(monkeypatch):
-    monkeypatch.setattr(browser_cdp_tool, "_resolve_cdp_endpoint", lambda: "")
+    monkeypatch.setattr(browser_cdp_tool, "_resolve_cdp_endpoint", lambda *a, **k: "")
     result = json.loads(browser_cdp_tool.browser_cdp(method="Target.getTargets"))
     assert "error" in result
     assert "/browser connect" in result["error"]
@@ -187,7 +187,7 @@ def test_no_endpoint_returns_helpful_error(monkeypatch):
 
 def test_non_ws_endpoint_returns_error(monkeypatch):
     monkeypatch.setattr(
-        browser_cdp_tool, "_resolve_cdp_endpoint", lambda: "http://localhost:9222"
+        browser_cdp_tool, "_resolve_cdp_endpoint", lambda *a, **k: "http://localhost:9222"
     )
     result = json.loads(browser_cdp_tool.browser_cdp(method="Target.getTargets"))
     assert "error" in result
@@ -402,7 +402,7 @@ def test_runtime_evaluate_blocked_when_current_page_is_private(monkeypatch):
     monkeypatch.setattr(
         browser_cdp_tool,
         "_resolve_cdp_endpoint",
-        lambda: "ws://127.0.0.1:9222/devtools/browser/mock",
+        lambda *a, **k: "ws://127.0.0.1:9222/devtools/browser/mock",
     )
 
     import tools.browser_tool as bt
@@ -436,7 +436,7 @@ def test_page_navigate_to_private_url_blocked_before_cdp(monkeypatch):
     monkeypatch.setattr(
         browser_cdp_tool,
         "_resolve_cdp_endpoint",
-        lambda: "ws://127.0.0.1:9222/devtools/browser/mock",
+        lambda *a, **k: "ws://127.0.0.1:9222/devtools/browser/mock",
     )
 
     import tools.browser_tool as bt
@@ -497,7 +497,7 @@ def test_check_fn_false_when_no_cdp_url(monkeypatch):
     import tools.browser_tool as bt
 
     monkeypatch.setattr(bt, "check_browser_requirements", lambda: True)
-    monkeypatch.setattr(bt, "_get_cdp_override", lambda: "")
+    monkeypatch.setattr(bt, "_get_cdp_override", lambda *a, **k: "")
     assert browser_cdp_tool._browser_cdp_check() is False
 
 
@@ -507,7 +507,7 @@ def test_check_fn_true_when_cdp_url_set(monkeypatch):
 
     monkeypatch.setattr(bt, "check_browser_requirements", lambda: True)
     monkeypatch.setattr(
-        bt, "_get_cdp_override", lambda: "ws://localhost:9222/devtools/browser/x"
+        bt, "_get_cdp_override", lambda *a, **k: "ws://localhost:9222/devtools/browser/x"
     )
     assert browser_cdp_tool._browser_cdp_check() is True
 
@@ -519,6 +519,6 @@ def test_check_fn_false_when_browser_requirements_fail(monkeypatch):
 
     monkeypatch.setattr(bt, "check_browser_requirements", lambda: False)
     monkeypatch.setattr(
-        bt, "_get_cdp_override", lambda: "ws://localhost:9222/devtools/browser/x"
+        bt, "_get_cdp_override", lambda *a, **k: "ws://localhost:9222/devtools/browser/x"
     )
     assert browser_cdp_tool._browser_cdp_check() is False

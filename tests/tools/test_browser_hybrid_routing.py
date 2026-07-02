@@ -29,7 +29,10 @@ def _reset_routing_state(monkeypatch):
     monkeypatch.setattr(browser_tool, "_start_browser_cleanup_thread", lambda: None)
     monkeypatch.setattr(browser_tool, "_update_session_activity", lambda t: None)
     # Default: no CDP override, no Camofox
-    monkeypatch.setattr(browser_tool, "_get_cdp_override", lambda: None)
+    # wheelbase fork: _get_cdp_override(task_id="default") takes an optional
+    # task_id (per-task CDP registry for the multi-user cloud gateway) —
+    # accept any args/kwargs so this stub matches the fork's real signature.
+    monkeypatch.setattr(browser_tool, "_get_cdp_override", lambda *a, **k: None)
     monkeypatch.setattr(browser_tool, "_is_camofox_mode", lambda: False)
 
 
@@ -91,7 +94,7 @@ class TestNavigationSessionKey:
     def test_cdp_override_stays_on_bare_task_id(self, monkeypatch):
         """A user-supplied CDP endpoint owns the whole session — no hybrid."""
         monkeypatch.setattr(browser_tool, "_get_cloud_provider", lambda: Mock())
-        monkeypatch.setattr(browser_tool, "_get_cdp_override", lambda: "ws://localhost:9222")
+        monkeypatch.setattr(browser_tool, "_get_cdp_override", lambda *a, **k: "ws://localhost:9222")
         key = browser_tool._navigation_session_key("default", "http://localhost:3000/")
         assert key == "default"
 
