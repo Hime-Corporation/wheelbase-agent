@@ -3,7 +3,6 @@
 Verifies that:
   - The four new work-item tools ARE registered after register(ctx) is called.
   - The three obsolete work_order tools are NOT registered.
-  - The pre_tool_call hook is still registered.
 """
 
 import wheelbase_core
