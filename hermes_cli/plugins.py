@@ -1992,41 +1992,13 @@ def get_pre_tool_call_block_message(
     """Check ``pre_tool_call`` hooks for a blocking directive.
 
     Plugins that need to enforce policy (rate limiting, security
-    restrictions, approval workflows) can return one of two shapes from
-    their ``pre_tool_call`` callback:
-
-    Hard block (immediate)::
+    restrictions, approval workflows) can return::
 
         {"action": "block", "message": "Reason the tool was blocked"}
 
-    Gateway approval gate (blocking — resumes or cancels after user
-    responds via ``POST /v1/runs/{run_id}/approval``)::
-
-        {
-          "action": "pending_approval",
-          "tool": "<tool_name>",
-          "args": {...},
-          "approval_id": "<uuid-hex>",
-          "description": "<human-readable description>",
-        }
-
-    For ``pending_approval``: if a gateway notify callback is registered
-    for the active approval session (i.e. the run is handled by
-    ``api_server``), this function emits an ``approval.request`` event,
-    blocks the calling agent thread on a ``threading.Event`` until the
-    client resolves the approval (or the gateway timeout elapses), then:
-    - returns ``None`` (allow) when the user approves (``once`` /
-      ``session`` / ``always``).
-    - returns a block message string when the user denies or times out.
-
-    When no gateway notify callback is available (e.g. CLI / cron / any
-    non-gateway surface), ``pending_approval`` is treated as a hard
-    block (fail-closed) so destructive tools are never silently executed
-    without consent.
-
-    The first valid block or unresolved-approval directive wins.
-    Invalid or irrelevant hook return values are silently ignored so
-    existing observer-only hooks are unaffected.
+    from their ``pre_tool_call`` callback.  The first valid block
+    directive wins.  Invalid or irrelevant hook return values are
+    silently ignored so existing observer-only hooks are unaffected.
     """
     allowed = getattr(_thread_tool_whitelist, "allowed", None)
     if allowed is not None and tool_name not in allowed:
@@ -2055,158 +2027,8 @@ def get_pre_tool_call_block_message(
             if isinstance(message, str) and message:
                 return message
 
-        elif action == "pending_approval":
-            # --- Wheelbase approval-gate path ---
-            # Delegate to the shared gateway approval flow in tools.approval.
-            # That module owns the _gateway_notify_cbs registry, the
-            # _ApprovalEntry / threading.Event blocking loop, and the
-            # resolve_gateway_approval() resolver that the API server's
-            # /approval handler calls.  We use its internal helpers directly
-            # so the approval lifecycle (heartbeat, timeout, hooks) is
-            # identical to how terminal-command approval works.
-            block_msg = _run_wheelbase_approval_gate(result, session_id=session_id)
-            # None  → approved (allow tool execution)
-            # str   → denied/timeout (block tool execution)
-            return block_msg
-
     return None
 
-
-def _run_wheelbase_approval_gate(
-    pending: Dict[str, Any],
-    session_id: str = "",
-) -> Optional[str]:
-    """Block the agent thread until the user approves or denies a destructive
-    wheelbase tool call via the gateway approval flow.
-
-    ``pending`` is the ``{"action": "pending_approval", ...}`` dict returned
-    by the ``pre_tool_call`` hook.
-
-    Returns:
-        ``None``  — user approved; tool execution should proceed.
-        ``str``   — user denied or timed out; string is the block message
-                    to surface to the model.
-
-    Fail-closed: any exception or missing notify callback returns a block
-    message so the tool is never silently executed without consent.
-    """
-    tool_name = pending.get("tool", "unknown_tool")
-    approval_id = pending.get("approval_id", "")
-    description = pending.get("description") or f"Execute destructive tool: {tool_name}"
-
-    try:
-        from tools.approval import (
-            _gateway_notify_cbs,
-            _lock,
-            _ApprovalEntry,
-            _gateway_queues,
-        )
-    except Exception as exc:
-        logger.warning(
-            "wheelbase approval-gate: cannot import approval module (%s) — "
-            "blocking tool '%s' as fail-closed",
-            exc, tool_name,
-        )
-        return (
-            f"Tool '{tool_name}' requires approval but the approval subsystem "
-            f"is unavailable. The tool was not executed."
-        )
-
-    # Resolve the approval session key.  Priority:
-    # 1. The contextvars key set by api_server._run_sync via set_current_session_key
-    # 2. The session_id passed through from the executor (task_id / session_id)
-    try:
-        from tools.approval import get_current_session_key
-        ctx_key = get_current_session_key(default="")
-    except Exception:
-        ctx_key = ""
-    effective_session_key = ctx_key or session_id or ""
-
-    # Look up the notify callback for this session.
-    with _lock:
-        notify_cb = _gateway_notify_cbs.get(effective_session_key)
-
-    if notify_cb is None:
-        # No gateway callback: CLI/cron/batch context.  Fail-closed.
-        logger.info(
-            "wheelbase approval-gate: no gateway notify callback for session "
-            "'%s' — blocking tool '%s' (no approval surface available)",
-            effective_session_key, tool_name,
-        )
-        return (
-            f"Tool '{tool_name}' requires human approval before it can execute. "
-            f"No approval interface is available in this context. "
-            f"The tool was not executed. Ask the user to re-run the request "
-            f"through the Wheelbase app where approval prompts are supported."
-        )
-
-    # Build the approval_data dict that gets emitted as the approval.request
-    # SSE event payload (matches the shape expected by _await_gateway_decision
-    # and the API server's _approval_notify callback).
-    approval_data: Dict[str, Any] = {
-        "tool": tool_name,
-        "approval_id": approval_id,
-        "description": description,
-        # Include pattern_key / pattern_keys so the existing approval hooks
-        # (pre_approval_request / post_approval_response) fire correctly.
-        "pattern_key": f"wb_approval:{tool_name}",
-        "pattern_keys": [f"wb_approval:{tool_name}"],
-        # command mirrors the terminal-guard shape so the approval UI
-        # in the client can render it consistently.
-        "command": tool_name,
-    }
-
-    # Reuse _await_gateway_decision — it handles enqueue, notify, blocking
-    # wait loop, heartbeat, hooks, and cleanup in one place.
-    try:
-        from tools.approval import _await_gateway_decision
-        decision = _await_gateway_decision(
-            effective_session_key,
-            notify_cb,
-            approval_data,
-            surface="gateway",
-        )
-    except Exception as exc:
-        logger.warning(
-            "wheelbase approval-gate: _await_gateway_decision failed "
-            "for tool '%s': %s — blocking as fail-closed",
-            tool_name, exc,
-        )
-        return (
-            f"Tool '{tool_name}' approval flow encountered an error ({exc}). "
-            f"The tool was not executed."
-        )
-
-    if decision.get("notify_failed"):
-        return (
-            f"BLOCKED: Failed to send approval request for '{tool_name}' to user. "
-            f"Do NOT retry."
-        )
-
-    resolved = decision.get("resolved", False)
-    choice = decision.get("choice")
-
-    if not resolved or not choice or choice == "deny":
-        if not resolved:
-            reason = "timed out without a response"
-            addendum = " Silence is not consent."
-        else:
-            reason = "denied by the user"
-            addendum = ""
-        return (
-            f"BLOCKED: '{tool_name}' {reason}.{addendum} "
-            f"The user has NOT consented to this action. "
-            f"Do NOT retry this tool call and do NOT attempt the same outcome "
-            f"via a different method. Wait for the user to respond before "
-            f"taking any further destructive or irreversible action."
-        )
-
-    # Approved (once / session / always) — allow execution.
-    logger.debug(
-        "wheelbase approval-gate: tool '%s' approved (choice=%s, approval_id=%s)",
-        tool_name, choice, approval_id,
-    )
-    return None
 
 
 def _ensure_plugins_discovered(force: bool = False) -> PluginManager:

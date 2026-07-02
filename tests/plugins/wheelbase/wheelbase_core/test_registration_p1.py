@@ -3,7 +3,6 @@
 Verifies that:
   - The four new work-item tools ARE registered after register(ctx) is called.
   - The three obsolete work_order tools are NOT registered.
-  - The pre_tool_call hook is still registered.
 """
 
 import wheelbase_core
@@ -74,15 +73,6 @@ def test_get_work_order_not_registered():
 def test_delete_work_order_not_registered():
     ctx = _run()
     assert "delete_work_order" not in ctx.tools, "delete_work_order must not be registered (table dropped)"
-
-
-# ---------------------------------------------------------------------------
-# Hook still registered
-# ---------------------------------------------------------------------------
-
-def test_pre_tool_call_hook_registered():
-    ctx = _run()
-    assert "pre_tool_call" in ctx.hooks, "pre_tool_call approval-gating hook must be registered"
 
 
 # ---------------------------------------------------------------------------

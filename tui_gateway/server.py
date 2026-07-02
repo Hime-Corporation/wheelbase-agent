@@ -9094,16 +9094,6 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                 session["running"] = False
                 session["last_active"] = time.time()
                 _clear_inflight_turn(session)
-            try:
-                from tui_gateway.wheelbase_usage import report_session_usage
-
-                report_session_usage(
-                    getattr(agent, "_session_db", None) or _get_db(),
-                    session.get("session_key") or "",
-                    session.get("wheelbase_identity"),
-                )
-            except Exception:
-                logger.debug("usage report dispatch failed", exc_info=True)
             _emit("session.info", sid, _session_info(agent, session))
 
         # A user prompt that arrived mid-turn (interrupt + queue) wins over

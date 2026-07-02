@@ -81,12 +81,6 @@ class TestRegister:
             assert ctx.tools[name]["toolset"] == "wheelbase_dealercenter_import"
             assert ctx.tools[name]["check_fn"] is not None
 
-    def test_registers_pre_tool_call_hook(self):
-        ctx = _Ctx()
-        plugin.register(ctx)
-        events = [event for event, _ in ctx.hooks]
-        assert "pre_tool_call" in events
-
     def test_check_fn_true_with_marker(self, active_workspace):
         ctx = _Ctx()
         plugin.register(ctx)
@@ -98,69 +92,6 @@ class TestRegister:
         plugin.register(ctx)
         for name, info in ctx.tools.items():
             assert info["check_fn"]() is False, f"check_fn for {name} should be False"
-
-
-# ---------------------------------------------------------------------------
-# pre_tool_call approval hook
-# ---------------------------------------------------------------------------
-
-class TestPreToolCallHook:
-    def test_no_gate_allows_all(self, monkeypatch):
-        monkeypatch.setenv("WHEELBASE_APPROVAL_GATE", "0")
-        # Re-import to pick up env change requires reloading — test via public function
-        # instead, since the gate is read at import time in the module.
-        # We exercise the already-imported module's hook directly.
-        # When gate is off, _pre_tool_call should return None regardless.
-        # Since the module reads the flag at import, we test the default (off) path.
-        import importlib
-        import wheelbase_dealercenter_import as p2
-        # If gate is already off (default), hook returns None.
-        if not p2._APPROVAL_GATE_ENABLED:
-            result = p2._pre_tool_call("dc_ingest", {"dryRun": False})
-            assert result is None
-
-    def test_gate_on_allows_dry_run(self, monkeypatch):
-        """Even with gate on, dry-run calls are allowed (non-destructive)."""
-        import wheelbase_dealercenter_import as p2
-        # Patch the guard directly to test the hook logic without reload.
-        original = p2._APPROVAL_GATE_ENABLED
-        p2._APPROVAL_GATE_ENABLED = True
-        try:
-            result = p2._pre_tool_call("dc_ingest", {"dryRun": True})
-            assert result is None
-        finally:
-            p2._APPROVAL_GATE_ENABLED = original
-
-    def test_gate_on_blocks_commit(self):
-        """With gate on, dc_ingest with dryRun=False returns pending_approval."""
-        import wheelbase_dealercenter_import as p2
-        original = p2._APPROVAL_GATE_ENABLED
-        p2._APPROVAL_GATE_ENABLED = True
-        try:
-            result = p2._pre_tool_call("dc_ingest", {"dryRun": False})
-            assert result is not None
-            assert result["action"] == "pending_approval"
-            assert result["tool"] == "dc_ingest"
-            assert "approval_id" in result
-        finally:
-            p2._APPROVAL_GATE_ENABLED = original
-
-    def test_gate_on_allows_non_gated_tools(self):
-        """dc_connect and dc_export_historic are never gated."""
-        import wheelbase_dealercenter_import as p2
-        original = p2._APPROVAL_GATE_ENABLED
-        p2._APPROVAL_GATE_ENABLED = True
-        try:
-            assert p2._pre_tool_call("dc_connect", {}) is None
-            assert p2._pre_tool_call("dc_export_historic", {"dateFrom": "2023-01-01"}) is None
-        finally:
-            p2._APPROVAL_GATE_ENABLED = original
-
-    def test_hook_accepts_arbitrary_kwargs(self):
-        """Should not raise with extra keyword arguments from the harness."""
-        import wheelbase_dealercenter_import as p2
-        result = p2._pre_tool_call("dc_connect", {}, session_id="s1", run_id="r1")
-        assert result is None  # gate off by default
 
 
 # ---------------------------------------------------------------------------
