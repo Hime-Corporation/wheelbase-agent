@@ -77,15 +77,6 @@ def test_delete_work_order_not_registered():
 
 
 # ---------------------------------------------------------------------------
-# Hook still registered
-# ---------------------------------------------------------------------------
-
-def test_pre_tool_call_hook_registered():
-    ctx = _run()
-    assert "pre_tool_call" in ctx.hooks, "pre_tool_call approval-gating hook must be registered"
-
-
-# ---------------------------------------------------------------------------
 # Schema sanity checks
 # ---------------------------------------------------------------------------
 

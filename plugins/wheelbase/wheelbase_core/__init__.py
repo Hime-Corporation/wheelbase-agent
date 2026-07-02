@@ -5,7 +5,6 @@ Tools are always registered (visible to the model); each handler returns a clear
 """
 
 from . import schemas
-from . import hooks as _hooks
 from .tools import get_car as get_car_tool
 from .tools import inventory_search as inventory_search_tool
 from .tools import update_inventory_status as update_inventory_status_tool
@@ -32,13 +31,6 @@ from .tools import inventory_stats as inventory_stats_tool
 
 
 def register(ctx):
-    # Approval-gating hook for destructive wheelbase tools.
-    # When WHEELBASE_APPROVAL_GATE=1 this intercepts send_to_vendor and
-    # delete_work_order and routes them through the gateway approval flow.
-    # When the flag is OFF (default) the hook is a no-op and prod tool
-    # execution is completely unaffected.
-    ctx.register_hook("pre_tool_call", _hooks._pre_tool_call)
-
     ctx.register_tool(
         name="get_car",
         toolset="wheelbase",

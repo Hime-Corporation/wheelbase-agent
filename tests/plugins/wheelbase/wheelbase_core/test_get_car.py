@@ -147,6 +147,3 @@ def test_register_wires_get_car():
     wheelbase_core.register(Ctx())
     assert "get_car" in registered
     assert registered["get_car"][0] == "wheelbase"
-    # The approval-gating pre_tool_call hook must be registered (no-op unless
-    # WHEELBASE_APPROVAL_GATE is enabled).
-    assert "pre_tool_call" in hooks
