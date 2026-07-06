@@ -205,5 +205,105 @@ def _safety_block_files(tool_name, args, task_id):
     return None
 
 
-def _relay(tool_name, args, relay_url, identity, next_call, *, task_id, tool_call_id):  # Task 7-8
-    raise NotImplementedError("relay — Task 7/8")
+import threading
+
+# Idempotency cache keyed by tool_call_id (spec §5.1 M2). The concurrent
+# executor double-wraps the middleware; a second invocation for the same
+# tool_call_id must return the first result, never re-dispatch.
+_result_cache: dict[str, Any] = {}
+_result_cache_lock = threading.Lock()
+_MAX_CACHE = 256
+
+_SHELL_FAMILY = frozenset({"terminal", "process", "execute_code", "search_files"})
+_FILE_FAMILY = frozenset({"read_file", "write_file", "patch"})
+
+
+def _make_transport(relay_url: str, identity: dict):
+    """Build the ExecTransport for this call. Production wiring (WS → Go
+    ExecHub) replaces this seam; it is monkeypatched to a fake in tests."""
+    from .ws_transport import WebsocketExecTransport  # not imported until wired
+    return WebsocketExecTransport(relay_url, identity)
+
+
+def _tool_error(message: str) -> str:
+    return json.dumps({"output": "", "returncode": 1, "exit_code": 1,
+                       "status": "error", "error": message}, ensure_ascii=False)
+
+
+def _relay(tool_name, args, relay_url, identity, next_call, *, task_id, tool_call_id):
+    # Idempotency: serve a cached result for a repeated tool_call_id.
+    if tool_call_id:
+        with _result_cache_lock:
+            if tool_call_id in _result_cache:
+                return _result_cache[tool_call_id]
+
+    from .transport import PreDispatchError
+
+    try:
+        transport = _make_transport(relay_url, identity)
+    except PreDispatchError:
+        return next_call(args)          # connection never came up → cloud fallback
+    except Exception as exc:
+        logger.warning("relay transport build failed: %s", exc)
+        return next_call(args)
+
+    try:
+        if tool_name in _SHELL_FAMILY:
+            result = _relay_command(tool_name, args, transport, identity)
+        else:
+            result = _relay_file(tool_name, args, transport, identity)
+    except PreDispatchError:
+        # Nothing executed on the desktop → safe to fall back.
+        return next_call(args)
+    except Exception as exc:
+        # Post-dispatch failure: return a tool error, NEVER re-dispatch (M4).
+        logger.warning("relay post-dispatch failure for %s: %s", tool_name, exc)
+        result = _tool_error(f"desktop exec failed: {exc}")
+
+    if tool_call_id:
+        with _result_cache_lock:
+            if len(_result_cache) >= _MAX_CACHE:
+                _result_cache.clear()
+            _result_cache[tool_call_id] = result
+    return result
+
+
+def _relay_command(tool_name, args, transport, identity) -> str:
+    from .relay_env import DesktopRelayEnvironment
+    env = DesktopRelayEnvironment(
+        transport=transport,
+        cwd=identity.get("cwd") or identity.get("workspace_root") or "/workspace",
+        timeout=int(args.get("timeout") or 120),
+        workspace_root=identity.get("workspace_root") or "",
+    )
+    env._snapshot_ready = True  # desktop shell is already a login shell
+    command = _extract_command(tool_name, args)
+    res = env.execute(command)
+    return json.dumps({
+        "output": res.get("output", ""),
+        "exit_code": res.get("returncode", 0),
+        "returncode": res.get("returncode", 0),
+        "status": "success" if res.get("returncode", 0) == 0 else "error",
+    }, ensure_ascii=False)
+
+
+def _relay_file(tool_name, args, transport, identity) -> str:
+    import uuid
+    request_id = uuid.uuid4().hex
+    workspace_root = identity.get("workspace_root") or ""
+    path = _file_path(args)
+    if tool_name == "read_file":
+        transport.send({"type": "read", "request_id": request_id,
+                        "path": path, "workspace_root": workspace_root})
+    else:  # write_file / patch (patch resolves to a final write on the desktop)
+        data = args.get("content")
+        if data is None:
+            data = args.get("data") or ""
+        transport.send({"type": "write", "request_id": request_id, "path": path,
+                        "data": data, "workspace_root": workspace_root})
+    frame = transport.recv(request_id, timeout=int(args.get("timeout") or 120))
+    if frame.get("type") == "error":
+        return _tool_error(str(frame.get("message") or "file relay error"))
+    return json.dumps({"status": "success", "success": True,
+                       "data": frame.get("data", ""), "path": path},
+                      ensure_ascii=False)

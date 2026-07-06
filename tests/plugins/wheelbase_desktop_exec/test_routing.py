@@ -2,10 +2,13 @@
 from __future__ import annotations
 
 import importlib
+import json
+import queue
 
 import pytest
 
 MOD = "plugins.wheelbase-desktop-exec"
+transport_mod = importlib.import_module("plugins.wheelbase-desktop-exec.transport")
 
 
 @pytest.fixture()
@@ -13,6 +16,33 @@ def plug(monkeypatch):
     # Hyphenated package name → import via importlib.
     module = importlib.import_module("plugins")  # ensure namespace
     return importlib.import_module("plugins.wheelbase-desktop-exec")
+
+
+class FakeTransport(transport_mod.ExecTransport):
+    """Scripts a successful exec frame sequence (mirrors test_relay_wiring.py)."""
+
+    def __init__(self, frames_by_type=None, connected=True):
+        self.sent = []
+        self._connected = connected
+        self._frames = frames_by_type or {}
+        self._q = {}
+
+    def send(self, frame):
+        if not self._connected:
+            raise transport_mod.PreDispatchError("no relay")
+        self.sent.append(dict(frame))
+        rid = frame["request_id"]
+        q = self._q.setdefault(rid, queue.Queue())
+        for f in self._frames.get(frame["type"], []):
+            g = dict(f)
+            g["request_id"] = rid
+            q.put(g)
+
+    def recv(self, request_id, timeout=None):
+        return self._q[request_id].get(timeout=timeout or 5)
+
+    def close(self):
+        pass
 
 
 @pytest.fixture(autouse=True)
@@ -74,12 +104,36 @@ def test_no_shell_relay_url_falls_back(plug):
 
 
 def test_routed_with_relay_url_reaches_safety_seam(plug, monkeypatch):
-    # With a relay_url present, we must proceed to the safety chain — proven
-    # by the stub seam raising. (Real behavior arrives in Task 5+.)
+    # With a relay_url present, routing must take the LOCAL path: run the
+    # safety chain and relay via _make_transport — never fall back to the
+    # cloud next_call.
     from wheelbase_sdk import runtime
-    runtime.set_task_identity("t-desk", {"user_id": "u", "shell_relay_url": "wss://relay"})
-    nc, _ = _next_call_spy()
-    with pytest.raises(NotImplementedError):
-        plug.route_or_passthrough(
-            tool_name="terminal", args={"command": "ls"}, next_call=nc, task_id="t-desk"
-        )
+    runtime.set_task_identity(
+        "t-desk", {"user_id": "u", "shell_relay_url": "wss://relay", "workspace_root": "/work"}
+    )
+    nc, calls = _next_call_spy()
+
+    safety_calls = {"n": 0}
+
+    def _safety_ok(*args, **kwargs):
+        safety_calls["n"] += 1
+        return None
+
+    monkeypatch.setattr(plug, "_safety_block", _safety_ok)
+
+    ft = FakeTransport(frames_by_type={"exec": [
+        {"type": "chunk", "stream": "stdout", "data": "ok\n"},
+        {"type": "exit", "exit_code": 0},
+    ]})
+    monkeypatch.setattr(plug, "_make_transport", lambda url, ident: ft)
+
+    out = plug.route_or_passthrough(
+        tool_name="terminal", args={"command": "ls"}, next_call=nc, task_id="t-desk"
+    )
+
+    # Safety seam was invoked and the relay transport carried the command —
+    # the cloud fallback (next_call) must NOT have run.
+    assert safety_calls["n"] == 1
+    assert ft.sent and ft.sent[0]["type"] == "exec"
+    assert calls["n"] == 0
+    assert "ok" in json.loads(out)["output"]
