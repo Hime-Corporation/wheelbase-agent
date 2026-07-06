@@ -5,6 +5,16 @@ that, for a desktop user who is online (identity carries shell_relay_url), runs
 the built-in per-tool safety chain (spec §5.5) then relays the operation to the
 user's machine. Mobile/offline users (no relay url) and any ambiguous identity
 fall back to the sandboxed cloud path via next_call. Zero upstream-core edits.
+
+Open items (handed to the Go ExecHub / Bun-sidecar plan):
+  * _make_transport / ws_transport.py: authenticated WS dial to
+    backend /v1/agent/exec carrying the signed capability token (spec §5.3 B2).
+  * workspace_root delivery: currently read from identity["workspace_root"];
+    the cloud turn must populate it per conversation (spec §7.2.1 open item).
+  * approval round-trip (spec §7.1 M1): check_all_command_guards resolves the
+    gateway approval callback internally via get_current_session_key /
+    _gateway_notify_cbs — must be validated E2E before shipping destructive
+    local exec (dormant-under-daytona path, first activated here).
 """
 from __future__ import annotations
 
