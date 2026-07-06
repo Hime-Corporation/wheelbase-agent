@@ -136,6 +136,7 @@ def apply_session_injection(
                 "tenant_id": identity.tenant_id,
                 "dealership_id": identity.dealership_id,
                 "credential_path": str(cred_path),
+                "shell_relay_url": identity.shell_relay_url or "",
             },
         )
 

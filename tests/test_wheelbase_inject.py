@@ -219,3 +219,18 @@ def test_rejects_anonymous_injection(tmp_path):
         apply_session_injection("", IDENT_A, tmp_path)
     with pytest.raises(ValueError):
         apply_session_injection("task-a", WheelbaseIdentity(user_id=""), tmp_path)
+
+
+def test_shell_relay_url_registered_for_task(tmp_path, monkeypatch):
+    monkeypatch.setenv("TERMINAL_ENV", "daytona")
+    from tui_gateway.wheelbase_identity import WheelbaseIdentity
+    from wheelbase_sdk import runtime as wb_runtime
+
+    identity = WheelbaseIdentity(user_id="u1", shell_relay_url="wss://relay/u1")
+    cleanup = apply_session_injection("task-9", identity, tmp_path)
+    try:
+        ident = wb_runtime.get_task_identity("task-9")
+        assert ident is not None
+        assert ident["shell_relay_url"] == "wss://relay/u1"
+    finally:
+        cleanup()

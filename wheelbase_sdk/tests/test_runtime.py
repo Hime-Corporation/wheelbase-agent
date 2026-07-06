@@ -202,3 +202,21 @@ def test_reset_identity_tolerates_foreign_token(tmp_path):
     runtime.set_task_identity("task-y", {"credential_path": "/y"})
     runtime.reset_identity(holder["token"])  # foreign token -> falls back to clear
     assert runtime.current_identity() is None
+
+
+def test_get_task_identity_returns_copy():
+    runtime.set_task_identity("task-42", {"user_id": "u1", "shell_relay_url": "wss://x"})
+    got = runtime.get_task_identity("task-42")
+    assert got == {"user_id": "u1", "shell_relay_url": "wss://x"}
+    got["user_id"] = "MUTATED"
+    # mutating the returned copy must not corrupt the registry
+    assert runtime.get_task_identity("task-42")["user_id"] == "u1"
+
+
+def test_get_task_identity_empty_task_id_returns_none():
+    assert runtime.get_task_identity("") is None
+    assert runtime.get_task_identity(None) is None  # type: ignore[arg-type]
+
+
+def test_get_task_identity_unknown_task_returns_none():
+    assert runtime.get_task_identity("never-registered") is None

@@ -119,6 +119,20 @@ class TestIdentityFromHeaders:
         assert identity.jwt == ""
         assert identity.cdp_url == ""
 
+    def test_shell_relay_url_parsed(self):
+        headers = {
+            "x-wheelbase-user-id": "user-123",
+            "x-wheelbase-shell-relay-url": "wss://api.wheelbase.io/v1/agent/exec?u=user-123",
+        }
+        identity = identity_from_headers(headers)
+        assert identity is not None
+        assert identity.shell_relay_url == "wss://api.wheelbase.io/v1/agent/exec?u=user-123"
+
+    def test_shell_relay_url_defaults_empty(self):
+        identity = identity_from_headers({"x-wheelbase-user-id": "user-123"})
+        assert identity is not None
+        assert identity.shell_relay_url == ""
+
 
 # ---------------------------------------------------------------------------
 # write_credential_file
