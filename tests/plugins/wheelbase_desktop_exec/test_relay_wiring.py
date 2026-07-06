@@ -103,6 +103,37 @@ def test_write_file_sends_write_frame(monkeypatch):
     assert write_frames[0]["data"] == "hi"
 
 
+def test_same_tool_call_id_across_tasks_does_not_collide(monkeypatch):
+    # Shared-dashboard fallback runs many users in one process. A reused
+    # tool_call_id across two DIFFERENT task_ids must NOT serve user A's cached
+    # output to user B — the cache key is (task_id, tool_call_id).
+    from wheelbase_sdk import runtime
+    runtime.set_task_identity(
+        "task-A", {"user_id": "A", "shell_relay_url": "wss://relayA", "workspace_root": "/a"})
+    runtime.set_task_identity(
+        "task-B", {"user_id": "B", "shell_relay_url": "wss://relayB", "workspace_root": "/b"})
+
+    def _transport_for(url, ident):
+        who = ident.get("user_id")
+        return FakeTransport(frames_by_type={"exec": [
+            {"type": "chunk", "stream": "stdout", "data": f"hello-{who}\n"},
+            {"type": "exit", "exit_code": 0},
+        ]})
+
+    monkeypatch.setattr(plug, "_make_transport", _transport_for)
+    monkeypatch.setattr(plug, "_safety_block", lambda *a, **k: None)
+
+    out_a = plug.route_or_passthrough(
+        tool_name="terminal", args={"command": "whoami"}, next_call=_no_next(),
+        task_id="task-A", tool_call_id="shared-id")
+    out_b = plug.route_or_passthrough(
+        tool_name="terminal", args={"command": "whoami"}, next_call=_no_next(),
+        task_id="task-B", tool_call_id="shared-id")
+
+    assert "hello-A" in json.loads(out_a)["output"]
+    assert "hello-B" in json.loads(out_b)["output"]   # NOT A's cached output
+
+
 def test_idempotent_second_invocation_no_double_execute(monkeypatch):
     ft = FakeTransport(frames_by_type={"exec": [
         {"type": "chunk", "stream": "stdout", "data": "once\n"},

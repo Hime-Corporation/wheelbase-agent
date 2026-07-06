@@ -48,9 +48,15 @@ def test_process_routes_through_command_guard(monkeypatch):
 
 
 def test_execute_code_uses_code_guard_not_command_guard(monkeypatch):
-    """execute_code MUST take the dedicated whole-script code guard, NEVER the
-    shell command guard — a script that doesn't textually trip a shell regex
-    would otherwise run on the user's real machine with no approval."""
+    """Unit test of the DEDICATED execute_code guard helper.
+
+    NOTE: execute_code no longer takes the local relay path — it routes to
+    cloud (see test_routing.test_unmapped_tools_route_to_cloud_not_local), so
+    this guard branch is dead for the local path. The helper is retained
+    (harmless) and unit-tested here: if execute_code is ever re-added to the
+    routed-local set, it MUST take the whole-script code guard, NEVER the shell
+    command guard — a script that doesn't textually trip a shell regex would
+    otherwise run on the user's real machine with no approval."""
     code_guard_calls = []
     command_guard_calls = []
     monkeypatch.setattr(

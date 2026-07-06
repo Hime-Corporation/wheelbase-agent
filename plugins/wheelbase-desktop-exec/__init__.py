@@ -24,11 +24,21 @@ from typing import Any, Callable
 
 logger = logging.getLogger(__name__)
 
-# Tools whose execution we route to the desktop. execute_code is included so
-# the working-dir model does not split (spec §5.1 M3).
+# Tools whose execution we route to the desktop over the local relay. These are
+# the ones that map CLEANLY onto the sidecar's primitives: bash-command tools
+# (terminal/process → command/cmd) and full-content file read/write
+# (read_file/write_file → path/data).
+#
+# patch/execute_code/search_files route to cloud pending (a) proper
+# sidecar-primitive mapping and (b) workspace_root delivery (spec §7.2.1). Their
+# args do NOT map to the current relay frames — `patch` carries
+# mode/old_string/new_string/patch (not content), `execute_code` carries `code`
+# (Python, not bash), and `search_files` carries `pattern`. Shipping them over
+# the command/file frames would send empty/wrong frames, so they deliberately
+# fall through to next_call (cloud Daytona) — functional and fail-closed —
+# until both open items above are resolved.
 ROUTED_TOOLS = frozenset({
     "terminal", "process", "read_file", "write_file",
-    "patch", "search_files", "execute_code",
 })
 
 
@@ -45,6 +55,8 @@ def _middleware_entry(**kwargs: Any) -> Any:
         task_id=kwargs.get("task_id") or "",
         session_id=kwargs.get("session_id") or "",
         tool_call_id=kwargs.get("tool_call_id") or "",
+        turn_id=kwargs.get("turn_id") or "",
+        api_request_id=kwargs.get("api_request_id") or "",
     )
 
 
@@ -56,6 +68,8 @@ def route_or_passthrough(
     task_id: str = "",
     session_id: str = "",
     tool_call_id: str = "",
+    turn_id: str = "",
+    api_request_id: str = "",
 ) -> Any:
     # 1. Not a routed tool → passthrough.
     if tool_name not in ROUTED_TOOLS:
@@ -75,15 +89,24 @@ def route_or_passthrough(
         return next_call(args)
 
     # 4. Reproduce the built-in safety chain (spec §5.5). A block returns the
-    #    block result and neither relays nor calls next_call.
-    block = _safety_block(tool_name, args, task_id, session_id)
+    #    block result and neither relays nor calls next_call. If the guard
+    #    itself RAISES (rather than returning a block dict), fail CLOSED with a
+    #    tool-error deny — never let the exception propagate, which would let the
+    #    framework auto-run the tool on cloud Daytona instead of the spec's DENY.
+    try:
+        block = _safety_block(tool_name, args, task_id, session_id)
+    except Exception as exc:
+        logger.warning("safety guard raised for %s; failing closed: %s",
+                       tool_name, exc)
+        return _tool_error(f"desktop exec denied: safety guard error: {exc}")
     if block is not None:
         return block
 
     # 5. Relay. Pre-dispatch failure → next_call (cloud fallback). Post-dispatch
     #    failure → tool error, NEVER re-dispatch (spec §5.1 M4).
     return _relay(tool_name, args, relay_url, identity, next_call,
-                  task_id=task_id, tool_call_id=tool_call_id)
+                  task_id=task_id, session_id=session_id, tool_call_id=tool_call_id,
+                  turn_id=turn_id, api_request_id=api_request_id)
 
 
 # terminal/process go through the shell command guards. execute_code does NOT
@@ -217,9 +240,12 @@ def _safety_block_files(tool_name, args, task_id):
 
 import threading
 
-# Idempotency cache keyed by tool_call_id (spec §5.1 M2). The concurrent
-# executor double-wraps the middleware; a second invocation for the same
-# tool_call_id must return the first result, never re-dispatch.
+# Idempotency cache keyed by (task_id, tool_call_id) (spec §5.1 M2). The
+# concurrent executor double-wraps the middleware; a second invocation for the
+# same call must return the first result, never re-dispatch. The key MUST
+# include task_id: the shared-dashboard fallback runs multiple users in one
+# process, so a reused tool_call_id across tasks must NOT serve user A's output
+# to user B.
 _result_cache: dict[str, Any] = {}
 _result_cache_lock = threading.Lock()
 _MAX_CACHE = 256
@@ -240,12 +266,78 @@ def _tool_error(message: str) -> str:
                        "status": "error", "error": message}, ensure_ascii=False)
 
 
-def _relay(tool_name, args, relay_url, identity, next_call, *, task_id, tool_call_id):
-    # Idempotency: serve a cached result for a repeated tool_call_id.
-    if tool_call_id:
+def _post_process_relayed_result(tool_name, args, result, *,
+                                 task_id, session_id, tool_call_id,
+                                 turn_id, api_request_id, duration_ms=0):
+    """Re-fire the post-processing that ``handle_function_call`` runs after a
+    normal dispatch (model_tools.py:1178 + :1201). Because this plugin relays at
+    the OUTER tool_execution wrapper WITHOUT calling next_call, that built-in
+    post-processing is otherwise skipped — including the shipped
+    security-guidance plugin's ``transform_tool_result`` content-scan on local
+    writes. Mirror both calls exactly (same functions, same argument shape). A
+    hook/transform that raises is logged and swallowed — it must never fail the
+    tool. Returns the (possibly transformed) result.
+    """
+    # 1. post_tool_call observer (model_tools.py:1178).
+    try:
+        from model_tools import _emit_post_tool_call_hook
+        _emit_post_tool_call_hook(
+            function_name=tool_name,
+            function_args=args,
+            result=result,
+            task_id=task_id,
+            session_id=session_id,
+            tool_call_id=tool_call_id,
+            turn_id=turn_id,
+            api_request_id=api_request_id,
+            duration_ms=duration_ms,
+            middleware_trace=[],
+        )
+    except Exception as exc:
+        logger.debug("post_tool_call re-fire error: %s", exc)
+
+    # 2. transform_tool_result canonicalization seam (model_tools.py:1201).
+    #    First valid string return wins; non-string returns ignored; fail-open.
+    try:
+        from hermes_cli.plugins import has_hook, invoke_hook
+        from model_tools import _tool_result_observer_fields
+        if has_hook("transform_tool_result"):
+            status, error_type, error_message = _tool_result_observer_fields(result)
+            hook_results = invoke_hook(
+                "transform_tool_result",
+                tool_name=tool_name,
+                args=args,
+                result=result,
+                task_id=task_id or "",
+                session_id=session_id or "",
+                tool_call_id=tool_call_id or "",
+                turn_id=turn_id or "",
+                api_request_id=api_request_id or "",
+                duration_ms=duration_ms,
+                status=status,
+                error_type=error_type,
+                error_message=error_message,
+            )
+            for hook_result in hook_results:
+                if isinstance(hook_result, str):
+                    result = hook_result
+                    break
+    except Exception as exc:
+        logger.debug("transform_tool_result re-fire error: %s", exc)
+
+    return result
+
+
+def _relay(tool_name, args, relay_url, identity, next_call, *,
+           task_id, session_id="", tool_call_id, turn_id="", api_request_id=""):
+    # Idempotency: serve a cached result for a repeated (task_id, tool_call_id).
+    # The key includes task_id so a reused tool_call_id in the shared-dashboard
+    # multi-user process can never serve one user's output to another (F4).
+    cache_key = f"{task_id}:{tool_call_id}" if tool_call_id else ""
+    if cache_key:
         with _result_cache_lock:
-            if tool_call_id in _result_cache:
-                return _result_cache[tool_call_id]
+            if cache_key in _result_cache:
+                return _result_cache[cache_key]
 
     from .transport import PreDispatchError
 
@@ -257,11 +349,13 @@ def _relay(tool_name, args, relay_url, identity, next_call, *, task_id, tool_cal
         logger.warning("relay transport build failed: %s", exc)
         return next_call(args)
 
+    relay_ok = False
     try:
         if tool_name in _SHELL_FAMILY:
             result = _relay_command(tool_name, args, transport, identity)
         else:
             result = _relay_file(tool_name, args, transport, identity)
+        relay_ok = True
     except PreDispatchError:
         # Nothing executed on the desktop → safe to fall back.
         return next_call(args)
@@ -270,11 +364,22 @@ def _relay(tool_name, args, relay_url, identity, next_call, *, task_id, tool_cal
         logger.warning("relay post-dispatch failure for %s: %s", tool_name, exc)
         result = _tool_error(f"desktop exec failed: {exc}")
 
-    if tool_call_id:
+    # On a SUCCESSFUL relay, re-fire the built-in post-processing that the outer
+    # relay path bypassed (post_tool_call + transform_tool_result) so security
+    # transforms still run on local results (F3). Skipped for the error result
+    # above so we do not double-report a failure the built-in never produced.
+    if relay_ok:
+        result = _post_process_relayed_result(
+            tool_name, args, result,
+            task_id=task_id, session_id=session_id, tool_call_id=tool_call_id,
+            turn_id=turn_id, api_request_id=api_request_id,
+        )
+
+    if cache_key:
         with _result_cache_lock:
             if len(_result_cache) >= _MAX_CACHE:
                 _result_cache.clear()
-            _result_cache[tool_call_id] = result
+            _result_cache[cache_key] = result
     return result
 
 
