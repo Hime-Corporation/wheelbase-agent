@@ -103,34 +103,87 @@ def test_no_shell_relay_url_falls_back(plug):
     assert calls["n"] == 1
 
 
-@pytest.mark.parametrize("tool", ["patch", "execute_code", "search_files"])
-def test_unmapped_tools_route_to_cloud_not_local(plug, monkeypatch, tool):
-    # patch/execute_code/search_files do NOT map cleanly onto the relay frames;
-    # they must fall through to next_call (cloud Daytona), never take the local
-    # safety+relay path — even when a desktop relay url IS present.
+def test_routed_local_set_is_all_seven_tools(plug):
+    # All 7 built-in tools now route to the desktop when a relay url is
+    # present: terminal/process/read_file/write_file (unchanged) plus
+    # patch/search_files (via _relay_file_ops/ShellFileOperations) and
+    # execute_code (via _relay_execute_code/env-cache injection).
+    assert set(plug.ROUTED_TOOLS) == {
+        "terminal", "process", "read_file", "write_file",
+        "patch", "search_files", "execute_code",
+    }
+
+
+@pytest.mark.parametrize("tool", ["patch", "search_files"])
+def test_patch_and_search_files_reach_the_file_ops_safety_seam(plug, monkeypatch, tool):
+    # patch/search_files now take the SAME safety+relay path as the other
+    # file tools (unlike execute_code, which has its own dedicated branch) —
+    # _safety_block must run and the relay transport must be built. Full
+    # happy-path relay behavior (real ShellFileOperations round-trip) is
+    # covered in test_file_ops_relay.py; here we only prove the DISPATCH
+    # reaches _relay_file_ops instead of falling back to cloud.
     from wheelbase_sdk import runtime
     runtime.set_task_identity(
         "t-desk", {"user_id": "u", "shell_relay_url": "wss://relay", "workspace_root": "/work"}
     )
-    # If either the local safety seam or the relay transport is touched, fail.
+    safety_calls = {"n": 0}
+
+    def _safety_ok(*a, **k):
+        safety_calls["n"] += 1
+        return None
+
+    monkeypatch.setattr(plug, "_safety_block", _safety_ok)
+
+    transport_calls = {"n": 0}
+
+    class _BrokenTransport(transport_mod.ExecTransport):
+        def send(self, frame):
+            raise RuntimeError("post-dispatch: transport not wired in this unit test")
+
+        def recv(self, request_id, timeout=None):
+            raise RuntimeError("post-dispatch: transport not wired in this unit test")
+
+    def _fake_transport(url, ident):
+        transport_calls["n"] += 1
+        return _BrokenTransport()
+
+    monkeypatch.setattr(plug, "_make_transport", _fake_transport)
+    nc, calls = _next_call_spy()
+    args = ({"mode": "replace", "path": "/x", "old_string": "a", "new_string": "b"}
+            if tool == "patch" else {"pattern": "x"})
+    out = plug.route_or_passthrough(
+        tool_name=tool, args=args, next_call=nc, task_id="t-desk"
+    )
+    assert safety_calls["n"] == 1        # safety seam DID run
+    assert calls["n"] == 0                # never fell back to cloud (M4: post-dispatch failure)
+    assert transport_calls["n"] == 1      # DID attempt to build the relay transport
+    parsed = json.loads(out)
+    assert parsed.get("status") == "error" or parsed.get("error")
+
+
+def test_execute_code_does_not_reach_the_generic_safety_seam(plug, monkeypatch):
+    # execute_code is intercepted BEFORE the generic _safety_block call (its
+    # own dedicated branch, guarded once by the built-in handler instead) —
+    # see test_execute_code_relay.py for full coverage of that path.
+    from wheelbase_sdk import runtime
+    runtime.set_task_identity(
+        "t-desk", {"user_id": "u", "shell_relay_url": "wss://relay", "workspace_root": "/work"}
+    )
     monkeypatch.setattr(plug, "_safety_block",
-                        lambda *a, **k: pytest.fail("local safety must not run"))
-    monkeypatch.setattr(plug, "_make_transport",
-                        lambda *a, **k: pytest.fail("local relay must not run"))
+                        lambda *a, **k: pytest.fail("generic _safety_block must not run for execute_code"))
+
+    def _boom_transport(url, ident):
+        raise RuntimeError("no transport in this unit test")
+
+    monkeypatch.setattr(plug, "_make_transport", _boom_transport)
     nc, calls = _next_call_spy()
     out = plug.route_or_passthrough(
-        tool_name=tool, args={"code": "print(1)"}, next_call=nc, task_id="t-desk"
+        tool_name="execute_code", args={"code": "1"}, next_call=nc, task_id="t-desk"
     )
+    # transport build failed -> fail-closed to cloud, but via the DEDICATED
+    # execute_code branch, never touching the generic safety seam.
     assert out == "SANDBOX_RESULT"
     assert calls["n"] == 1
-
-
-def test_routed_local_set_is_exactly_the_cleanly_mapped_tools(plug):
-    # The routed-local set is the four tools that map cleanly onto the sidecar
-    # primitives; the three unmapped tools are excluded (route to cloud).
-    assert set(plug.ROUTED_TOOLS) == {"terminal", "process", "read_file", "write_file"}
-    for excluded in ("patch", "execute_code", "search_files"):
-        assert excluded not in plug.ROUTED_TOOLS
 
 
 def test_guard_exception_fails_closed_to_deny(plug, monkeypatch):
