@@ -26,6 +26,11 @@ from starlette.websockets import WebSocketDisconnect
 
 from tui_gateway.wheelbase_identity import is_valid_user_id
 
+# Tenant ids ride the same trusted-header transport as user ids (the Go
+# backend mints both), so they share the exact same safe-identifier
+# discipline. Kept as a distinct name for call-site clarity / grep-ability.
+is_valid_tenant_id = is_valid_user_id
+
 logger = logging.getLogger(__name__)
 
 PROFILE_PREFIX = "wb-"
@@ -84,6 +89,24 @@ def profiles_root() -> Path:
         return Path(override)
     home = os.environ.get("HERMES_HOME", "/data/hermes").strip() or "/data/hermes"
     return Path(home) / "profiles"
+
+
+def hermes_home_root() -> Path:
+    """The router's own HERMES_HOME — base of the per-tenant profile tree.
+
+    ChildManager nests each tenant's profiles under
+    ``<hermes_home_root()>/tenants/<tenant_id>/profiles/wb-<user_id>`` so that
+    the upstream ``parent.name == "profiles"`` walk-up in hermes_constants.py
+    still resolves a child's "global root" to ``<hermes_home_root()>/tenants/
+    <tenant_id>`` — the per-tenant shared-credential fallback. Distinct from
+    :func:`profiles_root`, which still returns the flat (pre-tenant) profiles
+    directory consumed by ``tui_gateway.profile_cron``.
+    """
+    override = os.environ.get("WHEELBASE_PROFILES_ROOT", "").strip()
+    if override:
+        return Path(override)
+    home = os.environ.get("HERMES_HOME", "/data/hermes").strip() or "/data/hermes"
+    return Path(home)
 
 
 def _default_seed_skills(profile_dir: Path) -> None:
@@ -221,6 +244,7 @@ def provision_profile(
 
 @dataclass
 class Child:
+    tenant_id: str
     user_id: str
     profile_dir: Path
     port: int
@@ -290,6 +314,10 @@ class ChildManager:
         backoff_base: float = 1.0,
         backoff_cap: float = 60.0,
     ) -> None:
+        # NOTE: despite the (kept-for-compat) parameter/attribute name, this is
+        # now the router's HERMES_HOME root (see hermes_home_root()), not the
+        # flat "profiles" directory — children live nested under
+        # ``<profiles_root>/tenants/<tenant_id>/profiles/wb-<user_id>``.
         self.profiles_root = profiles_root
         self._spawn = spawn or _default_spawn
         self._wait_ready = wait_ready or _default_wait_ready
@@ -297,8 +325,17 @@ class ChildManager:
         self._sleep = sleep
         self._backoff_base = backoff_base
         self._backoff_cap = backoff_cap
-        self._children: dict[str, Child] = {}
+        self._children: dict[tuple[str, str], Child] = {}
         self._lock = threading.Lock()
+
+    def _profile_dir(self, tenant_id: str, user_id: str) -> Path:
+        return (
+            self.profiles_root
+            / "tenants"
+            / tenant_id
+            / "profiles"
+            / f"{PROFILE_PREFIX}{user_id}"
+        )
 
     def _alloc_port(self) -> int:
         used = {child.port for child in self._children.values()}
@@ -330,19 +367,23 @@ class ChildManager:
         child.proc = proc
         child.last_spawn = time.monotonic()
 
-    def ensure_child(self, user_id: str) -> Child:
+    def ensure_child(self, tenant_id: str, user_id: str) -> Child:
+        if not is_valid_tenant_id(tenant_id):
+            raise ValueError(f"invalid tenant id: {tenant_id!r}")
         if not is_valid_user_id(user_id):
             raise ValueError(f"invalid user id: {user_id!r}")
+        key = (tenant_id, user_id)
         with self._lock:
-            child = self._children.get(user_id)
+            child = self._children.get(key)
             if child is None:
                 child = Child(
+                    tenant_id=tenant_id,
                     user_id=user_id,
-                    profile_dir=self.profiles_root / f"{PROFILE_PREFIX}{user_id}",
+                    profile_dir=self._profile_dir(tenant_id, user_id),
                     port=self._alloc_port(),
                     token=secrets.token_urlsafe(32),
                 )
-                self._children[user_id] = child
+                self._children[key] = child
         with child.lock:
             if child.proc is None:
                 provision_profile(child.profile_dir, seed_skills=self._seed_skills)
@@ -364,7 +405,8 @@ class ChildManager:
                     self._backoff_base * (2 ** child.restarts),
                 )
                 logger.warning(
-                    "profile child crashed user=%s port=%d code=%s restart=%d backoff=%.1f",
+                    "profile child crashed tenant=%s user=%s port=%d code=%s restart=%d backoff=%.1f",
+                    child.tenant_id,
                     child.user_id,
                     child.port,
                     proc.poll(),
@@ -386,20 +428,38 @@ class ChildManager:
             time.sleep(interval)
 
     def reconcile_boot(self) -> list[Child]:
+        """Restart existing profile children, walking the tenant-nested tree.
+
+        Layout: ``<profiles_root>/tenants/<tenant_id>/profiles/wb-<user_id>``.
+        Garbage entries at either level (non-dirs, invalid tenant ids, dirs
+        not named ``wb-*``, invalid user ids) are skipped and logged rather
+        than raising.
+        """
         started: list[Child] = []
-        if not self.profiles_root.is_dir():
+        tenants_dir = self.profiles_root / "tenants"
+        if not tenants_dir.is_dir():
             return started
-        for entry in sorted(self.profiles_root.iterdir()):
-            if not entry.is_dir() or not entry.name.startswith(PROFILE_PREFIX):
+        for tenant_entry in sorted(tenants_dir.iterdir()):
+            if not tenant_entry.is_dir():
                 continue
-            user_id = entry.name[len(PROFILE_PREFIX):]
-            if not is_valid_user_id(user_id):
-                logger.warning("skipping invalid Wheelbase profile dir: %s", entry.name)
+            tenant_id = tenant_entry.name
+            if not is_valid_tenant_id(tenant_id):
+                logger.warning("skipping invalid Wheelbase tenant dir: %s", tenant_entry.name)
                 continue
-            try:
-                started.append(self.ensure_child(user_id))
-            except Exception:
-                logger.exception("boot reconcile failed for profile %s", entry.name)
+            profiles_dir = tenant_entry / "profiles"
+            if not profiles_dir.is_dir():
+                continue
+            for entry in sorted(profiles_dir.iterdir()):
+                if not entry.is_dir() or not entry.name.startswith(PROFILE_PREFIX):
+                    continue
+                user_id = entry.name[len(PROFILE_PREFIX):]
+                if not is_valid_user_id(user_id):
+                    logger.warning("skipping invalid Wheelbase profile dir: %s/%s", tenant_id, entry.name)
+                    continue
+                try:
+                    started.append(self.ensure_child(tenant_id, user_id))
+                except Exception:
+                    logger.exception("boot reconcile failed for profile %s/%s", tenant_id, entry.name)
         return started
 
 
@@ -489,6 +549,12 @@ def build_app(manager: ChildManager) -> FastAPI:
                 {"error": "missing or invalid X-Wheelbase-User-Id"},
                 status_code=403,
             )
+        tenant_id = request.headers.get("X-Wheelbase-Tenant-Id", "")
+        if not is_valid_tenant_id(tenant_id):
+            return JSONResponse(
+                {"error": "missing or invalid X-Wheelbase-Tenant-Id"},
+                status_code=403,
+            )
 
         try:
             query = _sanitized_query(request.url.query, user_id)
@@ -498,7 +564,7 @@ def build_app(manager: ChildManager) -> FastAPI:
             )
 
         try:
-            child = await asyncio.to_thread(manager.ensure_child, user_id)
+            child = await asyncio.to_thread(manager.ensure_child, tenant_id, user_id)
         except Exception:
             logger.exception("failed to ensure child for REST user=%s", user_id)
             return JSONResponse({"error": "child unavailable"}, status_code=502)
@@ -536,9 +602,13 @@ def build_app(manager: ChildManager) -> FastAPI:
         if not is_valid_user_id(user_id):
             await ws.close(code=4003)
             return
+        tenant_id = ws.headers.get("x-wheelbase-tenant-id", "")
+        if not is_valid_tenant_id(tenant_id):
+            await ws.close(code=4003)
+            return
 
         try:
-            child = await asyncio.to_thread(manager.ensure_child, user_id)
+            child = await asyncio.to_thread(manager.ensure_child, tenant_id, user_id)
         except Exception:
             logger.exception("failed to ensure child for WS user=%s", user_id)
             await ws.close(code=1011)
@@ -624,7 +694,29 @@ def main(
         logger.error("HERMES_DASHBOARD_SESSION_TOKEN must be set for profile router")
         raise SystemExit(2)
 
-    manager = ChildManager(profiles_root(), seed_skills=seed_skills)
+    root = hermes_home_root()
+
+    # Migrate any pre-tenant-keying profile layout (flat wb-<uid> dirs) into
+    # the tenant-nested tree BEFORE accepting traffic or running boot
+    # reconcile, so reconcile_boot() sees the post-migration layout.
+    from tui_gateway.tenant_migration import run_tenant_migration
+
+    migration_report = run_tenant_migration(
+        hermes_root=root,
+        supabase_url=os.environ.get("SUPABASE_URL", ""),
+        supabase_key=os.environ.get("SUPABASE_SERVICE_ROLE_KEY", ""),
+    )
+    logger.info(
+        "tenant migration: migrated=%d orphaned=%d skipped=%d errors=%d",
+        migration_report.migrated,
+        migration_report.orphaned,
+        migration_report.skipped,
+        len(migration_report.errors),
+    )
+    for err in migration_report.errors:
+        logger.warning("tenant migration error: %s", err)
+
+    manager = ChildManager(root, seed_skills=seed_skills)
     started = manager.reconcile_boot()
     logger.info("boot reconcile started %d profile child process(es)", len(started))
     threading.Thread(
@@ -636,11 +728,11 @@ def main(
     # Per-user children are dashboard processes that never tick cron; this
     # sweep fires each profile's due jobs regardless of whether its child is
     # alive. Local import avoids a circular dependency (profile_cron imports
-    # PROFILE_PREFIX/profiles_root from this module).
+    # PROFILE_PREFIX/hermes_home_root from this module).
     from tui_gateway.profile_cron import CronSweeper
 
     threading.Thread(
-        target=CronSweeper(profiles_root()).sweep_forever,
+        target=CronSweeper(hermes_home_root()).sweep_forever,
         name="profile-router-cron-sweep",
         daemon=True,
     ).start()

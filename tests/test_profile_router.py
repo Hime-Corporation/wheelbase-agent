@@ -235,24 +235,28 @@ def make_manager(tmp_path, **kw):
     return mgr, spawned
 
 
+TENANT = "tenant-1111"
+
+
 def test_two_users_route_to_two_different_ports(tmp_path):
     mgr, spawned = make_manager(tmp_path)
-    a = mgr.ensure_child("user-aaaa")
-    b = mgr.ensure_child("user-bbbb")
+    a = mgr.ensure_child(TENANT, "user-aaaa")
+    b = mgr.ensure_child(TENANT, "user-bbbb")
     assert a.port != b.port
     assert PORT_RANGE[0] <= a.port <= PORT_RANGE[1]
     assert a.token != b.token and len(a.token) >= 32
-    assert mgr.ensure_child("user-aaaa") is a
+    assert mgr.ensure_child(TENANT, "user-aaaa") is a
     assert len(spawned) == 2
 
 
 def test_ensure_child_provisions_profile_and_env(tmp_path):
     mgr, spawned = make_manager(tmp_path)
-    child = mgr.ensure_child("user-aaaa")
-    assert child.profile_dir == tmp_path / "wb-user-aaaa"
+    child = mgr.ensure_child(TENANT, "user-aaaa")
+    expected_dir = tmp_path / "tenants" / TENANT / "profiles" / "wb-user-aaaa"
+    assert child.profile_dir == expected_dir
     assert (child.profile_dir / "config.yaml").exists()
     env = spawned[0]["env"]
-    assert env["HERMES_HOME"] == str(tmp_path / "wb-user-aaaa")
+    assert env["HERMES_HOME"] == str(expected_dir)
     assert env["HERMES_DASHBOARD_SESSION_TOKEN"] == child.token
     assert env.get("PATH")
 
@@ -261,14 +265,14 @@ def test_ensure_child_rejects_invalid_user_id(tmp_path):
     mgr, _ = make_manager(tmp_path)
     for bad in ("", "../evil", "a b", "x" * 65):
         with pytest.raises(ValueError):
-            mgr.ensure_child(bad)
+            mgr.ensure_child(TENANT, bad)
 
 
 def test_ensure_child_thread_safe_single_spawn(tmp_path):
     mgr, spawned = make_manager(tmp_path)
     results = []
     threads = [
-        threading.Thread(target=lambda: results.append(mgr.ensure_child("user-aaaa")))
+        threading.Thread(target=lambda: results.append(mgr.ensure_child(TENANT, "user-aaaa")))
         for _ in range(8)
     ]
     for thread in threads:
@@ -290,10 +294,10 @@ def test_wait_ready_failure_does_not_cache_unready_child(tmp_path):
 
     mgr, spawned = make_manager(tmp_path, wait_ready=wait_ready)
     with pytest.raises(RuntimeError, match="not ready"):
-        mgr.ensure_child("user-aaaa")
+        mgr.ensure_child(TENANT, "user-aaaa")
 
     assert spawned[0]["proc"].killed is True
-    child = mgr.ensure_child("user-aaaa")
+    child = mgr.ensure_child(TENANT, "user-aaaa")
     assert child.proc is spawned[1]["proc"]
     assert len(spawned) == 2
 
@@ -301,7 +305,7 @@ def test_wait_ready_failure_does_not_cache_unready_child(tmp_path):
 def test_restart_on_crash_with_capped_backoff(tmp_path):
     sleeps = []
     mgr, spawned = make_manager(tmp_path, sleep=sleeps.append)
-    child = mgr.ensure_child("user-aaaa")
+    child = mgr.ensure_child(TENANT, "user-aaaa")
 
     for i in range(8):
         child.proc.exit_code = 1
@@ -317,17 +321,18 @@ def test_restart_on_crash_with_capped_backoff(tmp_path):
 
 def test_healthy_children_not_restarted(tmp_path):
     mgr, spawned = make_manager(tmp_path)
-    mgr.ensure_child("user-aaaa")
+    mgr.ensure_child(TENANT, "user-aaaa")
     mgr.check_children_once()
     mgr.check_children_once()
     assert len(spawned) == 1
 
 
 def test_boot_reconcile_starts_existing_profiles(tmp_path):
-    (tmp_path / "wb-user-aaaa").mkdir(parents=True)
-    (tmp_path / "wb-user-bbbb").mkdir(parents=True)
-    (tmp_path / "stray-dir").mkdir(parents=True)
-    (tmp_path / "wb-..evil..").mkdir(parents=True)
+    (tmp_path / "tenants" / TENANT / "profiles" / "wb-user-aaaa").mkdir(parents=True)
+    (tmp_path / "tenants" / "tenant-2222" / "profiles" / "wb-user-bbbb").mkdir(parents=True)
+    (tmp_path / "tenants" / TENANT / "profiles" / "stray-dir").mkdir(parents=True)
+    (tmp_path / "tenants" / TENANT / "profiles" / "wb-..evil..").mkdir(parents=True)
+    (tmp_path / "tenants" / "..evil-tenant" / "profiles" / "wb-user-cccc").mkdir(parents=True)
 
     mgr, spawned = make_manager(tmp_path)
     started = mgr.reconcile_boot()
@@ -420,13 +425,14 @@ def test_rest_proxies_with_child_token_swapped(router_client):
             "Content-Type": "application/json",
             "X-Hermes-Session-Token": "router-secret",
             "X-Wheelbase-User-Id": "user-aaaa",
+            "X-Wheelbase-Tenant-Id": TENANT,
         },
     )
     assert resp.status_code == 201
     assert resp.headers["content-type"] == "application/json"
     assert resp.headers["x-child"] == "yes"
     assert resp.json() == {"child": "ok", "method": "POST"}
-    child = mgr.ensure_child("user-aaaa")
+    child = mgr.ensure_child(TENANT, "user-aaaa")
     forwarded = stub.requests[0]
     assert forwarded["path"] == "/api/cron/list?limit=5"
     assert forwarded["body"] == b'{"x":1}'
@@ -524,7 +530,7 @@ def test_ws_proxies_frames_and_forwards_identity_headers(ws_router):
         ws.send_text('{"jsonrpc":"2.0","method":"ping","id":1}')
         assert ws.receive_text() == 'echo:{"jsonrpc":"2.0","method":"ping","id":1}'
 
-    child = mgr.ensure_child("user-aaaa")
+    child = mgr.ensure_child("t1", "user-aaaa")
     upgrade = stub.upgrades[0]
     assert f"token={child.token}" in upgrade["path"]
     lowered = {key.lower(): value for key, value in upgrade["headers"].items()}

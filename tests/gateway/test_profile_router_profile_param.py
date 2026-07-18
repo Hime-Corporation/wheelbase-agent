@@ -107,6 +107,7 @@ def router_client(tmp_path, monkeypatch):
 AUTH_HEADERS = {
     "X-Hermes-Session-Token": "router-secret",
     "X-Wheelbase-User-Id": "user-aaaa",
+    "X-Wheelbase-Tenant-Id": "tenant-1111",
 }
 OWN_PROFILE = "wb-user-aaaa"
 

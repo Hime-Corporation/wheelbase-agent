@@ -34,30 +34,53 @@ def _default_run_tick(profile_dir: Path) -> subprocess.Popen:
 class CronSweeper:
     def __init__(
         self,
-        profiles_root: Path,
+        root: Path,
         *,
         run_tick: Callable[[Path], subprocess.Popen] = _default_run_tick,
         max_concurrent: int = DEFAULT_MAX_CONCURRENT,
     ) -> None:
-        self.profiles_root = profiles_root
+        # ``root`` is the router's HERMES_HOME. Profiles are discovered under
+        # the tenant-nested layout (tenants/<tid>/profiles/wb-<uid>), the
+        # legacy flat layout (profiles/wb-<uid> — kept live because a deferred
+        # tenant migration leaves profiles there until the next boot), and
+        # ``root`` itself when it directly contains wb-* dirs.
+        self.root = root
         self._run_tick = run_tick
         self._max_concurrent = max(1, max_concurrent)
+
+    def _profile_parent_dirs(self) -> list[Path]:
+        from tui_gateway.wheelbase_identity import is_valid_user_id
+
+        parents: list[Path] = [self.root]
+        legacy = self.root / "profiles"
+        if legacy.is_dir():
+            parents.append(legacy)
+        tenants = self.root / "tenants"
+        if tenants.is_dir():
+            for tenant_dir in sorted(tenants.iterdir()):
+                if not tenant_dir.is_dir() or not is_valid_user_id(tenant_dir.name):
+                    continue
+                nested = tenant_dir / "profiles"
+                if nested.is_dir():
+                    parents.append(nested)
+        return parents
 
     def profiles_with_jobs(self) -> list[Path]:
         from tui_gateway.profile_router import PROFILE_PREFIX
         from tui_gateway.wheelbase_identity import is_valid_user_id
 
-        if not self.profiles_root.is_dir():
-            return []
         result: list[Path] = []
-        for entry in sorted(self.profiles_root.iterdir()):
-            if not entry.is_dir() or not entry.name.startswith(PROFILE_PREFIX):
+        for parent in self._profile_parent_dirs():
+            if not parent.is_dir():
                 continue
-            user_id = entry.name[len(PROFILE_PREFIX):]
-            if not is_valid_user_id(user_id):
-                continue
-            if (entry / "cron" / "jobs.json").exists():
-                result.append(entry)
+            for entry in sorted(parent.iterdir()):
+                if not entry.is_dir() or not entry.name.startswith(PROFILE_PREFIX):
+                    continue
+                user_id = entry.name[len(PROFILE_PREFIX):]
+                if not is_valid_user_id(user_id):
+                    continue
+                if (entry / "cron" / "jobs.json").exists():
+                    result.append(entry)
         return result
 
     def sweep_once(self) -> int:
@@ -93,11 +116,11 @@ class CronSweeper:
 
 
 def main_once() -> int:
-    """One sweep over the live profiles root — entrypoint for host/k8s cron."""
-    from tui_gateway.profile_router import profiles_root
+    """One sweep over the live hermes root — entrypoint for host/k8s cron."""
+    from tui_gateway.profile_router import hermes_home_root
 
     logging.basicConfig(level=logging.INFO)
-    return CronSweeper(profiles_root()).sweep_once()
+    return CronSweeper(hermes_home_root()).sweep_once()
 
 
 if __name__ == "__main__":
