@@ -18,6 +18,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Optional
+from urllib.parse import parse_qsl, urlencode
 
 from fastapi import FastAPI, Request, WebSocket
 from fastapi.responses import JSONResponse, Response
@@ -436,6 +437,42 @@ def _rest_proxy_headers(headers: Any, child_token: str) -> dict[str, str]:
     return forwarded
 
 
+class _ProfileParamRejected(Exception):
+    """Raised by :func:`_sanitized_query` when a cross-profile value is seen."""
+
+    def __init__(self, profile: str) -> None:
+        super().__init__(profile)
+        self.profile = profile
+
+
+def _sanitized_query(query: str, user_id: str) -> str:
+    """Strip a redundant ``profile`` query param, or reject a cross-user one.
+
+    The dashboard child honors ``?profile=<name>`` on many endpoints to
+    redirect reads/writes into another profile's directory under the shared
+    profiles root. The child's own HERMES_HOME already scopes it to the
+    caller's own profile, so a value naming that same profile (or the
+    ``current``/empty sentinel) is redundant and stripped silently. Any other
+    value is a cross-user credential read/write attempt and must be rejected
+    outright rather than silently corrected — we want visibility into the
+    attempt, not to paper over it.
+    """
+    own_profile = f"{PROFILE_PREFIX}{user_id}"
+    filtered: list[tuple[str, str]] = []
+    for key, value in parse_qsl(query, keep_blank_values=True):
+        if key == "profile":
+            if value in ("", "current", own_profile):
+                continue
+            logger.warning(
+                "rejected cross-profile query param user=%s requested_profile=%s",
+                user_id,
+                value,
+            )
+            raise _ProfileParamRejected(value)
+        filtered.append((key, value))
+    return urlencode(filtered)
+
+
 def build_app(manager: ChildManager) -> FastAPI:
     app = FastAPI(title="Wheelbase Profile Router")
 
@@ -454,6 +491,13 @@ def build_app(manager: ChildManager) -> FastAPI:
             )
 
         try:
+            query = _sanitized_query(request.url.query, user_id)
+        except _ProfileParamRejected:
+            return JSONResponse(
+                {"error": "profile parameter not permitted"}, status_code=403
+            )
+
+        try:
             child = await asyncio.to_thread(manager.ensure_child, user_id)
         except Exception:
             logger.exception("failed to ensure child for REST user=%s", user_id)
@@ -468,7 +512,7 @@ def build_app(manager: ChildManager) -> FastAPI:
             upstream = await client.request(
                 request.method,
                 url,
-                params=request.url.query,
+                params=query,
                 content=body,
                 headers=headers,
             )
