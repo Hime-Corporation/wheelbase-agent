@@ -234,3 +234,54 @@ def test_shell_relay_url_registered_for_task(tmp_path, monkeypatch):
         assert ident["shell_relay_url"] == "wss://relay/u1"
     finally:
         cleanup()
+
+
+# ─── Desktop exec relay exempts the sandboxed-TERMINAL_ENV requirement ──────
+#
+# A desktop session's shell/file tools run on the user's OWN machine via the
+# wheelbase-desktop-exec plugin, not on the gateway host — so an identified
+# session with a working relay must not be refused just because TERMINAL_ENV
+# is "local" (the natural config once the relay is live). Mobile/offline
+# sessions (no relay url) must keep hitting the exact refusal they always
+# have; this bypass must never widen to them.
+
+
+def test_desktop_relay_bypasses_sandbox_requirement(tmp_path, monkeypatch):
+    monkeypatch.setenv("TERMINAL_ENV", "local")
+    monkeypatch.delenv("WHEELBASE_ALLOW_UNSANDBOXED", raising=False)
+    identity = WheelbaseIdentity(user_id="u-desktop", shell_relay_url="wss://relay/u-desktop")
+    apply_session_injection("task-desktop", identity, tmp_path)()
+
+
+def test_desktop_relay_with_already_sandboxed_env_still_works(tmp_path, monkeypatch):
+    """A relay-available session on an ALSO-sandboxed gateway must not
+    double-require anything extra — same as any other sandboxed session."""
+    monkeypatch.setenv("TERMINAL_ENV", "daytona")
+    identity = WheelbaseIdentity(user_id="u-desktop", shell_relay_url="wss://relay/u-desktop")
+    apply_session_injection("task-desktop", identity, tmp_path)()
+
+
+def test_mobile_no_relay_url_still_refused_on_local(tmp_path, monkeypatch):
+    """No shell_relay_url (mobile/offline) -> unchanged from today: refused."""
+    monkeypatch.setenv("TERMINAL_ENV", "local")
+    monkeypatch.delenv("WHEELBASE_ALLOW_UNSANDBOXED", raising=False)
+    identity = WheelbaseIdentity(user_id="u-mobile", shell_relay_url="")
+    with pytest.raises(RuntimeError, match="TERMINAL_ENV"):
+        apply_session_injection("task-mobile", identity, tmp_path)
+
+
+def test_mobile_still_requires_sandboxed_env_regardless_of_desktop_bypass(tmp_path, monkeypatch):
+    """Mobile keeps requiring a real sandboxed backend (daytona in practice) —
+    confirms the desktop bypass is additive, not a general relaxation."""
+    monkeypatch.setenv("TERMINAL_ENV", "daytona")
+    identity = WheelbaseIdentity(user_id="u-mobile", shell_relay_url="")
+    apply_session_injection("task-mobile", identity, tmp_path)()
+
+
+def test_allow_unsandboxed_escape_hatch_unaffected_by_relay_change(tmp_path, monkeypatch):
+    """The pre-existing dev/test escape hatch keeps working exactly as before
+    for a session with NO relay url."""
+    monkeypatch.setenv("TERMINAL_ENV", "local")
+    monkeypatch.setenv("WHEELBASE_ALLOW_UNSANDBOXED", "1")
+    identity = WheelbaseIdentity(user_id="u-dev", shell_relay_url="")
+    apply_session_injection("task-dev", identity, tmp_path)()

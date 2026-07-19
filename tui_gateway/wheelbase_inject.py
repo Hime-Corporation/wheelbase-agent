@@ -80,10 +80,25 @@ def user_sandbox_key(user_id: str) -> str:
     return f"{prefix}{user_id}"
 
 
-def _require_sandboxed_env() -> str:
+def _require_sandboxed_env(shell_relay_url: str = "") -> str:
     """Refuse an identified turn unless the terminal backend isolates execution
-    off the gateway host. Returns the resolved terminal env on success."""
+    off the gateway host — UNLESS the session has a desktop exec relay
+    available (``shell_relay_url`` set), in which case the routed shell/file
+    tools run on the user's OWN machine instead of the gateway host (the
+    ``wheelbase-desktop-exec`` plugin), so the gateway's own TERMINAL_ENV is
+    not a multi-tenant isolation concern for them. Mobile/offline sessions
+    (no relay url) are unaffected — this bypass never applies to them.
+    Returns the resolved terminal env either way (the caller still uses it to
+    decide docker-volume vs. daytona-sandbox-key overrides for any tool that
+    isn't relayed)."""
     terminal_env = _terminal_env()
+    if shell_relay_url:
+        logger.debug(
+            "identified session has a desktop exec relay available; "
+            "waiving the sandboxed-TERMINAL_ENV requirement (TERMINAL_ENV=%s)",
+            terminal_env,
+        )
+        return terminal_env
     if terminal_env in SANDBOXED_TERMINAL_ENVS:
         return terminal_env
     if os.environ.get("WHEELBASE_ALLOW_UNSANDBOXED", "") == "1":
@@ -114,7 +129,7 @@ def apply_session_injection(
     if not task_id or identity is None or not identity.user_id:
         raise ValueError("session injection requires a task_id and an identified user")
 
-    terminal_env = _require_sandboxed_env()
+    terminal_env = _require_sandboxed_env(identity.shell_relay_url or "")
 
     # 1. Session-scoped Supabase JWT for the Wheelbase SDK (RLS scoping,
     #    spec §5.1.1). Freshest JWT wins (identity.update may have rotated it).

@@ -41,6 +41,13 @@ PROFILE_PLUGINS = (
     "wheelbase-demand-matrix",
     "wheelbase-inspection",
     "wheelbase-dealercenter-import",
+    # Standalone plugins only load when listed here (hermes_cli/plugins.py's
+    # plugins.enabled allow-list) — this one was built and tested but never
+    # added, so it never actually ran for any profile, desktop or otherwise.
+    # Safe to enable for every profile: its own middleware only relays when
+    # identity.shell_relay_url is present (desktop), and falls back to the
+    # normal sandboxed cloud path via next_call otherwise (mobile/offline).
+    "wheelbase-desktop-exec",
 )
 # Toolsets removed from every per-user (wb-<uid>) profile. session_search can
 # open ANY profile's state.db by path (in-process, bypasses the Daytona
