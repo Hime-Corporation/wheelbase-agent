@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -9084,6 +9085,96 @@ def test_browser_manage_connect_local_devtools_ws_preserves_path(monkeypatch):
     assert resp["result"]["connected"] is True
     assert resp["result"]["url"] == concrete
     assert os.environ["BROWSER_CDP_URL"] == concrete
+
+
+def test_normalize_cdp_url_preserves_query_string():
+    """The CDP relay authenticates with a ``?token=<cap>`` capability minted by
+    the backend. Collapsing a discovery-style URL to ``scheme://host:port`` must
+    keep that query, or the capability is silently dropped and the next hop
+    fails with an unexplained 401.  Mirrors the ``partition("?")`` split in
+    ``tools.browser_tool._resolve_cdp_override``, which re-appends the query
+    after ``/json/version``."""
+    from urllib.parse import urlparse
+
+    normalized = server._normalize_cdp_url(
+        urlparse("http://127.0.0.1:8091/internal/agent/cdp/user-1?token=cap-abc")
+    )
+
+    assert normalized == "http://127.0.0.1:8091?token=cap-abc"
+
+
+def test_normalize_cdp_url_without_query_unchanged():
+    """No-regression guard for the query-preserving change: query-less inputs
+    normalize exactly as they did before."""
+    from urllib.parse import urlparse
+
+    # Discovery-style input collapses to bare scheme://host:port.
+    assert (
+        server._normalize_cdp_url(urlparse("http://127.0.0.1:9222/json/version"))
+        == "http://127.0.0.1:9222"
+    )
+    assert (
+        server._normalize_cdp_url(urlparse("http://127.0.0.1:9222"))
+        == "http://127.0.0.1:9222"
+    )
+    # Concrete endpoints stay verbatim.
+    assert (
+        server._normalize_cdp_url(urlparse("ws://127.0.0.1:9222/devtools/browser/abc"))
+        == "ws://127.0.0.1:9222/devtools/browser/abc"
+    )
+
+
+def test_browser_manage_connect_preserves_cdp_capability_token(monkeypatch):
+    """End-to-end: a token-bearing relay URL keeps its capability through both
+    the reachability probe and the normalization that lands in
+    ``BROWSER_CDP_URL``."""
+    monkeypatch.delenv("BROWSER_CDP_URL", raising=False)
+    fake = types.SimpleNamespace(
+        cleanup_all_browsers=lambda: None,
+        _get_cdp_override=lambda: os.environ.get("BROWSER_CDP_URL", ""),
+    )
+    relay = "http://127.0.0.1:8091/internal/agent/cdp/user-1?token=cap-abc"
+
+    with patch.dict(sys.modules, {"tools.browser_tool": fake}):
+        urls = _stub_urlopen_capture(monkeypatch, ok=True)
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "browser.manage",
+                "params": {"action": "connect", "url": relay},
+            }
+        )
+
+    assert resp["result"]["connected"] is True
+    assert resp["result"]["url"] == "http://127.0.0.1:8091?token=cap-abc"
+    assert os.environ["BROWSER_CDP_URL"] == "http://127.0.0.1:8091?token=cap-abc"
+    # The probe carries the capability too — without it the relay answers 401
+    # and the browser is reported unreachable.
+    assert urls[0] == "http://127.0.0.1:8091/json/version?token=cap-abc"
+
+
+def test_browser_manage_connect_redacts_cdp_token_in_errors(monkeypatch, caplog):
+    """A failed connect must not echo the capability token back to the TUI or
+    into gateway logs — same policy ``tools.browser_tool`` applies via
+    ``agent.redact.redact_cdp_url``."""
+    monkeypatch.delenv("BROWSER_CDP_URL", raising=False)
+    relay = "http://127.0.0.1:8091/internal/agent/cdp/user-1?token=cap-secret"
+
+    _stub_urlopen(monkeypatch, ok=False)
+    with caplog.at_level(logging.DEBUG):
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "browser.manage",
+                "params": {"action": "connect", "url": relay},
+            }
+        )
+
+    assert resp["error"]["code"] == 5031
+    assert "cap-secret" not in resp["error"]["message"]
+    assert "token=***" in resp["error"]["message"]
+    assert "cap-secret" not in caplog.text
+    assert "BROWSER_CDP_URL" not in os.environ
 
 
 def test_browser_manage_connect_rejects_invalid_port(monkeypatch):

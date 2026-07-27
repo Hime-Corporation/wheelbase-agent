@@ -15498,10 +15498,27 @@ def _http_ok(url: str, timeout: float) -> bool:
         return False
 
 
+def _redact_browser_url(value: object) -> str:
+    """Mask credentials in a browser CDP URL before it reaches an error string.
+
+    Thin wrapper over :func:`agent.redact.redact_cdp_url` — the same single
+    source of truth ``tools.browser_tool._sanitize_url_for_logs`` uses — so the
+    gateway and the browser tool cannot drift apart. Matters because a relay
+    endpoint carries its capability token as ``?token=``, and connect errors are
+    rendered in the TUI and captured in gateway logs.
+    """
+    from agent.redact import redact_cdp_url
+
+    return redact_cdp_url(value)
+
+
 def _probe_urls(parsed) -> list[str]:
     scheme = {"ws": "http", "wss": "https"}.get(parsed.scheme, parsed.scheme)
     root = f"{scheme}://{parsed.netloc}".rstrip("/")
-    return [f"{root}/json/version", f"{root}/json"]
+    # A relay endpoint authenticates with a ``?token=`` capability; probing
+    # without it would 401 and report the browser as unreachable.
+    suffix = f"?{parsed.query}" if parsed.query else ""
+    return [f"{root}/json/version{suffix}", f"{root}/json{suffix}"]
 
 
 def _normalize_cdp_url(parsed) -> str:
@@ -15509,9 +15526,15 @@ def _normalize_cdp_url(parsed) -> str:
     # are connectable as-is. Discovery-style inputs collapse to bare
     # ``scheme://host:port`` so ``_resolve_cdp_override`` can append
     # ``/json/version`` later without doubling the path.
+    #
+    # The query string survives that collapse: the CDP relay mints a
+    # capability token onto ``...?token=<cap>``, and dropping it here would
+    # surface later as an unexplained 401. ``_resolve_cdp_override`` splits
+    # the query off with ``partition("?")`` before appending the discovery
+    # suffix, so path and query stay separated on both sides.
     if parsed.path.startswith("/devtools/browser/"):
         return parsed.geturl()
-    return parsed._replace(path="", params="", query="", fragment="").geturl()
+    return parsed._replace(path="", params="", fragment="").geturl()
 
 
 def _failure_messages(url: str, port: int, system: str) -> list[str]:
@@ -15578,13 +15601,13 @@ def _browser_connect(rid, params: dict) -> dict:
 
     parsed = urlparse(url if "://" in url else f"http://{url}")
     if parsed.scheme not in {"http", "https", "ws", "wss"}:
-        return _err(rid, 4015, f"unsupported browser url: {url}")
+        return _err(rid, 4015, f"unsupported browser url: {_redact_browser_url(url)}")
     if not parsed.hostname:
-        return _err(rid, 4015, f"missing host in browser url: {url}")
+        return _err(rid, 4015, f"missing host in browser url: {_redact_browser_url(url)}")
     try:
         port = parsed.port or (443 if parsed.scheme in {"https", "wss"} else 80)
     except ValueError:
-        return _err(rid, 4015, f"invalid port in browser url: {url}")
+        return _err(rid, 4015, f"invalid port in browser url: {_redact_browser_url(url)}")
 
     # Always normalize default-local to 127.0.0.1:9222 so downstream
     # comparisons + messaging match what we'll actually persist.
@@ -15606,7 +15629,12 @@ def _browser_connect(rid, params: dict) -> dict:
                 with socket.create_connection((parsed.hostname, port), timeout=2.0):
                     pass
             except OSError as e:
-                return _err(rid, 5031, f"could not reach browser CDP at {url}: {e}")
+                return _err(
+                    rid,
+                    5031,
+                    f"could not reach browser CDP at {_redact_browser_url(url)}: "
+                    f"{_redact_browser_url(e)}",
+                )
         elif _is_default_local_cdp(parsed):
             from hermes_cli.browser_connect import (
                 discover_local_cdp_url,
@@ -15673,7 +15701,9 @@ def _browser_connect(rid, params: dict) -> dict:
             probes = _probe_urls(parsed)
             ok = any(_http_ok(p, timeout=2.0) for p in probes)
             if not ok:
-                return _err(rid, 5031, f"could not reach browser CDP at {url}")
+                return _err(
+                    rid, 5031, f"could not reach browser CDP at {_redact_browser_url(url)}"
+                )
 
         normalized = _normalize_cdp_url(parsed)
 
@@ -15685,7 +15715,7 @@ def _browser_connect(rid, params: dict) -> dict:
         os.environ["BROWSER_CDP_URL"] = normalized
         cleanup_all_browsers()
     except Exception as e:
-        return _err(rid, 5031, str(e))
+        return _err(rid, 5031, _redact_browser_url(e))
 
     payload: dict[str, object] = {"connected": True, "url": normalized}
     if messages:
