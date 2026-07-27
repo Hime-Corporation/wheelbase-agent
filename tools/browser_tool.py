@@ -407,6 +407,11 @@ def _resolve_cdp_override(cdp_url: str) -> str:
     For discovery-style endpoints we fetch /json/version and return the
     webSocketDebuggerUrl so downstream tools always receive a concrete browser
     websocket instead of an ambiguous host:port URL.
+
+    Fails closed: when discovery fails (or returns no webSocketDebuggerUrl) this
+    returns ``""`` rather than the raw endpoint, so a dead relay does not stay
+    truthy and hard-fail every session.  Callers must treat an empty result as
+    "no usable endpoint" and fall back accordingly.
     """
     raw = (cdp_url or "").strip()
     if not raw:
@@ -423,10 +428,13 @@ def _resolve_cdp_override(cdp_url: str) -> str:
         else:
             return raw
 
-    if discovery_url.lower().endswith("/json/version"):
+    # Keep any query string (e.g. the relay's ?token=) out of the path when
+    # appending the discovery suffix.
+    path_part, sep, query_part = discovery_url.partition("?")
+    if path_part.lower().endswith("/json/version"):
         version_url = discovery_url
     else:
-        version_url = discovery_url.rstrip("/") + "/json/version"
+        version_url = path_part.rstrip("/") + "/json/version" + (sep + query_part if sep else "")
 
     try:
         response = requests.get(version_url, timeout=10)
@@ -439,7 +447,7 @@ def _resolve_cdp_override(cdp_url: str) -> str:
             _sanitize_url_for_logs(version_url),
             _sanitize_url_for_logs(exc),
         )
-        return raw
+        return ""
 
     ws_url = str(payload.get("webSocketDebuggerUrl") or "").strip()
     if ws_url:
@@ -451,10 +459,11 @@ def _resolve_cdp_override(cdp_url: str) -> str:
         return ws_url
 
     logger.warning(
-        "CDP discovery at %s did not return webSocketDebuggerUrl; using raw endpoint",
+        "CDP discovery at %s did not return webSocketDebuggerUrl; treating endpoint "
+        "as unusable",
         _sanitize_url_for_logs(version_url),
     )
-    return raw
+    return ""
 
 
 _task_cdp_urls: dict[str, str] = {}
@@ -2101,7 +2110,16 @@ def _get_session_info(task_id: Optional[str] = None) -> Dict[str, Any]:
     # Create session outside the lock (network call in cloud mode)
     cdp_override = _get_cdp_override(task_id)
     if cdp_override and not force_local:
-        session_info = _create_cdp_session(task_id, cdp_override)
+        try:
+            session_info = _create_cdp_session(task_id, cdp_override)
+        except Exception as e:
+            logger.warning(
+                "CDP override session for task %s failed (%s); falling back to "
+                "local Chromium",
+                task_id, e,
+                exc_info=True,
+            )
+            session_info = _create_local_session(task_id)
     elif force_local:
         session_info = _create_local_session(task_id)
     else:
@@ -2117,8 +2135,18 @@ def _get_session_info(task_id: Optional[str] = None) -> Dict[str, Any]:
                 if session_info.get("cdp_url"):
                     # Some cloud providers (including Browser-Use v3) return an HTTP
                     # CDP discovery URL instead of a raw websocket endpoint.
+                    # _resolve_cdp_override fails closed, so raise into the fallback
+                    # below rather than storing an empty cdp_url — downstream that
+                    # would silently launch a fresh local Chromium while the cloud
+                    # session we just created (and are billed for) dangles.
+                    resolved = _resolve_cdp_override(str(session_info["cdp_url"]))
+                    if not resolved:
+                        raise RuntimeError(
+                            f"Cloud provider {type(provider).__name__} returned a "
+                            "cdp_url that failed discovery"
+                        )
                     session_info = dict(session_info)
-                    session_info["cdp_url"] = _resolve_cdp_override(str(session_info["cdp_url"]))
+                    session_info["cdp_url"] = resolved
             except Exception as e:
                 provider_name = type(provider).__name__
                 logger.warning(

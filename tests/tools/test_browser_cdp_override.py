@@ -40,11 +40,72 @@ class TestResolveCdpOverride:
         assert resolved == WS_URL
         mock_get.assert_called_once_with(VERSION_URL, timeout=10)
 
-    def test_falls_back_to_raw_url_when_discovery_fails(self):
+    def test_returns_empty_when_discovery_fails(self):
+        """Fail closed: a dead relay must resolve to "" so callers fall through
+        to their cloud/local fallback instead of dialing a URL nobody serves."""
         from tools.browser_tool import _resolve_cdp_override
 
         with patch("tools.browser_tool.requests.get", side_effect=RuntimeError("boom")):
-            assert _resolve_cdp_override(HTTP_URL) == HTTP_URL
+            assert _resolve_cdp_override(HTTP_URL) == ""
+
+    def test_returns_empty_when_payload_has_no_websocket_url(self):
+        """Discovery answered but carries no webSocketDebuggerUrl -> unusable."""
+        from tools.browser_tool import _resolve_cdp_override
+
+        response = Mock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {"Browser": "Chrome/140.0"}
+
+        with patch("tools.browser_tool.requests.get", return_value=response):
+            assert _resolve_cdp_override(HTTP_URL) == ""
+
+    def test_preserves_query_string_when_appending_json_version(self):
+        """The relay's ?token= capability param must stay a query param rather
+        than being mangled into the discovery path."""
+        from tools.browser_tool import _resolve_cdp_override
+
+        response = Mock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {"webSocketDebuggerUrl": WS_URL}
+
+        raw = "http://127.0.0.1:8091/internal/agent/cdp/user-1?token=abc123"
+        with patch("tools.browser_tool.requests.get", return_value=response) as mock_get:
+            resolved = _resolve_cdp_override(raw)
+
+        assert resolved == WS_URL
+        mock_get.assert_called_once_with(
+            "http://127.0.0.1:8091/internal/agent/cdp/user-1/json/version?token=abc123",
+            timeout=10,
+        )
+
+    def test_preserves_query_string_with_trailing_slash(self):
+        from tools.browser_tool import _resolve_cdp_override
+
+        response = Mock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {"webSocketDebuggerUrl": WS_URL}
+
+        raw = "http://127.0.0.1:8091/internal/agent/cdp/user-1/?token=abc123"
+        with patch("tools.browser_tool.requests.get", return_value=response) as mock_get:
+            _resolve_cdp_override(raw)
+
+        mock_get.assert_called_once_with(
+            "http://127.0.0.1:8091/internal/agent/cdp/user-1/json/version?token=abc123",
+            timeout=10,
+        )
+
+    def test_explicit_json_version_with_query_is_used_as_is(self):
+        from tools.browser_tool import _resolve_cdp_override
+
+        response = Mock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {"webSocketDebuggerUrl": WS_URL}
+
+        raw = "http://127.0.0.1:8091/internal/agent/cdp/user-1/json/version?token=abc123"
+        with patch("tools.browser_tool.requests.get", return_value=response) as mock_get:
+            _resolve_cdp_override(raw)
+
+        mock_get.assert_called_once_with(raw, timeout=10)
 
     def test_redacts_secret_query_params_in_success_log(self):
         from tools.browser_tool import _resolve_cdp_override
@@ -80,7 +141,7 @@ class TestResolveCdpOverride:
                 patch("tools.browser_tool.logger.warning") as mock_warning:
             resolved = _resolve_cdp_override(raw)
 
-        assert resolved == raw
+        assert resolved == ""
         mock_warning.assert_called_once()
         _, logged_raw, logged_version_url, logged_error = mock_warning.call_args.args
         assert "super-secret-token-123456" not in logged_raw
@@ -122,6 +183,36 @@ class TestResolveCdpOverride:
             "https://cdp.browser-use.example/session/json/version",
             timeout=10,
         )
+
+    def test_provider_cdp_url_failing_discovery_falls_back_to_local(self, monkeypatch):
+        """Call site B must never store an empty cdp_url: downstream that would
+        launch a fresh local Chromium while the just-created (billed) cloud
+        session dangles.  Raise into the existing fallback instead."""
+        import tools.browser_tool as browser_tool
+
+        provider = Mock()
+        provider.create_session.return_value = {
+            "session_name": "cloud-session",
+            "bb_session_id": "bu_123",
+            "cdp_url": "https://cdp.browser-use.example/session",
+            "features": {"browser_use": True},
+        }
+
+        monkeypatch.setattr(browser_tool, "_active_sessions", {})
+        monkeypatch.setattr(browser_tool, "_session_last_activity", {})
+        monkeypatch.setattr(browser_tool, "_start_browser_cleanup_thread", lambda: None)
+        monkeypatch.setattr(browser_tool, "_update_session_activity", lambda task_id: None)
+        monkeypatch.setattr(browser_tool, "_ensure_cdp_supervisor", lambda task_id: None)
+        monkeypatch.setattr(browser_tool, "_get_cdp_override", lambda *a, **k: "")
+        monkeypatch.setattr(browser_tool, "_get_cloud_provider", lambda: provider)
+
+        with patch("tools.browser_tool.requests.get", side_effect=RuntimeError("boom")):
+            session_info = browser_tool._get_session_info("task-discovery-failed")
+
+        assert session_info["fallback_from_cloud"] is True
+        assert "failed discovery" in session_info["fallback_reason"]
+        assert session_info["features"]["local"] is True
+        assert session_info["cdp_url"] is None
 
 
 class TestGetCdpOverride:
