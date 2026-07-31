@@ -10530,6 +10530,14 @@ def test_session_list_honors_params_profile_opens_profile_db(monkeypatch, tmp_pa
                 }
             ]
 
+        # Upstream's session.list now also calls session_count() for pagination
+        # (methods_session.py). Without this the handler raises AttributeError
+        # *on a ProfileDB instance* — which still proved the profile db was
+        # opened, but masked the assertion this test actually makes.
+        def session_count(self, **kwargs):
+            seen["counted"] = True
+            return 1
+
         def close(self):
             seen["closed"] = True
 

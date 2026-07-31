@@ -1208,7 +1208,15 @@ def _db_for_profile(profile: str | None = None):
             identified = True
     profile_home = _profile_home(profile)
     if profile_home is None:
-        if identified:
+        # _profile_home() returns None for two very different reasons and only
+        # ONE of them is a fail-closed condition:
+        #   1. the named profile IS this process's launch profile — the shared
+        #      handle is the CORRECT answer. Every per-profile child process
+        #      hits this on every request; raising here takes them all down.
+        #   2. the profile does not resolve (not provisioned yet, lookup
+        #      failure) — returning the shared store here would serve another
+        #      user's sessions, which is the bleed this fork exists to prevent.
+        if identified and not _profile_is_launch_home(profile):
             raise RuntimeError(
                 f"profile home unavailable for identified profile {profile!r} "
                 "— refusing to fall back to the shared launch store"
@@ -1234,7 +1242,15 @@ def _profile_db(params: dict | None = None):
     Closes dedicated profile handles; leaves the launch-profile shared handle open.
     Yields None when the db is unavailable.
     """
-    db, owns = _db_for_profile(_request_profile(params))
+    # Pass only the EXPLICIT param. _db_for_profile does its own identity
+    # derivation and uses that to decide whether an unresolvable profile home
+    # is fail-closed (identity-derived) or benign (client-supplied). Handing it
+    # _request_profile()'s already-derived value made `identified` permanently
+    # False, which silently rendered the fail-closed guard unreachable.
+    explicit = None
+    if isinstance(params, dict):
+        explicit = (params.get("profile") or "").strip() or None
+    db, owns = _db_for_profile(explicit)
     try:
         yield db
     finally:
@@ -1301,6 +1317,29 @@ def _profile_home(profile: str | None) -> Path | None:
     if home.resolve() == Path(_hermes_home).resolve():
         return None
     return home if (home / "state.db").exists() or home.exists() else None
+
+
+def _profile_is_launch_home(profile: str | None) -> bool:
+    """True when ``profile`` names THIS process's own launch profile.
+
+    Disambiguates the two reasons :func:`_profile_home` returns None. A
+    per-profile child process runs with ``HERMES_HOME`` already pointed at the
+    user's own profile, so its identity-derived ``wb-<user_id>`` resolves back
+    to the launch home — there the shared handle is correct and must NOT be
+    treated as a fail-closed condition. See :func:`_db_for_profile`.
+    """
+    name = (profile or "").strip()
+    if not name:
+        return False
+    try:
+        from hermes_cli import profiles as profiles_mod
+
+        home = Path(profiles_mod.get_profile_dir(name))
+        return home.resolve() == Path(_hermes_home).resolve()
+    except Exception:
+        # Unresolvable is NOT "is the launch profile" — fall through to the
+        # fail-closed path rather than silently widening access.
+        return False
 
 
 def _profile_scoped(handler):
