@@ -6,6 +6,7 @@ loopback stubs so token/header forwarding is covered without starting Hermes.
 from __future__ import annotations
 
 import asyncio
+import base64
 import http.server
 import json
 import threading
@@ -21,8 +22,10 @@ from tui_gateway.profile_router import (
     ChildManager,
     build_app,
     provision_profile,
+    _identity_headers,
 )
 from tui_gateway.wheelbase_identity import is_valid_user_id
+from tui_gateway.wheelbase_identity import WheelbaseIdentity
 
 
 def test_is_valid_user_id():
@@ -32,6 +35,11 @@ def test_is_valid_user_id():
     assert not is_valid_user_id("../evil")
     assert not is_valid_user_id("a/b")
     assert not is_valid_user_id("x" * 65)
+
+
+def test_router_never_forwards_independent_identity_headers():
+    with pytest.raises(ValueError):
+        _identity_headers({"X-Wheelbase-User-Id": "user-aaaa"})
 
 
 def test_provision_writes_config_with_plugins(tmp_path):
@@ -56,6 +64,7 @@ def test_main_starts_cron_sweep_thread(tmp_path, monkeypatch):
     import tui_gateway.profile_router as pr
 
     monkeypatch.setenv("HERMES_DASHBOARD_SESSION_TOKEN", "tok")
+    monkeypatch.setenv("AGENT_GATEWAY_IDENTITY_KEYS", json.dumps({"k1": base64.b64encode(b"k" * 32).decode()}))
     monkeypatch.setattr(pr, "profiles_root", lambda: tmp_path)
 
     captured = {}
@@ -385,7 +394,16 @@ class _RecordingChildHTTP(threading.Thread):
 
 @pytest.fixture
 def router_client(tmp_path, monkeypatch):
+    import tui_gateway.profile_router as pr
     monkeypatch.setenv("HERMES_DASHBOARD_SESSION_TOKEN", "router-secret")
+    def verified(headers):
+        names = {key.lower() for key in headers}
+        if "x-wheelbase-identity-envelope" in names:
+            return WheelbaseIdentity(user_id="user-aaaa", tenant_id=TENANT)
+        if any(name.startswith("x-wheelbase-") for name in names):
+            raise ValueError("independent header")
+        return None
+    monkeypatch.setattr(pr, "identity_from_headers", verified)
     stub = _RecordingChildHTTP()
     stub.start()
     mgr, _ = make_manager(tmp_path)
@@ -424,8 +442,7 @@ def test_rest_proxies_with_child_token_swapped(router_client):
         headers={
             "Content-Type": "application/json",
             "X-Hermes-Session-Token": "router-secret",
-            "X-Wheelbase-User-Id": "user-aaaa",
-            "X-Wheelbase-Tenant-Id": TENANT,
+            "X-Wheelbase-Identity-Envelope": "signed-envelope",
         },
     )
     assert resp.status_code == 201
@@ -437,7 +454,7 @@ def test_rest_proxies_with_child_token_swapped(router_client):
     assert forwarded["path"] == "/api/cron/list?limit=5"
     assert forwarded["body"] == b'{"x":1}'
     assert forwarded["headers"]["X-Hermes-Session-Token"] == child.token
-    assert forwarded["headers"]["X-Wheelbase-User-Id"] == "user-aaaa"
+    assert forwarded["headers"]["X-Wheelbase-Identity-Envelope"] == "signed-envelope"
 
 
 class _EchoChildWS(threading.Thread):
@@ -486,7 +503,16 @@ class _EchoChildWS(threading.Thread):
 
 @pytest.fixture
 def ws_router(tmp_path, monkeypatch):
+    import tui_gateway.profile_router as pr
     monkeypatch.setenv("HERMES_DASHBOARD_SESSION_TOKEN", "router-secret")
+    def verified(headers):
+        names = {key.lower() for key in headers}
+        if "x-wheelbase-identity-envelope" in names:
+            return WheelbaseIdentity(user_id="user-aaaa", tenant_id="t1")
+        if any(name.startswith("x-wheelbase-") for name in names):
+            raise ValueError("independent header")
+        return None
+    monkeypatch.setattr(pr, "identity_from_headers", verified)
     stub = _EchoChildWS()
     stub.start_and_wait()
     mgr, _ = make_manager(tmp_path)
@@ -519,15 +545,7 @@ def test_ws_rejects_missing_or_invalid_user_id(ws_router):
 
 def test_ws_proxies_frames_and_forwards_identity_headers(ws_router):
     client, stub, mgr = ws_router
-    headers = {
-        "X-Wheelbase-User-Id": "user-aaaa",
-        "X-Wheelbase-Tenant-Id": "t1",
-        "X-Wheelbase-Dealership-Id": "d1",
-        "X-Wheelbase-User-Jwt": "jwt-a",
-        "X-Wheelbase-Cdp-Url": "http://cdp/user-aaaa",
-        "X-Wheelbase-Client": "desktop",
-        "X-Wheelbase-Device-Id": "550e8400-e29b-41d4-a716-446655440000",
-    }
+    headers = {"X-Wheelbase-Identity-Envelope": "signed-envelope"}
     with client.websocket_connect("/api/ws?token=router-secret", headers=headers) as ws:
         ws.send_text('{"jsonrpc":"2.0","method":"ping","id":1}')
         assert ws.receive_text() == 'echo:{"jsonrpc":"2.0","method":"ping","id":1}'
@@ -536,8 +554,5 @@ def test_ws_proxies_frames_and_forwards_identity_headers(ws_router):
     upgrade = stub.upgrades[0]
     assert f"token={child.token}" in upgrade["path"]
     lowered = {key.lower(): value for key, value in upgrade["headers"].items()}
-    assert lowered["x-wheelbase-user-id"] == "user-aaaa"
-    assert lowered["x-wheelbase-user-jwt"] == "jwt-a"
-    assert lowered["x-wheelbase-cdp-url"] == "http://cdp/user-aaaa"
-    assert lowered["x-wheelbase-client"] == "desktop"
-    assert lowered["x-wheelbase-device-id"] == "550e8400-e29b-41d4-a716-446655440000"
+    assert lowered["x-wheelbase-identity-envelope"] == "signed-envelope"
+    assert not any(key.startswith("x-wheelbase-") and key != "x-wheelbase-identity-envelope" for key in lowered)

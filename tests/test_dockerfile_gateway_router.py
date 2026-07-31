@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 from pathlib import Path
+import base64
+import json
 
 import pytest
 
@@ -29,7 +31,8 @@ def test_gateway_cmd_is_profile_router():
 def test_main_builds_app_and_reconciles(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_DASHBOARD_SESSION_TOKEN", "router-secret")
     monkeypatch.setenv("WHEELBASE_PROFILES_ROOT", str(tmp_path))
-    (tmp_path / "wb-user-aaaa").mkdir()
+    monkeypatch.setenv("AGENT_GATEWAY_IDENTITY_KEYS", json.dumps({"k1": base64.b64encode(b"k" * 32).decode()}))
+    (tmp_path / "tenants" / "tenant-a" / "profiles" / "wb-user-aaaa").mkdir(parents=True)
 
     spawned = []
     captured = {}

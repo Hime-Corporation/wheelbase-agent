@@ -7,12 +7,13 @@ other's.
 from __future__ import annotations
 
 import json
+import hashlib
 import re
 
 import pytest
 
 from tools import browser_tool, terminal_tool
-from tui_gateway.wheelbase_identity import WheelbaseIdentity, update_user_jwt
+from tui_gateway.wheelbase_identity import WheelbaseIdentity
 from tui_gateway.wheelbase_inject import (
     apply_session_injection,
     contain_workspace_path,
@@ -21,11 +22,19 @@ from tui_gateway.wheelbase_inject import (
 )
 from wheelbase_sdk import runtime as wb_runtime
 
-IDENT_A = WheelbaseIdentity(
+def _identity(*, user_id, tenant_id, **kwargs):
+    jti = hashlib.sha256(f"{tenant_id}:{user_id}:{kwargs.get('device_id', '')}".encode()).hexdigest()
+    return WheelbaseIdentity(user_id=user_id, tenant_id=tenant_id,
+        jwt=kwargs.pop("jwt", f"jwt-{user_id}"), session_jti_hash=jti,
+        credential_revision=kwargs.pop("credential_revision", 1),
+        credential_expires_at=kwargs.pop("credential_expires_at", 9999999999), **kwargs)
+
+
+IDENT_A = _identity(
     user_id="user-aaaa", tenant_id="t1", dealership_id="d1",
     jwt="jwt-a", cdp_url="http://internal:8091/internal/agent/cdp/user-aaaa",
 )
-IDENT_B = WheelbaseIdentity(
+IDENT_B = _identity(
     user_id="user-bbbb", tenant_id="t1", dealership_id="d2",
     jwt="jwt-b", cdp_url="http://internal:8091/internal/agent/cdp/user-bbbb",
 )
@@ -77,8 +86,8 @@ def test_two_users_no_cross_bleed(tmp_path):
     )
 
     # Credentials: distinct files, distinct tokens.
-    cred_a = json.loads((tmp_path / "wheelbase-sessions" / "user-aaaa.json").read_text())
-    cred_b = json.loads((tmp_path / "wheelbase-sessions" / "user-bbbb.json").read_text())
+    cred_a = json.loads((tmp_path / "wheelbase-sessions" / f"{IDENT_A.session_jti_hash}.json").read_text())
+    cred_b = json.loads((tmp_path / "wheelbase-sessions" / f"{IDENT_B.session_jti_hash}.json").read_text())
     assert cred_a["access_token"] == "jwt-a"
     assert cred_b["access_token"] == "jwt-b"
 
@@ -87,8 +96,8 @@ def test_two_users_no_cross_bleed(tmp_path):
 
 
 def test_same_user_in_two_tenants_gets_distinct_external_resources(tmp_path, monkeypatch):
-    same_user_a = WheelbaseIdentity(user_id="shared-user", tenant_id="tenant-a")
-    same_user_b = WheelbaseIdentity(user_id="shared-user", tenant_id="tenant-b")
+    same_user_a = _identity(user_id="shared-user", tenant_id="tenant-a")
+    same_user_b = _identity(user_id="shared-user", tenant_id="tenant-b")
 
     apply_session_injection("tenant-a-task", same_user_a, tmp_path)()
     apply_session_injection("tenant-b-task", same_user_b, tmp_path)()
@@ -122,7 +131,7 @@ def test_sdk_context_set_and_reset(tmp_path):
     ident = wb_runtime.current_identity()
     assert ident is not None
     assert ident["user_id"] == IDENT_A.user_id
-    assert ident["credential_path"].endswith("user-aaaa.json")
+    assert ident["credential_path"].endswith(f"{IDENT_A.session_jti_hash}.json")
     cleanup()
     assert wb_runtime.current_identity() is None, "cleanup must fail closed for thread reuse"
 
@@ -144,7 +153,7 @@ def test_sdk_task_identity_records_exact_connection_owner(tmp_path):
 
 
 def test_sdk_context_carries_immutable_client_device_origin(tmp_path):
-    identity = WheelbaseIdentity(
+    identity = _identity(
         user_id="desktop-user",
         tenant_id="desktop-tenant",
         client="desktop",
@@ -284,23 +293,22 @@ def test_live_env_cwd_change_invokes_ensure_cwd():
         terminal_tool._task_env_overrides.pop("task-live", None)
 
 
-def test_jwt_refresh_only_touches_own_user(tmp_path):
+def test_revision_refresh_only_touches_own_jti(tmp_path):
     apply_session_injection("task-a", IDENT_A, tmp_path)()
     apply_session_injection("task-b", IDENT_B, tmp_path)()
-    update_user_jwt(IDENT_A.user_id, "jwt-a-rotated")
-    try:
-        apply_session_injection("task-a", IDENT_A, tmp_path)()
-        cred_a = json.loads((tmp_path / "wheelbase-sessions" / "user-aaaa.json").read_text())
-        cred_b = json.loads((tmp_path / "wheelbase-sessions" / "user-bbbb.json").read_text())
-        assert cred_a["access_token"] == "jwt-a-rotated"
-        assert cred_b["access_token"] == "jwt-b"
-    finally:
-        update_user_jwt(IDENT_A.user_id, "")
+    refreshed = _identity(user_id=IDENT_A.user_id, tenant_id=IDENT_A.tenant_id,
+        dealership_id=IDENT_A.dealership_id, jwt="jwt-a-rotated",
+        credential_revision=2, cdp_url=IDENT_A.cdp_url)
+    apply_session_injection("task-a", refreshed, tmp_path)()
+    cred_a = json.loads((tmp_path / "wheelbase-sessions" / f"{IDENT_A.session_jti_hash}.json").read_text())
+    cred_b = json.loads((tmp_path / "wheelbase-sessions" / f"{IDENT_B.session_jti_hash}.json").read_text())
+    assert cred_a["access_token"] == "jwt-a-rotated"
+    assert cred_b["access_token"] == "jwt-b"
 
 
 def test_missing_cdp_url_clears_registration(tmp_path):
     apply_session_injection("task-a", IDENT_A, tmp_path)()
-    no_browser = WheelbaseIdentity(user_id="user-aaaa", tenant_id="t1", jwt="jwt-a", cdp_url="")
+    no_browser = _identity(user_id="user-aaaa", tenant_id="t1", jwt="jwt-a", cdp_url="")
     apply_session_injection("task-a", no_browser, tmp_path)()
     # Falls back to env/config path (empty in tests -> empty string).
     assert browser_tool._get_cdp_override("task-a") != IDENT_A.cdp_url
@@ -318,7 +326,7 @@ def test_shell_relay_url_registered_for_task(tmp_path, monkeypatch):
     from tui_gateway.wheelbase_identity import WheelbaseIdentity
     from wheelbase_sdk import runtime as wb_runtime
 
-    identity = WheelbaseIdentity(user_id="u1", tenant_id="t1", shell_relay_url="wss://relay/u1")
+    identity = _identity(user_id="u1", tenant_id="t1", shell_relay_url="wss://relay/u1")
     cleanup = apply_session_injection("task-9", identity, tmp_path)
     try:
         ident = wb_runtime.get_task_identity("task-9")
@@ -341,7 +349,7 @@ def test_shell_relay_url_registered_for_task(tmp_path, monkeypatch):
 def test_desktop_relay_bypasses_sandbox_requirement(tmp_path, monkeypatch):
     monkeypatch.setenv("TERMINAL_ENV", "local")
     monkeypatch.delenv("WHEELBASE_ALLOW_UNSANDBOXED", raising=False)
-    identity = WheelbaseIdentity(
+    identity = _identity(
         user_id="u-desktop",
         tenant_id="t1",
         shell_relay_url="wss://relay/u-desktop",
@@ -353,7 +361,7 @@ def test_desktop_relay_with_already_sandboxed_env_still_works(tmp_path, monkeypa
     """A relay-available session on an ALSO-sandboxed gateway must not
     double-require anything extra — same as any other sandboxed session."""
     monkeypatch.setenv("TERMINAL_ENV", "daytona")
-    identity = WheelbaseIdentity(
+    identity = _identity(
         user_id="u-desktop",
         tenant_id="t1",
         shell_relay_url="wss://relay/u-desktop",
@@ -365,7 +373,7 @@ def test_mobile_no_relay_url_still_refused_on_local(tmp_path, monkeypatch):
     """No shell_relay_url (mobile/offline) -> unchanged from today: refused."""
     monkeypatch.setenv("TERMINAL_ENV", "local")
     monkeypatch.delenv("WHEELBASE_ALLOW_UNSANDBOXED", raising=False)
-    identity = WheelbaseIdentity(user_id="u-mobile", tenant_id="t1", shell_relay_url="")
+    identity = _identity(user_id="u-mobile", tenant_id="t1", shell_relay_url="")
     with pytest.raises(RuntimeError, match="TERMINAL_ENV"):
         apply_session_injection("task-mobile", identity, tmp_path)
 
@@ -374,7 +382,7 @@ def test_mobile_still_requires_sandboxed_env_regardless_of_desktop_bypass(tmp_pa
     """Mobile keeps requiring a real sandboxed backend (daytona in practice) —
     confirms the desktop bypass is additive, not a general relaxation."""
     monkeypatch.setenv("TERMINAL_ENV", "daytona")
-    identity = WheelbaseIdentity(user_id="u-mobile", tenant_id="t1", shell_relay_url="")
+    identity = _identity(user_id="u-mobile", tenant_id="t1", shell_relay_url="")
     apply_session_injection("task-mobile", identity, tmp_path)()
 
 
@@ -383,5 +391,5 @@ def test_allow_unsandboxed_escape_hatch_unaffected_by_relay_change(tmp_path, mon
     for a session with NO relay url."""
     monkeypatch.setenv("TERMINAL_ENV", "local")
     monkeypatch.setenv("WHEELBASE_ALLOW_UNSANDBOXED", "1")
-    identity = WheelbaseIdentity(user_id="u-dev", tenant_id="t1", shell_relay_url="")
+    identity = _identity(user_id="u-dev", tenant_id="t1", shell_relay_url="")
     apply_session_injection("task-dev", identity, tmp_path)()

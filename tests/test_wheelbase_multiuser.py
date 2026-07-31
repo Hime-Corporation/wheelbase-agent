@@ -15,30 +15,25 @@ import pytest
 from hermes_state import SessionDB
 from tui_gateway import server
 from tui_gateway.transport import bind_transport, reset_transport
-from tui_gateway import wheelbase_identity
 from tui_gateway.wheelbase_identity import WheelbaseIdentity
 from wheelbase_sdk import runtime as wb_runtime
-
-
-@pytest.fixture(autouse=True)
-def _clear_jwt_cache():
-    """The module-level JWT cache must not leak across tests/files."""
-    yield
-    with wheelbase_identity._lock:
-        wheelbase_identity._jwt_by_user.clear()
 
 
 class _FakeTransport:
     def __init__(self, identity=None):
         self.wheelbase_identity = identity
         self.written = []
+        self.closed = False
 
     def write(self, obj):
         self.written.append(obj)
 
+    def close(self):
+        self.closed = True
 
-IDENT_A = WheelbaseIdentity(user_id="user-aaaa", tenant_id="t1", dealership_id="d1", jwt="jwt-a")
-IDENT_B = WheelbaseIdentity(user_id="user-bbbb", tenant_id="t1", dealership_id="d1", jwt="jwt-b")
+
+IDENT_A = WheelbaseIdentity(user_id="user-aaaa", tenant_id="t1", dealership_id="d1", jwt="jwt-a", session_jti_hash="jti-a", credential_revision=1, credential_expires_at=9999999999)
+IDENT_B = WheelbaseIdentity(user_id="user-bbbb", tenant_id="t1", dealership_id="d1", jwt="jwt-b", session_jti_hash="jti-b", credential_revision=1, credential_expires_at=9999999999)
 
 
 @pytest.fixture
@@ -132,10 +127,10 @@ def test_identity_update_rewrites_credential_file(tmp_path, _bound, monkeypatch)
     monkeypatch.setattr(server, "get_hermes_home", lambda: str(tmp_path))
     _bound(IDENT_A)
     resp = server.handle_request(
-        {"id": 1, "method": "identity.update", "params": {"jwt": "jwt-rotated"}}
+        {"id": 1, "method": "identity.update", "params": {"jwt": "jwt-rotated", "credential_revision": 2, "credential_expires_at": 9999999999, "session_jti_hash": IDENT_A.session_jti_hash}}
     )
     assert resp["result"]["ok"] is True
-    cred = tmp_path / "wheelbase-sessions" / f"{IDENT_A.user_id}.json"
+    cred = tmp_path / "wheelbase-sessions" / f"{IDENT_A.session_jti_hash}.json"
     data = json.loads(cred.read_text(encoding="utf-8"))
     assert data["access_token"] == "jwt-rotated"
 
@@ -151,6 +146,9 @@ def test_identity_update_atomically_refreshes_capabilities_without_scope_mutatio
         jwt="jwt-old",
         cdp_url="https://old-cdp",
         shell_relay_url="wss://old-shell",
+        session_jti_hash="jti-old",
+        credential_revision=1,
+        credential_expires_at=9999999999,
     )
     transport = _bound(old)
     session = {
@@ -173,6 +171,9 @@ def test_identity_update_atomically_refreshes_capabilities_without_scope_mutatio
                 "device_id": old.device_id,
                 "cdp_url": "https://new-cdp",
                 "shell_relay_url": "wss://new-shell",
+                "session_jti_hash": old.session_jti_hash,
+                "credential_revision": 2,
+                "credential_expires_at": 9999999999,
             },
         }
     )
@@ -188,7 +189,7 @@ def test_identity_update_atomically_refreshes_capabilities_without_scope_mutatio
         {
             "id": 2,
             "method": "identity.update",
-            "params": {"jwt": "jwt-newer", "client": old.client, "device_id": old.device_id},
+            "params": {"jwt": "jwt-newer", "client": old.client, "device_id": old.device_id, "session_jti_hash": old.session_jti_hash, "credential_revision": 3, "credential_expires_at": 9999999999},
         }
     )
     assert cleared["result"]["ok"] is True
@@ -244,14 +245,30 @@ def test_queued_prompt_carries_requesting_device_identity(monkeypatch):
 )
 def test_identity_update_rejects_immutable_scope_changes(field, value, _bound):
     original = WheelbaseIdentity(
-        user_id="user-aaaa", tenant_id="t1", client="desktop", device_id="device-1"
+        user_id="user-aaaa", tenant_id="t1", client="desktop", device_id="device-1",
+        session_jti_hash="jti-original", credential_revision=1,
+        credential_expires_at=9999999999,
     )
     transport = _bound(original)
     response = server.handle_request(
-        {"id": 1, "method": "identity.update", "params": {"jwt": "new", field: value}}
+        {"id": 1, "method": "identity.update", "params": {"jwt": "new", "credential_revision": 2, "credential_expires_at": 9999999999, "session_jti_hash": original.session_jti_hash, field: value}}
     )
     assert response["error"]["code"] == 4032
     assert transport.wheelbase_identity is original
+    assert transport.closed is True
+
+
+def test_identity_update_rejects_non_newer_revision_without_mutation(tmp_path, _bound, monkeypatch):
+    monkeypatch.setattr(server, "get_hermes_home", lambda: str(tmp_path))
+    transport = _bound(IDENT_A)
+    response = server.handle_request({"id": 1, "method": "identity.update", "params": {
+        "jwt": "replacement", "session_jti_hash": IDENT_A.session_jti_hash,
+        "credential_revision": IDENT_A.credential_revision,
+        "credential_expires_at": 9999999999,
+    }})
+    assert response["error"]["code"] == 4033
+    assert transport.wheelbase_identity is IDENT_A
+    assert transport.closed is True
 
 
 def test_identity_update_rejected_without_identity(_bound):
@@ -285,6 +302,9 @@ def test_identity_update_refreshes_active_shell_and_browser_policy_immediately(
         jwt="jwt-old",
         cdp_url="wss://cdp/old",
         shell_relay_url="wss://shell/old",
+        session_jti_hash="jti-d1",
+        credential_revision=1,
+        credential_expires_at=9999999999,
     )
     transport = _FakeTransport(old)
     transport._wheelbase_connection_id = connection_id
@@ -313,6 +333,9 @@ def test_identity_update_refreshes_active_shell_and_browser_policy_immediately(
                     "device_id": "device-1",
                     "cdp_url": new_cdp,
                     "shell_relay_url": new_shell,
+                    "session_jti_hash": old.session_jti_hash,
+                    "credential_revision": 2,
+                    "credential_expires_at": 9999999999,
                 },
             }
         )
@@ -398,6 +421,10 @@ def test_identity_update_does_not_refresh_another_device_active_tasks(
         device_id="device-1",
         cdp_url="wss://cdp/d1-old",
         shell_relay_url="wss://shell/d1-old",
+        jwt="jwt-d1",
+        session_jti_hash="jti-d1",
+        credential_revision=1,
+        credential_expires_at=9999999999,
     )
     d2 = WheelbaseIdentity(
         user_id="user-aaaa",
@@ -406,6 +433,10 @@ def test_identity_update_does_not_refresh_another_device_active_tasks(
         device_id="device-2",
         cdp_url="wss://cdp/d2",
         shell_relay_url="wss://shell/d2",
+        jwt="jwt-d2",
+        session_jti_hash="jti-d2",
+        credential_revision=1,
+        credential_expires_at=9999999999,
     )
     t1 = _FakeTransport(d1)
     t1._wheelbase_connection_id = "connection-d1"
@@ -449,6 +480,9 @@ def test_identity_update_does_not_refresh_another_device_active_tasks(
                     "device_id": "device-1",
                     "cdp_url": "",
                     "shell_relay_url": "",
+                    "session_jti_hash": d1.session_jti_hash,
+                    "credential_revision": 2,
+                    "credential_expires_at": 9999999999,
                 },
             }
         )
@@ -798,6 +832,9 @@ def test_ephemeral_tasks_clear_only_their_per_task_registries(
         device_id="device-parent",
         cdp_url="wss://cdp/parent",
         shell_relay_url="wss://shell/parent",
+        session_jti_hash="jti-parent",
+        credential_revision=1,
+        credential_expires_at=9999999999,
     )
     sibling_wb = WheelbaseIdentity(
         user_id=IDENT_B.user_id,
@@ -808,6 +845,9 @@ def test_ephemeral_tasks_clear_only_their_per_task_registries(
         device_id="device-sibling",
         cdp_url="wss://cdp/sibling",
         shell_relay_url="wss://shell/sibling",
+        session_jti_hash="jti-sibling",
+        credential_revision=1,
+        credential_expires_at=9999999999,
     )
     _bound(parent_wb)
 

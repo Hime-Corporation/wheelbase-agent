@@ -24,7 +24,12 @@ from fastapi import FastAPI, Request, WebSocket
 from fastapi.responses import JSONResponse, Response
 from starlette.websockets import WebSocketDisconnect
 
-from tui_gateway.wheelbase_identity import is_valid_user_id
+from tui_gateway.wheelbase_identity import (
+    HEADER_ENVELOPE,
+    identity_from_headers,
+    is_valid_user_id,
+    load_identity_envelope_keys,
+)
 
 # Tenant ids ride the same trusted-header transport as user ids (the Go
 # backend mints both), so they share the exact same safe-identifier
@@ -81,18 +86,6 @@ _HOP_REQUEST_HEADERS = frozenset(
 _HOP_RESPONSE_HEADERS = frozenset(
     {"content-length", "transfer-encoding", "connection"}
 )
-_WHEELBASE_HEADER_CANONICAL = {
-    "x-wheelbase-user-id": "X-Wheelbase-User-Id",
-    "x-wheelbase-tenant-id": "X-Wheelbase-Tenant-Id",
-    "x-wheelbase-dealership-id": "X-Wheelbase-Dealership-Id",
-    "x-wheelbase-user-jwt": "X-Wheelbase-User-Jwt",
-    "x-wheelbase-cdp-url": "X-Wheelbase-Cdp-Url",
-    "x-wheelbase-shell-relay-url": "X-Wheelbase-Shell-Relay-Url",
-    "x-wheelbase-client": "X-Wheelbase-Client",
-    "x-wheelbase-device-id": "X-Wheelbase-Device-Id",
-}
-
-
 def profiles_root() -> Path:
     override = os.environ.get("WHEELBASE_PROFILES_ROOT", "").strip()
     if override:
@@ -485,11 +478,13 @@ def _token_ok(presented: str) -> bool:
 
 
 def _identity_headers(headers: Any) -> list[tuple[str, str]]:
-    return [
-        (key, value)
-        for key, value in headers.items()
-        if key.lower().startswith("x-wheelbase-")
-    ]
+    wheelbase = [(key, value) for key, value in headers.items() if key.lower().startswith("x-wheelbase-")]
+    if any(key.lower() != HEADER_ENVELOPE for key, _value in wheelbase):
+        raise ValueError("independent Wheelbase identity headers are forbidden")
+    envelopes = [("X-Wheelbase-Identity-Envelope", value) for key, value in wheelbase if key.lower() == HEADER_ENVELOPE]
+    if len(envelopes) != 1:
+        raise ValueError("exactly one identity envelope is required")
+    return envelopes
 
 
 def _rest_proxy_headers(headers: Any, child_token: str) -> dict[str, str]:
@@ -499,10 +494,8 @@ def _rest_proxy_headers(headers: Any, child_token: str) -> dict[str, str]:
         if lower in _HOP_REQUEST_HEADERS or lower.startswith("x-wheelbase-"):
             continue
         forwarded[key] = value
-    for key, value in headers.items():
-        lower = key.lower()
-        if lower.startswith("x-wheelbase-"):
-            forwarded[_WHEELBASE_HEADER_CANONICAL.get(lower, key)] = value
+    for key, value in _identity_headers(headers):
+        forwarded[key] = value
     forwarded["X-Hermes-Session-Token"] = child_token
     return forwarded
 
@@ -553,18 +546,13 @@ def build_app(manager: ChildManager) -> FastAPI:
     async def rest_proxy(request: Request, path: str):
         if not _token_ok(request.headers.get("X-Hermes-Session-Token", "")):
             return JSONResponse({"error": "unauthorized"}, status_code=403)
-        user_id = request.headers.get("X-Wheelbase-User-Id", "")
-        if not is_valid_user_id(user_id):
-            return JSONResponse(
-                {"error": "missing or invalid X-Wheelbase-User-Id"},
-                status_code=403,
-            )
-        tenant_id = request.headers.get("X-Wheelbase-Tenant-Id", "")
-        if not is_valid_tenant_id(tenant_id):
-            return JSONResponse(
-                {"error": "missing or invalid X-Wheelbase-Tenant-Id"},
-                status_code=403,
-            )
+        try:
+            identity = identity_from_headers(request.headers)
+        except ValueError:
+            return JSONResponse({"error": "invalid identity envelope"}, status_code=403)
+        if identity is None:
+            return JSONResponse({"error": "identity envelope required"}, status_code=403)
+        user_id, tenant_id = identity.user_id, identity.tenant_id
 
         try:
             query = _sanitized_query(request.url.query, user_id)
@@ -608,14 +596,15 @@ def build_app(manager: ChildManager) -> FastAPI:
         if not _token_ok(ws.query_params.get("token", "")):
             await ws.close(code=4003)
             return
-        user_id = ws.headers.get("x-wheelbase-user-id", "")
-        if not is_valid_user_id(user_id):
+        try:
+            identity = identity_from_headers(ws.headers)
+        except ValueError:
             await ws.close(code=4003)
             return
-        tenant_id = ws.headers.get("x-wheelbase-tenant-id", "")
-        if not is_valid_tenant_id(tenant_id):
+        if identity is None:
             await ws.close(code=4003)
             return
+        user_id, tenant_id = identity.user_id, identity.tenant_id
 
         try:
             child = await asyncio.to_thread(manager.ensure_child, tenant_id, user_id)
@@ -696,6 +685,10 @@ def main(
     *,
     seed_skills: Optional[Callable[[Path], None]] = None,
 ) -> None:
+    try:
+        load_identity_envelope_keys()
+    except ValueError as exc:
+        raise SystemExit(f"identity envelope verification configuration invalid: {exc}") from exc
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s %(message)s",

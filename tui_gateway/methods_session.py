@@ -307,29 +307,69 @@ def _(rid, params: dict) -> dict:
     ident = _transport_identity()
     if ident is None:
         return _err(rid, 4030, "no identity on this connection")
+    cloud_envelope_mode = bool(os.environ.get("AGENT_GATEWAY_IDENTITY_KEYS", "").strip())
+    envelope_identity = None
+    if cloud_envelope_mode:
+        if set(params) != {"identity_envelope"}:
+            return _err(rid, 4031, "signed identity envelope required")
+        try:
+            from tui_gateway.wheelbase_identity import identity_from_headers
+
+            envelope_identity = identity_from_headers(
+                {"X-Wheelbase-Identity-Envelope": str(params["identity_envelope"])}
+            )
+        except ValueError:
+            return _err(rid, 4031, "invalid identity envelope")
+        if envelope_identity is None:
+            return _err(rid, 4031, "signed identity envelope required")
+        params = envelope_identity.__dict__
     jwt = str(params.get("jwt") or "").strip()
     if not jwt:
         return _err(rid, 4031, "jwt required")
-    for field in ("user_id", "tenant_id", "client", "device_id"):
+    transport = current_transport()
+
+    def reject(code: int, message: str) -> dict:
+        if transport is not None:
+            try:
+                transport.close()
+            except Exception:
+                pass
+        logger.warning(
+            "identity.update dropped reason=%s client=%s revision=%s",
+            message,
+            ident.client,
+            ident.credential_revision,
+        )
+        return _err(rid, code, message)
+
+    for field in ("user_id", "tenant_id", "client", "device_id", "session_jti_hash"):
         current_value = str(getattr(ident, field) or "").strip()
         if field in params and str(params.get(field) or "").strip() != current_value:
-            return _err(rid, 4032, f"immutable identity scope mismatch: {field}")
+            return reject(4032, f"immutable identity scope mismatch: {field}")
+    revision = params.get("credential_revision")
+    expires_at = params.get("credential_expires_at")
+    if not isinstance(revision, int) or isinstance(revision, bool) or revision < ident.credential_revision:
+        return reject(4033, "credential revision is stale")
+    if not isinstance(expires_at, int) or isinstance(expires_at, bool) or expires_at <= 0:
+        return reject(4034, "authoritative credential expiry required")
     try:
         from dataclasses import replace
-        from tui_gateway.wheelbase_identity import update_user_jwt, write_credential_file
+        from tui_gateway.wheelbase_identity import write_credential_file
 
-        refreshed = replace(
-            ident,
-            jwt=jwt,
-            # Missing and explicit-empty capability fields both clear stale
-            # short-lived URLs. The broker must renew them on every refresh.
+        refreshed = envelope_identity or replace(
+            ident, jwt=jwt, credential_revision=revision,
+            credential_expires_at=expires_at,
+            credential_source=str(params.get("credential_source") or "agent_session").strip(),
             cdp_url=str(params.get("cdp_url") or "").strip(),
             shell_relay_url=str(params.get("shell_relay_url") or "").strip(),
         )
-        update_user_jwt(ident.user_id, jwt)
-        write_credential_file(Path(get_hermes_home()), refreshed)
+        if revision == ident.credential_revision and (
+            refreshed.jwt != ident.jwt
+            or refreshed.credential_expires_at != ident.credential_expires_at
+        ):
+            return reject(4033, "credential revision did not advance")
+        credential_file = write_credential_file(Path(get_hermes_home()), refreshed)
 
-        transport = current_transport()
         if transport is None:
             return _err(rid, 4030, "no identity transport on this connection")
         # Replace the connection and every session it currently owns under one
@@ -345,7 +385,7 @@ def _(rid, params: dict) -> dict:
 
             active_task_ids = wheelbase_runtime.refresh_connection_tasks(
                 _wheelbase_connection_id(transport),
-                refreshed.__dict__,
+                {**refreshed.__dict__, "credential_path": str(credential_file)},
             )
         from tools.browser_tool import register_task_cdp_url
 
@@ -362,6 +402,7 @@ def _(rid, params: dict) -> dict:
             "desktop_capabilities": bool(
                 refreshed.cdp_url or refreshed.shell_relay_url
             ),
+            "credential_revision": refreshed.credential_revision,
         },
     )
 
