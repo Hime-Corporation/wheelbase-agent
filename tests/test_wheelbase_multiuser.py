@@ -6,8 +6,13 @@ persistence on session rows, and the identity.update credential refresh.
 from __future__ import annotations
 
 import importlib
+import base64
+import hashlib
+import hmac
 import json
 import threading
+import time
+import uuid
 from pathlib import Path
 
 import pytest
@@ -34,6 +39,44 @@ class _FakeTransport:
 
 IDENT_A = WheelbaseIdentity(user_id="user-aaaa", tenant_id="t1", dealership_id="d1", jwt="jwt-a", session_jti_hash="jti-a", credential_revision=1, credential_expires_at=9999999999)
 IDENT_B = WheelbaseIdentity(user_id="user-bbbb", tenant_id="t1", dealership_id="d1", jwt="jwt-b", session_jti_hash="jti-b", credential_revision=1, credential_expires_at=9999999999)
+
+
+def _b64url(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
+
+
+def _signed_identity_envelope(identity: WheelbaseIdentity, key: bytes) -> str:
+    now = int(time.time())
+    header = {"alg": "HS256", "typ": "JWT", "kid": "integration"}
+    payload = {
+        "iss": "wheelbase-api",
+        "aud": "wheelbase-agent-gateway",
+        "kind": "agent_gateway_identity",
+        "ver": 2,
+        "iat": now,
+        "exp": now + 20,
+        "nonce": str(uuid.uuid4()),
+        "bundle": {
+            "user_id": identity.user_id,
+            "tenant_id": identity.tenant_id,
+            "dealership_id": identity.dealership_id,
+            "client": identity.client,
+            "device_id": identity.device_id,
+            "session_jti_hash": identity.session_jti_hash,
+            "credential_revision": identity.credential_revision,
+            "credential_expires_at": identity.credential_expires_at,
+            "access_token": identity.jwt,
+            "cdp_url": identity.cdp_url,
+            "shell_relay_url": identity.shell_relay_url,
+        },
+    }
+    signing = ".".join(
+        (
+            _b64url(json.dumps(header, separators=(",", ":"), sort_keys=True).encode()),
+            _b64url(json.dumps(payload, separators=(",", ":"), sort_keys=True).encode()),
+        )
+    )
+    return f"{signing}.{_b64url(hmac.new(key, signing.encode(), hashlib.sha256).digest())}"
 
 
 @pytest.fixture
@@ -264,6 +307,7 @@ def test_queued_prompt_carries_requesting_device_identity(monkeypatch):
     [
         ("user_id", "other-user"),
         ("tenant_id", "other-tenant"),
+        ("dealership_id", "other-dealership"),
         ("client", "mobile"),
         ("device_id", "device-2"),
     ],
@@ -336,6 +380,159 @@ def test_identity_update_rejected_without_identity(_bound):
         {"id": 1, "method": "identity.update", "params": {"jwt": "x"}}
     )
     assert resp["error"]["code"] == 4030
+
+
+def test_cloud_identity_update_rejects_unsigned_forgery(_bound, monkeypatch):
+    key = b"u" * 32
+    monkeypatch.setenv(
+        "AGENT_GATEWAY_IDENTITY_KEYS",
+        json.dumps({"integration": base64.b64encode(key).decode()}),
+    )
+    original = WheelbaseIdentity(
+        user_id="user-aaaa",
+        tenant_id="tenant-a",
+        dealership_id="dealer-a",
+        client="desktop",
+        device_id=str(uuid.uuid4()),
+        jwt="secret-old-token",
+        session_jti_hash="a" * 64,
+        credential_revision=1,
+        credential_expires_at=9999999999,
+    )
+    transport = _bound(original)
+
+    response = server.handle_request(
+        {
+            "id": "forged-update",
+            "method": "identity.update",
+            "params": {
+                "jwt": "secret-forged-token",
+                "credential_revision": 2,
+                "credential_expires_at": 9999999999,
+            },
+        }
+    )
+
+    assert response["error"]["code"] == 4031
+    assert transport.wheelbase_identity is original
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("user_id", "user-bbbb"),
+        ("tenant_id", "tenant-b"),
+        ("dealership_id", "dealer-b"),
+        ("device_id", str(uuid.uuid4())),
+    ],
+)
+def test_cloud_signed_identity_update_rejects_scope_drift(
+    field, value, tmp_path, _bound, monkeypatch
+):
+    key = b"v" * 32
+    monkeypatch.setenv(
+        "AGENT_GATEWAY_IDENTITY_KEYS",
+        json.dumps({"integration": base64.b64encode(key).decode()}),
+    )
+    monkeypatch.setattr(server, "get_hermes_home", lambda: str(tmp_path))
+    original = WheelbaseIdentity(
+        user_id="user-aaaa",
+        tenant_id="tenant-a",
+        dealership_id="dealer-a",
+        client="desktop",
+        device_id=str(uuid.uuid4()),
+        jwt="secret-old-token",
+        session_jti_hash="b" * 64,
+        credential_revision=1,
+        credential_expires_at=9999999999,
+    )
+    transport = _bound(original)
+    changed = {**original.__dict__, field: value, "jwt": "secret-new-token", "credential_revision": 2}
+    envelope = _signed_identity_envelope(WheelbaseIdentity(**changed), key)
+
+    response = server.handle_request(
+        {
+            "id": "drift-update",
+            "method": "identity.update",
+            "params": {"identity_envelope": envelope},
+        }
+    )
+
+    assert response["error"]["code"] == 4032
+    assert transport.wheelbase_identity is original
+    assert transport.closed is True
+
+
+def test_cloud_signed_refresh_is_independent_per_device(tmp_path, monkeypatch):
+    key = b"w" * 32
+    monkeypatch.setenv(
+        "AGENT_GATEWAY_IDENTITY_KEYS",
+        json.dumps({"integration": base64.b64encode(key).decode()}),
+    )
+    monkeypatch.setattr(server, "get_hermes_home", lambda: str(tmp_path))
+    common = {
+        "user_id": "user-aaaa",
+        "tenant_id": "tenant-a",
+        "dealership_id": "dealer-a",
+        "client": "desktop",
+        "credential_revision": 1,
+        "credential_expires_at": 9999999999,
+    }
+    d1 = WheelbaseIdentity(
+        **common,
+        device_id=str(uuid.uuid4()),
+        jwt="secret-d1-old",
+        session_jti_hash="c" * 64,
+    )
+    d2 = WheelbaseIdentity(
+        **common,
+        device_id=str(uuid.uuid4()),
+        jwt="secret-d2",
+        session_jti_hash="d" * 64,
+    )
+    t1, t2 = _FakeTransport(d1), _FakeTransport(d2)
+    t1._wheelbase_connection_id = "connection-d1"
+    t2._wheelbase_connection_id = "connection-d2"
+    monkeypatch.setattr(
+        server,
+        "_sessions",
+        {
+            "task-d1": {"session_key": "task-d1", "transport": t1, "wheelbase_identity": d1},
+            "task-d2": {"session_key": "task-d2", "transport": t2, "wheelbase_identity": d2},
+        },
+    )
+    runtime_token1 = wb_runtime.set_task_identity(
+        "task-d1", {**d1.__dict__, "_connection_id": "connection-d1"}
+    )
+    runtime_token2 = wb_runtime.set_task_identity(
+        "task-d2", {**d2.__dict__, "_connection_id": "connection-d2"}
+    )
+    transport_token = bind_transport(t1)
+    try:
+        refreshed_d1 = WheelbaseIdentity(
+            **{**d1.__dict__, "jwt": "secret-d1-new", "credential_revision": 2}
+        )
+        response = server.handle_request(
+            {
+                "id": "signed-refresh",
+                "method": "identity.update",
+                "params": {
+                    "identity_envelope": _signed_identity_envelope(refreshed_d1, key)
+                },
+            }
+        )
+
+        assert response["result"]["credential_revision"] == 2
+        assert t1.wheelbase_identity.credential_revision == 2
+        assert t2.wheelbase_identity is d2
+        assert wb_runtime.get_task_identity("task-d1")["credential_revision"] == 2
+        assert wb_runtime.get_task_identity("task-d2")["credential_revision"] == 1
+    finally:
+        reset_transport(transport_token)
+        wb_runtime.reset_identity(runtime_token2)
+        wb_runtime.reset_identity(runtime_token1)
+        wb_runtime.clear_task("task-d1")
+        wb_runtime.clear_task("task-d2")
 
 
 @pytest.mark.parametrize(

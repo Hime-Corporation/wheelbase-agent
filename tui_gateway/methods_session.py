@@ -361,7 +361,14 @@ def _(rid, params: dict) -> dict:
         emit("update_dropped", reason=reason)
         return _err(rid, code, message)
 
-    for field in ("user_id", "tenant_id", "client", "device_id", "session_jti_hash"):
+    for field in (
+        "user_id",
+        "tenant_id",
+        "dealership_id",
+        "client",
+        "device_id",
+        "session_jti_hash",
+    ):
         current_value = str(getattr(ident, field) or "").strip()
         if field in params and str(params.get(field) or "").strip() != current_value:
             return reject(
