@@ -5,8 +5,10 @@ filtered only by the supplied make/statusId/yearRange/offset arguments.
 """
 
 from wheelbase_sdk import WheelbaseClient, WheelbaseAuthError, signed_out_result, ok, err
+from ._auth import auth_result, authenticated_client
 
 
+@auth_result
 def inventory_search(args: dict, **kwargs) -> str:
     query = str(args.get("query") or "").strip()
 
@@ -31,7 +33,7 @@ def inventory_search(args: dict, **kwargs) -> str:
             return err("offset must be a number")
 
     try:
-        client = WheelbaseClient()
+        client = authenticated_client(WheelbaseClient)
     except WheelbaseAuthError:
         return signed_out_result()
     try:

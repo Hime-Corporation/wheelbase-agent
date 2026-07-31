@@ -11,7 +11,7 @@ This is the FROZEN public interface the four Wheelbase plugins build against.
 from __future__ import annotations
 
 import os
-from typing import Any
+from typing import Any, Callable
 
 import httpx
 
@@ -29,11 +29,45 @@ class WheelbaseClient:
         session = load_session()
         if session is None:
             raise WheelbaseAuthError("not signed in")
+        self._session = session
         self._token = session.access_token
         self._supabase_url = (os.environ.get("SUPABASE_URL") or "").rstrip("/")
         self._anon = os.environ.get("SUPABASE_ANON_KEY") or ""
         self._go_origin = (os.environ.get("WHEELBASE_GO_API_ORIGIN") or "").rstrip("/")
         self._http = httpx.Client(transport=transport, timeout=timeout)
+
+    def _reload(self) -> None:
+        session = load_session()
+        if session is None:
+            raise WheelbaseAuthError("not signed in", reason="not_signed_in")
+        self._session = session
+        self._token = session.access_token
+
+    def _send(
+        self,
+        build: Callable[[], httpx.Response],
+        *,
+        method: str,
+        idempotent_rpc: bool = False,
+    ) -> httpx.Response:
+        """Reload credentials before I/O and retry one safe request on rotation."""
+        self._reload()
+        original_revision = self._session.revision
+        response = build()
+        if response.status_code == 401:
+            safe = method.upper() in {"GET", "HEAD"} or idempotent_rpc
+            if safe:
+                replacement = load_session()
+                if replacement is not None and replacement.revision > original_revision:
+                    self._session = replacement
+                    self._token = replacement.access_token
+                    response = build()
+            if response.status_code == 401:
+                raise WheelbaseAuthError("not signed in", reason="not_signed_in")
+        if response.status_code == 403:
+            raise WheelbaseAuthError("forbidden", reason="forbidden")
+        response.raise_for_status()
+        return response
 
     # ── Supabase PostgREST ────────────────────────────────────────────────────
     def _pg_headers(self) -> dict[str, str]:
@@ -45,12 +79,14 @@ class WheelbaseClient:
         }
 
     def postgrest_get(self, table: str, params: dict[str, str]) -> list[dict]:
-        r = self._http.get(
-            f"{self._supabase_url}/rest/v1/{table}",
-            params=params,
-            headers=self._pg_headers(),
+        r = self._send(
+            lambda: self._http.get(
+                f"{self._supabase_url}/rest/v1/{table}",
+                params=params,
+                headers=self._pg_headers(),
+            ),
+            method="GET",
         )
-        r.raise_for_status()
         return r.json()
 
     def postgrest_write(
@@ -61,16 +97,19 @@ class WheelbaseClient:
         body: Any = None,
         params: dict[str, str] | None = None,
         prefer: str = "return=representation",
+        idempotent_rpc: bool = False,
     ) -> Any:
-        headers = {**self._pg_headers(), "Prefer": prefer}
-        r = self._http.request(
-            method,
-            f"{self._supabase_url}/rest/v1/{table}",
-            params=params or {},
-            json=body,
-            headers=headers,
+        r = self._send(
+            lambda: self._http.request(
+                method,
+                f"{self._supabase_url}/rest/v1/{table}",
+                params=params or {},
+                json=body,
+                headers={**self._pg_headers(), "Prefer": prefer},
+            ),
+            method=method,
+            idempotent_rpc=idempotent_rpc,
         )
-        r.raise_for_status()
         return r.json() if r.content else None
 
     def postgrest_get_page(
@@ -93,12 +132,14 @@ class WheelbaseClient:
         """
         merged = {**params, "limit": str(limit), "offset": str(offset)}
         headers = {**self._pg_headers(), "Prefer": "count=exact"}
-        r = self._http.get(
-            f"{self._supabase_url}/rest/v1/{table}",
-            params=merged,
-            headers=headers,
+        r = self._send(
+            lambda: self._http.get(
+                f"{self._supabase_url}/rest/v1/{table}",
+                params=merged,
+                headers={**self._pg_headers(), "Prefer": "count=exact"},
+            ),
+            method="GET",
         )
-        r.raise_for_status()
         rows: list[dict] = r.json()
 
         next_offset: int | None = None
@@ -130,19 +171,22 @@ class WheelbaseClient:
         *,
         body: Any = None,
         params: dict[str, str] | None = None,
+        idempotent_rpc: bool = False,
     ) -> Any:
-        headers = {
-            "Authorization": f"Bearer {self._token}",
-            "Content-Type": "application/json",
-        }
-        r = self._http.request(
-            method,
-            f"{self._go_origin}{path}",
-            params=params or {},
-            json=body,
-            headers=headers,
+        r = self._send(
+            lambda: self._http.request(
+                method,
+                f"{self._go_origin}{path}",
+                params=params or {},
+                json=body,
+                headers={
+                    "Authorization": f"Bearer {self._token}",
+                    "Content-Type": "application/json",
+                },
+            ),
+            method=method,
+            idempotent_rpc=idempotent_rpc,
         )
-        r.raise_for_status()
         return r.json() if r.content else None
 
     def close(self) -> None:

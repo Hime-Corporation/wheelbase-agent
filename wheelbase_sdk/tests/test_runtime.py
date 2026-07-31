@@ -7,6 +7,7 @@ import threading
 import pytest
 
 from wheelbase_sdk import runtime
+from wheelbase_sdk.errors import WheelbaseAuthError
 from wheelbase_sdk.session import load_session
 
 
@@ -15,11 +16,12 @@ from wheelbase_sdk.session import load_session
 # ---------------------------------------------------------------------------
 
 
-def _write_cred(path, token: str, expires_at: int | None = None) -> None:
-    data: dict = {"access_token": token}
+def _write_cred(path, token: str, expires_at: int | None = 9999999999, revision: int = 1) -> None:
+    data: dict = {"access_token": token, "revision": revision, "source": "agent_session"}
     if expires_at is not None:
         data["expires_at"] = expires_at
     path.write_text(json.dumps(data), encoding="utf-8")
+    path.chmod(0o600)
 
 
 # ---------------------------------------------------------------------------
@@ -108,7 +110,7 @@ def test_two_threads_no_cross_bleed(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_missing_credential_file_falls_back_to_legacy(tmp_path, monkeypatch):
+def test_missing_task_credential_fails_closed_even_with_legacy(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     legacy_file = tmp_path / "wheelbase-session.json"
     _write_cred(legacy_file, "fallback-token")
@@ -116,9 +118,37 @@ def test_missing_credential_file_falls_back_to_legacy(tmp_path, monkeypatch):
     # Point to a nonexistent credential file
     runtime.set_task_identity("task-missing", {"credential_path": str(tmp_path / "nonexistent.json")})
 
-    session = load_session()
-    assert session is not None
-    assert session.access_token == "fallback-token"
+    with pytest.raises(WheelbaseAuthError, match="refresh_pending"):
+        load_session()
+
+
+@pytest.mark.parametrize("kind", ["symlink", "wrong_mode", "malformed", "empty", "missing_expiry", "expired", "within_skew"])
+def test_task_credentials_fail_closed(kind, tmp_path, monkeypatch):
+    path = tmp_path / "credential.json"
+    if kind == "symlink":
+        target = tmp_path / "target.json"
+        _write_cred(target, "token")
+        path.symlink_to(target)
+    elif kind == "wrong_mode":
+        _write_cred(path, "token")
+        path.chmod(0o644)
+    elif kind == "malformed":
+        path.write_text("{bad")
+        path.chmod(0o600)
+    elif kind == "empty":
+        _write_cred(path, "")
+        path.chmod(0o600)
+    elif kind == "missing_expiry":
+        path.write_text(json.dumps({"access_token": "token", "revision": 1, "source": "agent_session"}))
+        path.chmod(0o600)
+    else:
+        import wheelbase_sdk.session as session_module
+        monkeypatch.setattr(session_module.time, "time", lambda: 1000)
+        _write_cred(path, "token", 999 if kind == "expired" else 1029)
+        path.chmod(0o600)
+    runtime.set_task_identity("task", {"credential_path": str(path)})
+    with pytest.raises(WheelbaseAuthError):
+        load_session()
 
 
 # ---------------------------------------------------------------------------
@@ -226,3 +256,13 @@ def test_get_task_identity_empty_task_id_returns_none():
 
 def test_get_task_identity_unknown_task_returns_none():
     assert runtime.get_task_identity("never-registered") is None
+
+
+def test_refresh_connection_tasks_updates_only_newer_revision_and_credential_path():
+    runtime.set_task_identity("d1", {"_connection_id": "c1", "tenant_id": "t", "user_id": "u", "client": "desktop", "device_id": "d1", "credential_revision": 1, "credential_path": "/old"})
+    runtime.set_task_identity("d2", {"_connection_id": "c2", "tenant_id": "t", "user_id": "u", "client": "desktop", "device_id": "d2", "credential_revision": 1, "credential_path": "/other"})
+    updated = runtime.refresh_connection_tasks("c1", {"tenant_id": "t", "user_id": "u", "client": "desktop", "device_id": "d1", "credential_revision": 2, "credential_path": "/new", "jwt": "new"})
+    assert updated == ("d1",)
+    assert runtime.get_task_identity("d1")["credential_path"] == "/new"
+    assert runtime.get_task_identity("d1")["credential_revision"] == 2
+    assert runtime.get_task_identity("d2")["credential_path"] == "/other"

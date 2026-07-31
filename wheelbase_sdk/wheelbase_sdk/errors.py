@@ -13,6 +13,13 @@ from typing import Any
 class WheelbaseAuthError(Exception):
     """Raised by WheelbaseClient when there is no signed-in Supabase session."""
 
+    VALID_REASONS = frozenset({"not_signed_in", "expired", "refresh_pending", "forbidden"})
+
+    def __init__(self, message: str = "not signed in", *, reason: str | None = None) -> None:
+        inferred = reason or (message if message in self.VALID_REASONS else "not_signed_in")
+        self.reason = inferred if inferred in self.VALID_REASONS else "not_signed_in"
+        super().__init__(message)
+
 
 def signed_out_result() -> str:
     """Standard tool result when the user isn't signed in to Wheelbase."""

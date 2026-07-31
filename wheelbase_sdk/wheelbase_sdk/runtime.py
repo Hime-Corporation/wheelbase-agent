@@ -126,13 +126,27 @@ def refresh_connection_tasks(
             }
             if current_scope != refreshed_scope:
                 continue
-            current.update(
-                jwt=str(refreshed.get("jwt") or "").strip(),
+            old_revision = current.get("credential_revision", 0)
+            new_revision = refreshed.get("credential_revision", 0)
+            if not isinstance(old_revision, int) or not isinstance(new_revision, int):
+                continue
+            if new_revision < old_revision:
+                continue
+            update = dict(
                 cdp_url=str(refreshed.get("cdp_url") or "").strip(),
                 shell_relay_url=str(
                     refreshed.get("shell_relay_url") or ""
                 ).strip(),
             )
+            if new_revision > old_revision:
+                update.update(
+                    jwt=str(refreshed.get("jwt") or "").strip(),
+                    credential_path=str(refreshed.get("credential_path") or "").strip(),
+                    credential_revision=new_revision,
+                    credential_expires_at=refreshed.get("credential_expires_at"),
+                    credential_source=str(refreshed.get("credential_source") or "").strip(),
+                )
+            current.update(update)
             updated.append(task_id)
     return tuple(updated)
 
