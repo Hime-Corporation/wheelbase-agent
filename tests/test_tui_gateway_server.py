@@ -4865,6 +4865,27 @@ def test_session_resume_missing_uses_neutral_unavailable_error(monkeypatch):
     assert server._sessions == {}
 
 
+def test_session_event_uses_durable_id_from_originating_runtime_session(monkeypatch):
+    frames = []
+    server._sessions["runtime-a"] = {"session_key": "durable-a"}
+    server._sessions["runtime-b"] = {"session_key": "durable-b"}
+    monkeypatch.setattr(server, "write_json", lambda frame: frames.append(frame))
+    try:
+        server._emit("message.complete", "runtime-a", {"session_id": "runtime-a"})
+    finally:
+        server._sessions.pop("runtime-a", None)
+        server._sessions.pop("runtime-b", None)
+
+    params = frames[0]["params"]
+    assert params["session_id"] == "durable-a"
+    assert params["payload"]["session_id"] == "durable-a"
+
+
+def test_unknown_sessionless_event_is_rejected():
+    with pytest.raises(ValueError, match="sessionless event not permitted"):
+        server._emit("message.complete", "", {"content": "late"})
+
+
 def test_ensure_session_db_row_persists_explicit_cwd(monkeypatch, tmp_path):
     """An explicitly chosen workspace is persisted as the session cwd."""
     created = []

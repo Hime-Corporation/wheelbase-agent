@@ -1809,6 +1809,7 @@ def _(rid, params: dict) -> dict:
         # Token up front so each draft can be staged + streamed the moment it
         # lands, instead of the user staring at a blank grid until all N finish.
         token = uuid.uuid4().hex[:12]
+        operation_transport = current_transport() or _stdio_transport
         _pet_cancel_arm(token)
         stage = root / token
         stage.mkdir(parents=True, exist_ok=True)
@@ -1838,7 +1839,9 @@ def _(rid, params: dict) -> dict:
         # Hand the token to the client up front (token-only init event) so a Stop
         # fired before the first draft lands can still target this run.
         try:
-            _emit("pet.generate.progress", "", {"token": token, "count": count})
+            _emit_operation_event(
+                "pet.generate.progress", token, {"count": count}, operation_transport
+            )
         except Exception as exc:  # noqa: BLE001 - streaming is best-effort
             logger.debug("pet.generate init emit failed: %s", exc)
 
@@ -1854,10 +1857,11 @@ def _(rid, params: dict) -> dict:
             # Stream this draft to the client so the grid fills in live. Best-
             # effort: a transport hiccup must not abort the generation itself.
             try:
-                _emit(
+                _emit_operation_event(
                     "pet.generate.progress",
-                    "",
-                    {"token": token, "index": index, "dataUri": data_uri, "count": count},
+                    token,
+                    {"index": index, "dataUri": data_uri, "count": count},
+                    operation_transport,
                 )
             except Exception as exc:  # noqa: BLE001
                 logger.debug("pet.generate progress emit failed: %s", exc)
@@ -1939,6 +1943,7 @@ def _(rid, params: dict) -> dict:
                 return _err(rid, 5031, str(exc))
 
         _pet_cancel_arm(cancel_token)
+        operation_transport = current_transport() or _stdio_transport
         slug = store.unique_slug(name)
 
         def _on_progress(event: str, detail: str) -> None:
@@ -1950,7 +1955,9 @@ def _(rid, params: dict) -> dict:
                 state, done, total = detail.split(":")
                 payload = {"event": "row", "state": state, "done": done, "total": total}
             try:
-                _emit("pet.hatch.progress", "", payload)
+                _emit_operation_event(
+                    "pet.hatch.progress", cancel_token, payload, operation_transport
+                )
             except Exception as exc:  # noqa: BLE001
                 logger.debug("pet.hatch progress emit failed: %s", exc)
 

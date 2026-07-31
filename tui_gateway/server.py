@@ -1492,8 +1492,64 @@ def _event_frame(event: str, sid: str, payload: dict | None = None) -> dict:
     return {"jsonrpc": "2.0", "method": "event", "params": params}
 
 
+_GLOBAL_EVENT_TYPES = frozenset(
+    {
+        "gateway.ready",
+        "skin.changed",
+        "pet.changed",
+        "cron.changed",
+        "sessions.changed",
+        "platforms.changed",
+        "pairing.changed",
+    }
+)
+
+
+def _emit_session_event(event: str, runtime_sid: str, payload: dict | None = None):
+    """Emit a transcript/session mutation with its durable Hermes ID.
+
+    ``runtime_sid`` remains the transport-routing lookup key. Only the durable
+    ``session_key`` is serialized, so a late completion cannot be relabeled by
+    whichever conversation became active afterward.
+    """
+    session = _sessions.get(runtime_sid)
+    if session is None:
+        logger.info("dropping event for closed runtime session type=%s", event)
+        return False
+    durable_id = str(session.get("session_key") or "").strip()
+    if not durable_id:
+        raise ValueError(f"missing durable session id for event {event!r}")
+    outward_payload = dict(payload) if payload is not None else None
+    if outward_payload is not None and "session_id" in outward_payload:
+        outward_payload["session_id"] = durable_id
+    frame = _event_frame(event, durable_id, outward_payload)
+    if (transport := session.get("transport")) is not None:
+        return transport.write(frame)
+    return write_json(frame)
+
+
+def _emit_global_event(event: str, payload: dict | None = None):
+    if event not in _GLOBAL_EVENT_TYPES:
+        raise ValueError(f"sessionless event not permitted: {event}")
+    return write_json(_event_frame(event, "", payload))
+
+
+def _emit_operation_event(
+    event: str, operation_token: str, payload: dict | None, transport: Transport
+):
+    """Emit non-chat progress only to the transport that initiated the RPC."""
+    if not operation_token:
+        raise ValueError("operation token required")
+    outward = dict(payload or {})
+    outward["token"] = operation_token
+    return transport.write(_event_frame(event, "", outward))
+
+
 def _emit(event: str, sid: str, payload: dict | None = None):
-    write_json(_event_frame(event, sid, payload))
+    """Compatibility facade enforcing explicit event provenance."""
+    if sid:
+        return _emit_session_event(event, sid, payload)
+    return _emit_global_event(event, payload)
 
 
 # Live client transports, one per connected WS peer (maintained by tui_gateway.ws).
@@ -1525,11 +1581,14 @@ def _broadcast_global_event(event: str, payload: dict | None = None) -> None:
     the frame. No registered transports (stdio TUI, tests) → plain ``_emit``,
     which that path already tees where it needs to go.
     """
+    if event not in _GLOBAL_EVENT_TYPES:
+        raise ValueError(f"sessionless event not permitted: {event}")
+
     with _live_transports_lock:
         targets = list(_live_transports)
 
     if not targets:
-        _emit(event, "", payload)
+        _emit_global_event(event, payload)
         return
 
     frame = _event_frame(event, "", payload)
