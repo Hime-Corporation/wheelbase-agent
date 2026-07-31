@@ -153,11 +153,32 @@ _cfg_cache: dict | None = None
 _cfg_mtime: float | None = None
 _cfg_path = None
 _session_resume_lock = threading.Lock()
+_GATEWAY_INSTANCE_FINGERPRINT = hashlib.sha256(
+    f"wheelbase-instance-v1\0{os.getpid()}\0{uuid.uuid4().hex}".encode()
+).hexdigest()[:20]
 try:
     _slash_timeout = float(os.environ.get("HERMES_TUI_SLASH_TIMEOUT_S") or "45")
 except (ValueError, TypeError):
     _slash_timeout = 45.0
 _SLASH_WORKER_TIMEOUT_S = max(5.0, _slash_timeout)
+
+
+def _wheelbase_runtime_fingerprints(identity) -> dict[str, Any]:
+    """Return non-secret proof of the serving process and physical profile."""
+    profile_home = Path(get_hermes_home()).resolve(strict=False)
+    expected_tail = (
+        "tenants",
+        str(identity.tenant_id),
+        "profiles",
+        f"wb-{identity.user_id}",
+    )
+    return {
+        "instance_fingerprint": _GATEWAY_INSTANCE_FINGERPRINT,
+        "profile_fingerprint": hashlib.sha256(
+            f"wheelbase-profile-v1\0{profile_home}".encode()
+        ).hexdigest()[:20],
+        "profile_scope_match": tuple(profile_home.parts[-4:]) == expected_tail,
+    }
 
 # When a WebSocket client (the dashboard's embedded-chat tab / desktop app)
 # disconnects, ``tui_gateway.ws`` detaches the transport but intentionally
@@ -7293,7 +7314,11 @@ def _enqueue_prompt(session: dict, text: Any, transport: Any) -> None:
     ):
         prev = existing["text"]
         text = f"{prev}\n\n{text}" if prev and text else (prev or text)
-    session["queued_prompt"] = {"text": text, "transport": transport}
+    session["queued_prompt"] = {
+        "text": text,
+        "transport": transport,
+        "wheelbase_identity": getattr(transport, "wheelbase_identity", None),
+    }
 
 
 def _interrupt_busy_session(sid: str, session: dict, agent: Any) -> None:
@@ -7418,6 +7443,8 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
         session["running"] = True
         if queued.get("transport") is not None:
             session["transport"] = queued["transport"]
+        if queued.get("wheelbase_identity") is not None:
+            session["wheelbase_identity"] = queued["wheelbase_identity"]
     try:
         if _session_uses_compute_host(session):
             resp = _submit_prompt_to_compute_host(rid, sid, session, queued["text"])
@@ -7821,7 +7848,15 @@ def _live_session_payload(
     with session["history_lock"]:
         if cols is not None:
             session["cols"] = cols
-        if transport is not None:
+        # A passive resume/activate may attach another device while the current
+        # owner is still receiving an in-flight turn. Never let that read-only
+        # request steal event delivery. An idle session may hand off normally;
+        # a new prompt also explicitly claims transport when it starts.
+        if transport is not None and (
+            not session.get("running")
+            or session.get("transport") is None
+            or _transport_is_dead(session.get("transport"))
+        ):
             session["transport"] = transport
         if touch:
             session["last_active"] = time.time()

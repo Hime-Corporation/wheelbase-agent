@@ -504,6 +504,7 @@ def _resolve_cdp_override(cdp_url: str) -> str:
 
 _task_cdp_urls: dict[str, str] = {}
 _task_cdp_lock = threading.Lock()
+_task_cdp_registration_lock = threading.Lock()
 
 
 class DesktopUnavailableError(RuntimeError):
@@ -533,12 +534,25 @@ def _desktop_task_cdp_raw(task_id: str) -> str:
 
 def register_task_cdp_url(task_id: str, url: str) -> None:
     """Per-task CDP endpoint for the multi-user cloud gateway. Overrides the
-    process-global BROWSER_CDP_URL/browser.cdp_url for this task only."""
-    with _task_cdp_lock:
-        if url:
-            _task_cdp_urls[task_id] = url
-        else:
-            _task_cdp_urls.pop(task_id, None)
+    process-global BROWSER_CDP_URL/browser.cdp_url for this task only.
+
+    A refreshed capability must not leave an agent-browser session attached to
+    the previous endpoint. Reap that cached session while the old capability is
+    still registered, then publish the replacement for new calls.
+    """
+    normalized = str(url or "").strip()
+    with _task_cdp_registration_lock:
+        with _task_cdp_lock:
+            previous = _task_cdp_urls.get(task_id, "")
+        with _cleanup_lock:
+            has_active_session = task_id in _active_sessions
+        if previous != normalized and has_active_session:
+            _cleanup_single_browser_session(task_id)
+        with _task_cdp_lock:
+            if normalized:
+                _task_cdp_urls[task_id] = normalized
+            else:
+                _task_cdp_urls.pop(task_id, None)
 
 
 def _get_cdp_override_raw(task_id: str = "default") -> str:
@@ -2211,7 +2225,12 @@ def _get_session_info(task_id: Optional[str] = None) -> Dict[str, Any]:
     with _cleanup_lock:
         # Check if we already have a session for this task
         if task_id in _active_sessions:
-            return _active_sessions[task_id]
+            session_info = _active_sessions[task_id]
+            if desktop_required and not session_info.get("cdp_url"):
+                raise DesktopUnavailableError(
+                    "active browser session is not attached to the desktop CDP relay"
+                )
+            return session_info
 
     # Hybrid routing: session keys ending with ``::local`` force a local
     # Chromium regardless of the globally-configured cloud provider.  Public
@@ -2223,10 +2242,16 @@ def _get_session_info(task_id: Optional[str] = None) -> Dict[str, Any]:
     cdp_override = _get_cdp_override(task_id)
     if desktop_required and not cdp_override:
         raise DesktopUnavailableError("desktop CDP relay discovery failed")
+    if desktop_required and force_local:
+        raise DesktopUnavailableError("desktop browser cannot use a local sidecar")
     if cdp_override and not force_local:
         try:
             session_info = _create_cdp_session(task_id, cdp_override)
         except Exception as e:
+            if desktop_required:
+                raise DesktopUnavailableError(
+                    f"desktop CDP session creation failed: {e}"
+                ) from e
             logger.warning(
                 "CDP override session for task %s failed (%s); falling back to "
                 "local Chromium",
@@ -2502,7 +2527,8 @@ def _run_browser_command(
     # Evaluate immutable desktop origin before any local binary/provider gate.
     # A missing or dead relay must not be masked by a Chromium install error or
     # redirected into Browserbase/Browser Use/local browser selection.
-    if _desktop_requires_cdp(task_id or "default"):
+    desktop_required = _desktop_requires_cdp(task_id or "default")
+    if desktop_required:
         raw_desktop_cdp = _desktop_task_cdp_raw(task_id or "default")
         resolved_desktop_cdp = (
             _resolve_cdp_override(raw_desktop_cdp) if raw_desktop_cdp else ""
@@ -2523,6 +2549,10 @@ def _run_browser_command(
         browser_cmd = _find_agent_browser()
     except FileNotFoundError as e:
         logger.warning("agent-browser CLI not found: %s", e)
+        if desktop_required:
+            from wheelbase_sdk.runtime import desktop_unavailable_result
+
+            return desktop_unavailable_result(detail=str(e))
         return {"success": False, "error": str(e)}
 
     if _requires_real_termux_browser_install(browser_cmd):
@@ -2534,7 +2564,8 @@ def _run_browser_command(
     # message instead of hanging for _command_timeout seconds per call.
     # Skip when engine=lightpanda — LP doesn't need Chromium for navigation.
     if (
-        _is_local_mode()
+        not desktop_required
+        and _is_local_mode()
         and not _chromium_installed()
         and _get_browser_engine() != "lightpanda"
         and not _maybe_autoinstall_chromium()
@@ -2799,6 +2830,13 @@ def _run_browser_command(
     except Exception as e:
         logger.warning("browser '%s' exception: %s", command, e, exc_info=True)
         result = {"success": False, "error": str(e)}
+
+    if desktop_required and not result.get("success"):
+        from wheelbase_sdk.runtime import desktop_unavailable_result
+
+        return desktop_unavailable_result(
+            detail=str(result.get("error") or "desktop CDP command failed")
+        )
 
     # --- Lightpanda automatic Chrome fallback ---
     # If engine is lightpanda and the result looks broken, retry with Chrome.

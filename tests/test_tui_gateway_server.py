@@ -2681,16 +2681,8 @@ def test_lazy_child_watch_resume_serves_candidate_inclusive_display(monkeypatch,
     assert texts == ["child prompt", "child substantive answer", "child terse reply"]
 
 
-def test_session_resume_follows_compression_tip(monkeypatch, tmp_path):
-    """Resuming a rotated-out parent id must load the continuation's messages.
-
-    Regression for the desktop "I came back and the reply isn't there" report:
-    auto-compression ends the live session and forks a continuation child, so a
-    resume on the parent id (the desktop's routed id when the chat was opened
-    before it rotated) used to reload the pre-compression transcript and drop
-    the response generated after compression. session.resume must follow the
-    compression tip via resolve_resume_session_id.
-    """
+def test_session_resume_keeps_requested_compression_parent_exact(monkeypatch, tmp_path):
+    """Public resume never silently substitutes a continuation durable ID."""
     from hermes_state import SessionDB
 
     db = SessionDB(db_path=tmp_path / "state.db")
@@ -2737,21 +2729,62 @@ def test_session_resume_follows_compression_tip(monkeypatch, tmp_path):
     )
 
     try:
-        # eager_build: this asserts the synchronously-built agent binds to the
-        # resolved tip (captured["agent_session_id"]); the compression-tip
-        # resolution itself runs before the build and is mode-agnostic.
         resp = server.handle_request(
             {"id": "1", "method": "session.resume", "params": {"session_id": "parent_root", "eager_build": True}}
         )
     finally:
         db.close()
 
-    # The agent must bind to the continuation tip, and the returned transcript
-    # must include the post-compression reply (which lives only in the tip).
-    assert resp["result"]["session_key"] == "cont_tip"
-    assert captured["agent_session_id"] == "cont_tip"
+    assert resp["result"]["session_key"] == "parent_root"
+    assert resp["result"]["resumed"] == "parent_root"
+    assert captured["agent_session_id"] == "parent_root"
     texts = [m.get("text") for m in resp["result"]["messages"]]
-    assert "post-compression reply" in texts
+    assert "pre-compression turn" in texts
+    assert "post-compression reply" not in texts
+
+
+def test_later_resume_does_not_steal_inflight_session_events(monkeypatch):
+    class _Transport:
+        def __init__(self):
+            self.written = []
+
+        def write(self, frame):
+            self.written.append(frame)
+            return True
+
+    class _DB:
+        def get_session(self, session_id):
+            return {"id": session_id}
+
+        def get_messages_as_conversation(self, *_args, **_kwargs):
+            return []
+
+    first = _Transport()
+    later = _Transport()
+    live = _session(session_key="durable-live", transport=first, running=True)
+    monkeypatch.setattr(server, "_sessions", {"durable-live": live})
+    monkeypatch.setattr(server, "_get_db", lambda: _DB())
+
+    token = server.bind_transport(later)
+    try:
+        response = server.handle_request(
+            {"id": "resume", "method": "session.resume", "params": {"session_id": "durable-live"}}
+        )
+        assert response["result"]["session_id"] == "durable-live"
+        server._emit("message.delta", "durable-live", {"text": "still first"})
+        assert len(first.written) == 1
+        assert later.written == []
+
+        live["running"] = False
+        server.handle_request(
+            {"id": "idle-resume", "method": "session.resume", "params": {"session_id": "durable-live"}}
+        )
+        server._emit("message.delta", "durable-live", {"text": "now later"})
+    finally:
+        server.reset_transport(token)
+
+    assert len(first.written) == 1
+    assert len(later.written) == 1
 
 
 def test_session_resume_passes_stored_runtime_to_agent(monkeypatch):
@@ -11722,7 +11755,9 @@ def test_session_activate_returns_inflight_stream_before_completion(monkeypatch)
     monkeypatch.setattr(server, "make_stream_renderer", lambda cols: None)
     monkeypatch.setattr(server, "render_message", lambda raw, cols: None)
     monkeypatch.setattr(server, "_get_db", lambda: None)
-    monkeypatch.setattr(server, "_session_info", lambda agent: {"model": agent.model})
+    monkeypatch.setattr(
+        server, "_session_info", lambda agent, *_args: {"model": agent.model}
+    )
 
     def _emit(event, sid, payload=None):
         if event == "message.complete":
@@ -11785,7 +11820,9 @@ def test_session_activate_returns_prompt_queued_during_busy_turn(monkeypatch):
     that copy without leaking the transport object.
     """
     monkeypatch.setattr(server, "_load_busy_input_mode", lambda: "queue")
-    monkeypatch.setattr(server, "_session_info", lambda agent: {"model": agent.model})
+    monkeypatch.setattr(
+        server, "_session_info", lambda agent, *_args: {"model": agent.model}
+    )
     agent = types.SimpleNamespace(model="model-live")
     session = _session(
         agent=agent,
@@ -11818,7 +11855,9 @@ def test_session_activate_returns_prompt_queued_during_busy_turn(monkeypatch):
 
 
 def test_session_activate_switches_live_session_without_closing_siblings(monkeypatch):
-    monkeypatch.setattr(server, "_session_info", lambda agent: {"model": agent.model})
+    monkeypatch.setattr(
+        server, "_session_info", lambda agent, *_args: {"model": agent.model}
+    )
     server._sessions["sid-a"] = _session(
         agent=types.SimpleNamespace(model="model-a"),
         history=[{"role": "user", "content": "old"}],

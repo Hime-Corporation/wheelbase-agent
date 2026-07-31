@@ -123,11 +123,10 @@ def _(rid, params: dict) -> dict:
         )
     isolation_cfg = _load_dashboard_process_isolation_config()
     turn_isolation = _session_uses_compute_host(session, isolation_cfg)
-    # Re-bind to the current client transport for this request. This keeps
-    # streaming events on the active websocket even if an earlier disconnect
-    # or fallback moved the session transport to stdio.
-    if (t := current_transport()) is not None:
-        session["transport"] = t
+    # Capture the initiating transport, but do not claim event delivery until
+    # this request actually owns a new turn. A second device may submit/resume
+    # while the current turn is running; rebinding here would steal its stream.
+    t = current_transport()
     while True:
         busy_transport = None
         with session["history_lock"]:
@@ -150,6 +149,12 @@ def _(rid, params: dict) -> dict:
         # queue whose drain already ran.
 
     with session["history_lock"]:
+        if t is not None:
+            session["transport"] = t
+        # Future turns always use the initiating connection's freshly-updated
+        # immutable identity/capabilities, never a stale device stored earlier.
+        if (turn_identity := _transport_identity()) is not None:
+            session["wheelbase_identity"] = turn_identity
         # A watch session's run lives in the PARENT turn, so its own running
         # flag is False — without this, typing mid-run builds a second agent
         # racing the in-flight child on the same stored session (interleaved

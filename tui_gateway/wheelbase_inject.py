@@ -17,6 +17,7 @@ Fail-closed rules:
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import posixpath
@@ -30,6 +31,7 @@ logger = logging.getLogger(__name__)
 
 SANDBOX_MOUNT = "/workspace"
 _CONVERSATION_ID_RE = re.compile(r"^[A-Za-z0-9_.-]{1,80}$")
+_SCOPE_COMPONENT_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 
 def contain_workspace_path(raw: str) -> str:
@@ -62,14 +64,24 @@ def _terminal_env() -> str:
     return (os.environ.get("TERMINAL_ENV", "local") or "local").strip().lower()
 
 
-def workspace_volume(user_id: str) -> str:
-    """Stable per-user docker volume name (persistent workspace, spec §8.2)."""
+def _execution_scope_key(tenant_id: str, user_id: str) -> str:
+    """Bounded deterministic external-resource key for one tenant/user pair."""
+    if not _SCOPE_COMPONENT_RE.fullmatch(tenant_id or ""):
+        raise ValueError("execution scope requires a valid tenant_id")
+    if not _SCOPE_COMPONENT_RE.fullmatch(user_id or ""):
+        raise ValueError("execution scope requires a valid user_id")
+    digest = hashlib.sha256(f"{tenant_id}\0{user_id}".encode()).hexdigest()[:16]
+    return f"t-{tenant_id[:12]}-u-{user_id[:12]}-{digest}"
+
+
+def workspace_volume(tenant_id: str, user_id: str) -> str:
+    """Stable tenant/user Docker volume name (persistent workspace)."""
     prefix = os.environ.get("WHEELBASE_WORKSPACE_VOLUME_PREFIX", "wb-ws-")
-    return f"{prefix}{user_id}"
+    return f"{prefix}{_execution_scope_key(tenant_id, user_id)}"
 
 
-def user_sandbox_key(user_id: str) -> str:
-    """Stable per-user sandbox key (daytona/non-volume backends).
+def user_sandbox_key(tenant_id: str, user_id: str) -> str:
+    """Stable tenant/user sandbox key (daytona/non-volume backends).
 
     Returned by ``terminal_tool._resolve_container_task_id`` so every turn for
     one user reuses ONE sandbox (``hermes-<key>``) instead of spawning a fresh
@@ -77,7 +89,7 @@ def user_sandbox_key(user_id: str) -> str:
     preserves the filesystem), not a separate mounted volume as in docker mode.
     """
     prefix = os.environ.get("WHEELBASE_SANDBOX_KEY_PREFIX", "wb-")
-    return f"{prefix}{user_id}"
+    return f"{prefix}{_execution_scope_key(tenant_id, user_id)}"
 
 
 def _require_sandboxed_env(shell_relay_url: str = "") -> str:
@@ -126,8 +138,10 @@ def apply_session_injection(
     """Scope the upcoming turn to *identity*. Returns a cleanup callable the
     turn's finally block MUST invoke (resets the SDK context for thread reuse).
     """
-    if not task_id or identity is None or not identity.user_id:
-        raise ValueError("session injection requires a task_id and an identified user")
+    if not task_id or identity is None or not identity.user_id or not identity.tenant_id:
+        raise ValueError(
+            "session injection requires a task_id and an identified tenant/user"
+        )
 
     terminal_env = _require_sandboxed_env(identity.shell_relay_url or "")
 
@@ -165,16 +179,16 @@ def apply_session_injection(
 
     register_task_cdp_url(task_id, identity.cdp_url or "")
 
-    # 3. Per-user sandbox (spec §7). register_task_env_overrides MERGES, so the
-    #    dashboard's cwd registration earlier in the turn is overridden by ours,
-    #    not lost. The override shape depends on how the backend persists:
-    #      - daytona: persistence IS the sandbox. Pin a stable per-user
-    #        sandbox_key so every turn reuses ONE cloud sandbox
-    #        (hermes-wb-<uid>) rather than spawning a per-turn sandbox; there is
-    #        no separate volume to mount. sandbox_key is an isolation key, so
-    #        _resolve_container_task_id returns it and the env caches per-user.
+    # 3. Per-tenant/user sandbox (spec §7). register_task_env_overrides MERGES,
+    #    so the dashboard's cwd registration earlier in the turn is overridden
+    #    by ours, not lost. The override shape depends on how the backend persists:
+    #      - daytona: persistence IS the sandbox. Pin a stable tenant/user
+    #        sandbox_key so every turn reuses ONE scoped cloud sandbox rather
+    #        than spawning a per-turn sandbox; there is no separate volume to
+    #        mount. sandbox_key is an isolation key, so
+    #        _resolve_container_task_id returns it and the env caches per scope.
     #      - docker (and other volume-mount backends): per-turn container that
-    #        mounts the user's own named volume at /workspace.
+    #        mounts the tenant/user scope's own named volume at /workspace.
     from tools.terminal_tool import register_task_env_overrides
 
     if explicit_cwd:
@@ -185,6 +199,7 @@ def apply_session_injection(
         cwd = SANDBOX_MOUNT
 
     sandbox_env = {
+        "WHEELBASE_TENANT_ID": identity.tenant_id,
         "WHEELBASE_USER_ID": identity.user_id,
         "WHEELBASE_DEALERSHIP_ID": identity.dealership_id,
     }
@@ -193,7 +208,7 @@ def apply_session_injection(
             task_id,
             {
                 "cwd": cwd,
-                "sandbox_key": user_sandbox_key(identity.user_id),
+                "sandbox_key": user_sandbox_key(identity.tenant_id, identity.user_id),
                 "docker_env": sandbox_env,
             },
         )
@@ -202,7 +217,9 @@ def apply_session_injection(
             task_id,
             {
                 "cwd": cwd,
-                "docker_volumes": [f"{workspace_volume(identity.user_id)}:{SANDBOX_MOUNT}"],
+                "docker_volumes": [
+                    f"{workspace_volume(identity.tenant_id, identity.user_id)}:{SANDBOX_MOUNT}"
+                ],
                 "docker_env": sandbox_env,
             },
         )

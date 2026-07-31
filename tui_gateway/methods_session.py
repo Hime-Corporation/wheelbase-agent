@@ -297,7 +297,7 @@ def _(rid, params: dict) -> dict:
 
 @method("identity.update")
 def _(rid, params: dict) -> dict:
-    """Refresh the connection identity's Supabase JWT (cloud gateway only).
+    """Refresh JWT and short-lived relay capabilities (cloud gateway only).
 
     Only the backend chat broker can originate this frame — it strips any
     client-sent identity.update before proxying (defense in depth: even a
@@ -310,14 +310,132 @@ def _(rid, params: dict) -> dict:
     jwt = str(params.get("jwt") or "").strip()
     if not jwt:
         return _err(rid, 4031, "jwt required")
+    for field in ("user_id", "tenant_id", "client", "device_id"):
+        current_value = str(getattr(ident, field) or "").strip()
+        if field in params and str(params.get(field) or "").strip() != current_value:
+            return _err(rid, 4032, f"immutable identity scope mismatch: {field}")
     try:
+        from dataclasses import replace
         from tui_gateway.wheelbase_identity import update_user_jwt, write_credential_file
 
+        refreshed = replace(
+            ident,
+            jwt=jwt,
+            # Missing and explicit-empty capability fields both clear stale
+            # short-lived URLs. The broker must renew them on every refresh.
+            cdp_url=str(params.get("cdp_url") or "").strip(),
+            shell_relay_url=str(params.get("shell_relay_url") or "").strip(),
+        )
         update_user_jwt(ident.user_id, jwt)
-        write_credential_file(Path(get_hermes_home()), ident)
+        write_credential_file(Path(get_hermes_home()), refreshed)
+
+        transport = current_transport()
+        if transport is None:
+            return _err(rid, 4030, "no identity transport on this connection")
+        # Replace the connection and every session it currently owns under one
+        # lifecycle lock. Sessions owned by another device/transport remain
+        # untouched; when this connection starts a future turn it explicitly
+        # installs its refreshed identity in methods_prompt.
+        with _sessions_lock:
+            transport.wheelbase_identity = refreshed
+            for session in _sessions.values():
+                if session.get("transport") is transport:
+                    session["wheelbase_identity"] = refreshed
     except Exception as e:
         return _err(rid, 5040, f"credential refresh failed: {e}")
-    return _ok(rid, {"ok": True})
+    return _ok(
+        rid,
+        {
+            "ok": True,
+            "client": refreshed.client,
+            "device_id": refreshed.device_id or None,
+            "desktop_capabilities": bool(
+                refreshed.cdp_url or refreshed.shell_relay_url
+            ),
+        },
+    )
+
+
+@method("wheelbase.runtime.probe")
+def _(rid, params: dict) -> dict:
+    """Return non-secret child/profile proof and a side-effect-free relay probe.
+
+    The desktop probe is attempted only after both advertised desktop
+    capabilities are absent. It calls the real desktop-routing policy with a
+    spy fallback, so a regression is observed without executing on the desktop,
+    cloud sandbox, or gateway host.
+    """
+    ident = _transport_identity()
+    if ident is None:
+        return _err(rid, 4030, "connection identity required")
+
+    result = _wheelbase_runtime_fingerprints(ident)
+    probe = {
+        "attempted": False,
+        "error_code": "desktop_identity_required",
+        "fallback_invocations": 0,
+    }
+    if ident.client != "desktop":
+        result["desktop_probe"] = probe
+        return _ok(rid, result)
+    if ident.cdp_url or ident.shell_relay_url:
+        probe["error_code"] = "desktop_available"
+        result["desktop_probe"] = probe
+        return _ok(rid, result)
+
+    probe["attempted"] = True
+    task_id = f"wheelbase-runtime-probe-{uuid.uuid4().hex}"
+    wheelbase_runtime = None
+    runtime_token = None
+    try:
+        import importlib
+
+        from wheelbase_sdk import runtime as wheelbase_runtime
+
+        runtime_token = wheelbase_runtime.set_task_identity(
+            task_id,
+            {
+                "user_id": ident.user_id,
+                "tenant_id": ident.tenant_id,
+                "client": ident.client,
+                "device_id": ident.device_id,
+                "cdp_url": "",
+                "shell_relay_url": "",
+            },
+        )
+        fallback_count = 0
+
+        def diagnostic_fallback(_args):
+            nonlocal fallback_count
+            fallback_count += 1
+            return json.dumps({"error_code": "diagnostic_fallback_invoked"})
+
+        plugin = sys.modules.get("hermes_plugins.wheelbase_desktop_exec")
+        if plugin is None:
+            plugin = importlib.import_module("plugins.wheelbase-desktop-exec")
+        raw = plugin.route_or_passthrough(
+            tool_name="terminal",
+            args={"command": ":"},
+            next_call=diagnostic_fallback,
+            task_id=task_id,
+            tool_call_id=uuid.uuid4().hex,
+        )
+        parsed = json.loads(raw) if isinstance(raw, str) else dict(raw or {})
+        probe["error_code"] = str(
+            parsed.get("error_code") or "diagnostic_unexpected_result"
+        )
+        probe["fallback_invocations"] = fallback_count
+    except Exception:
+        logger.exception("wheelbase.runtime.probe failed")
+        probe["error_code"] = "diagnostic_unavailable"
+    finally:
+        if wheelbase_runtime is not None and runtime_token is not None:
+            wheelbase_runtime.reset_identity(runtime_token)
+        if wheelbase_runtime is not None:
+            wheelbase_runtime.clear_task(task_id)
+
+    result["desktop_probe"] = probe
+    return _ok(rid, result)
 
 
 @method("project.facts")
@@ -392,10 +510,7 @@ def _(rid, params: dict) -> dict:
 
     found = db.get_session(target)
     if not found:
-        found = db.get_session_by_title(target)
-        if found:
-            target = found["id"]
-        elif is_truthy_value(params.get("lazy", False)) and _child_run_active(target):
+        if is_truthy_value(params.get("lazy", False)) and _child_run_active(target):
             # Race: a watch window opened on a freshly-spawned subagent. The
             # child relays `subagent.start` (which carries child_session_id and
             # triggers the window) BEFORE its first run_conversation() flushes
@@ -411,32 +526,11 @@ def _(rid, params: dict) -> dict:
         else:
             return _err(rid, 4007, "session unavailable")
 
-    # Follow the compression-continuation chain to the live tip so a resume on
-    # a rotated-out parent id binds to the descendant that actually holds the
-    # post-compression turns. Auto-compression ends the session and forks a
-    # continuation child; without this, resuming the original id (the desktop's
-    # routed id when the chat was opened before it rotated) reloads the parent
-    # transcript and the response generated after compression is missing — the
-    # "I came back and the reply isn't there" bug on large sessions. Resolving
-    # here also re-anchors the fast path below so a still-live rotated session
-    # is reused (by its new key) instead of rebuilding a duplicate agent on the
-    # stale parent. Skipped for lazy watch windows, which intentionally attach
-    # to the exact child branch they were opened on.
-    if found and not is_truthy_value(params.get("lazy", False)):
-        try:
-            tip = db.resolve_resume_session_id(target)
-        except Exception:
-            tip = target
-        if tip and tip != target:
-            target = tip
-            found = db.get_session(target) or found
-
     # Ownership gate (cloud gateway): an identified connection may only
     # resume rows it owns. Legacy rows (NULL user_id) are also denied to
     # identified users. Respond exactly like a missing session so other
-    # users' session ids are not enumerable. Runs AFTER the compression-tip
-    # resolution above so it gates on the FINAL (tip) row's owner — never on
-    # the pre-resolution parent (which could belong to a different user).
+    # users' session ids are not enumerable. The requested durable row is
+    # always checked directly; public resume never substitutes a continuation.
     resume_ident = _transport_identity()
     if resume_ident is not None and (found.get("user_id") or "") != resume_ident.user_id:
         return _err(rid, 4007, "session unavailable")

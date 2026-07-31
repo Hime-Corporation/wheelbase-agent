@@ -1,4 +1,4 @@
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, mock_open, patch
 
 import pytest
 
@@ -238,6 +238,94 @@ class TestGetCdpOverride:
             provider.create_session.assert_not_called()
         finally:
             runtime.clear_task("desktop-task")
+
+    def test_desktop_cdp_creation_error_never_calls_local_fallback(self, monkeypatch):
+        import tools.browser_tool as browser_tool
+        from wheelbase_sdk import runtime
+
+        task_id = "desktop-create-failure"
+        runtime.set_task_identity(task_id, {"client": "desktop", "device_id": "d1"})
+        browser_tool.register_task_cdp_url(task_id, WS_URL)
+        local = Mock()
+        monkeypatch.setattr(browser_tool, "_active_sessions", {})
+        monkeypatch.setattr(browser_tool, "_start_browser_cleanup_thread", lambda: None)
+        monkeypatch.setattr(browser_tool, "_update_session_activity", lambda _task: None)
+        monkeypatch.setattr(browser_tool, "_get_cdp_override", lambda _task: WS_URL)
+        monkeypatch.setattr(
+            browser_tool, "_create_cdp_session", Mock(side_effect=RuntimeError("relay gone"))
+        )
+        monkeypatch.setattr(browser_tool, "_create_local_session", local)
+        try:
+            with pytest.raises(browser_tool.DesktopUnavailableError) as exc:
+                browser_tool._get_session_info(task_id)
+            assert exc.value.code == "desktop_unavailable"
+            local.assert_not_called()
+        finally:
+            browser_tool.register_task_cdp_url(task_id, "")
+            runtime.clear_task(task_id)
+
+    def test_desktop_command_failure_never_calls_lightpanda_chrome_fallback(
+        self, monkeypatch, tmp_path
+    ):
+        import tools.browser_tool as browser_tool
+        from wheelbase_sdk import runtime
+
+        task_id = "desktop-command-failure"
+        runtime.set_task_identity(task_id, {"client": "desktop", "device_id": "d1"})
+        browser_tool.register_task_cdp_url(task_id, WS_URL)
+        chrome_fallback = Mock(return_value={"success": True})
+        proc = MagicMock(returncode=1)
+        proc.wait.return_value = None
+        monkeypatch.setattr(browser_tool, "_resolve_cdp_override", lambda _url: WS_URL)
+        monkeypatch.setattr(browser_tool, "_find_agent_browser", lambda: "/usr/bin/agent-browser")
+        monkeypatch.setattr(browser_tool, "_is_local_mode", lambda: False)
+        monkeypatch.setattr(browser_tool, "_chromium_installed", lambda: True)
+        monkeypatch.setattr(
+            browser_tool,
+            "_get_session_info",
+            lambda _task: {"session_name": "desktop", "cdp_url": WS_URL},
+        )
+        monkeypatch.setattr(browser_tool, "_get_browser_engine", lambda: "lightpanda")
+        monkeypatch.setattr(browser_tool, "_is_camofox_mode", lambda: False)
+        monkeypatch.setattr(browser_tool, "_socket_safe_tmpdir", lambda: str(tmp_path))
+        monkeypatch.setattr(browser_tool, "_run_chrome_fallback_command", chrome_fallback)
+        try:
+            with patch("subprocess.Popen", return_value=proc), patch(
+                "os.open", return_value=99
+            ), patch("os.close"), patch("os.unlink"), patch(
+                "builtins.open", mock_open(read_data="relay command failed")
+            ), patch("tools.interrupt.is_interrupted", return_value=False), patch(
+                "tools.browser_tool._write_owner_pid"
+            ):
+                result = browser_tool._run_browser_command(task_id, "snapshot", [])
+            assert result["error_code"] == "desktop_unavailable"
+            chrome_fallback.assert_not_called()
+        finally:
+            browser_tool.register_task_cdp_url(task_id, "")
+            runtime.clear_task(task_id)
+
+    def test_refreshing_cdp_capability_reaps_cached_session(self, monkeypatch):
+        import tools.browser_tool as browser_tool
+
+        task_id = "desktop-capability-refresh"
+        cleanup = Mock(
+            side_effect=lambda stale_task: browser_tool._active_sessions.pop(
+                stale_task, None
+            )
+        )
+        monkeypatch.setattr(browser_tool, "_active_sessions", {})
+        browser_tool.register_task_cdp_url(task_id, "wss://relay/old")
+        browser_tool._active_sessions[task_id] = {
+            "session_name": "stale",
+            "cdp_url": "wss://relay/old",
+        }
+        monkeypatch.setattr(browser_tool, "_cleanup_single_browser_session", cleanup)
+        try:
+            browser_tool.register_task_cdp_url(task_id, "wss://relay/new")
+            cleanup.assert_called_once_with(task_id)
+            assert browser_tool._desktop_task_cdp_raw(task_id) == "wss://relay/new"
+        finally:
+            browser_tool.register_task_cdp_url(task_id, "")
 
     def test_prefers_env_var_over_config(self, monkeypatch):
         import tools.browser_tool as browser_tool

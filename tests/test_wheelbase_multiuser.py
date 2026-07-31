@@ -6,6 +6,7 @@ persistence on session rows, and the identity.update credential refresh.
 from __future__ import annotations
 
 import json
+import threading
 from pathlib import Path
 
 import pytest
@@ -72,6 +73,7 @@ def test_list_sessions_rich_filters_by_user(db):
 
 def test_session_list_handler_scopes_to_identity(db, _bound, monkeypatch):
     monkeypatch.setattr(server, "_get_db", lambda: db)
+    monkeypatch.setattr(server, "_profile_is_launch_home", lambda _profile: True)
     db.create_session("s-a", source="tui", user_id=IDENT_A.user_id)
     db.create_session("s-b", source="tui", user_id=IDENT_B.user_id)
 
@@ -102,8 +104,8 @@ def test_resume_denies_foreign_and_legacy_rows(db, _bound, monkeypatch):
         resp = server.handle_request(
             {"id": 1, "method": "session.resume", "params": {"session_id": target}}
         )
-        assert resp["error"]["code"] == 4007, f"resume of {target} must look like 'not found'"
-        assert "not found" in resp["error"]["message"]
+        assert resp["error"]["code"] == 4007
+        assert resp["error"]["message"] == "session unavailable"
 
 
 def test_ensure_session_db_row_persists_user_id(db, monkeypatch):
@@ -136,12 +138,195 @@ def test_identity_update_rewrites_credential_file(tmp_path, _bound, monkeypatch)
     assert data["access_token"] == "jwt-rotated"
 
 
+def test_identity_update_atomically_refreshes_capabilities_without_scope_mutation(
+    tmp_path, _bound, monkeypatch
+):
+    old = WheelbaseIdentity(
+        user_id="user-aaaa",
+        tenant_id="t1",
+        client="desktop",
+        device_id="device-1",
+        jwt="jwt-old",
+        cdp_url="https://old-cdp",
+        shell_relay_url="wss://old-shell",
+    )
+    transport = _bound(old)
+    session = {
+        "session_key": "session-a",
+        "transport": transport,
+        "wheelbase_identity": old,
+    }
+    monkeypatch.setattr(server, "_sessions", {"session-a": session})
+    monkeypatch.setattr(server, "get_hermes_home", lambda: str(tmp_path))
+
+    response = server.handle_request(
+        {
+            "id": 1,
+            "method": "identity.update",
+            "params": {
+                "jwt": "jwt-new",
+                "user_id": old.user_id,
+                "tenant_id": old.tenant_id,
+                "client": old.client,
+                "device_id": old.device_id,
+                "cdp_url": "https://new-cdp",
+                "shell_relay_url": "wss://new-shell",
+            },
+        }
+    )
+
+    assert response["result"]["ok"] is True
+    assert transport.wheelbase_identity.cdp_url == "https://new-cdp"
+    assert transport.wheelbase_identity.shell_relay_url == "wss://new-shell"
+    assert session["wheelbase_identity"] is transport.wheelbase_identity
+    assert session["wheelbase_identity"].tenant_id == old.tenant_id
+    assert session["wheelbase_identity"].user_id == old.user_id
+
+    cleared = server.handle_request(
+        {
+            "id": 2,
+            "method": "identity.update",
+            "params": {"jwt": "jwt-newer", "client": old.client, "device_id": old.device_id},
+        }
+    )
+    assert cleared["result"]["ok"] is True
+    assert transport.wheelbase_identity.cdp_url == ""
+    assert transport.wheelbase_identity.shell_relay_url == ""
+
+
+def test_queued_prompt_carries_requesting_device_identity(monkeypatch):
+    old = WheelbaseIdentity(
+        user_id="user-aaaa",
+        tenant_id="t1",
+        client="desktop",
+        device_id="device-1",
+        cdp_url="https://old-cdp",
+    )
+    refreshed = WheelbaseIdentity(
+        user_id="user-aaaa",
+        tenant_id="t1",
+        client="desktop",
+        device_id="device-2",
+        cdp_url="https://fresh-cdp",
+    )
+    old_transport = _FakeTransport(old)
+    requesting_transport = _FakeTransport(refreshed)
+    session = {
+        "history_lock": threading.Lock(),
+        "running": False,
+        "transport": old_transport,
+        "wheelbase_identity": old,
+    }
+    observed = {}
+
+    def run_queued(_rid, _sid, queued_session, text):
+        observed["identity"] = queued_session["wheelbase_identity"]
+        observed["text"] = text
+
+    monkeypatch.setattr(server, "_run_prompt_submit", run_queued)
+    server._enqueue_prompt(session, "next turn", requesting_transport)
+
+    assert server._drain_queued_prompt("rid", "sid", session) is True
+    assert session["transport"] is requesting_transport
+    assert observed == {"identity": refreshed, "text": "next turn"}
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("user_id", "other-user"),
+        ("tenant_id", "other-tenant"),
+        ("client", "mobile"),
+        ("device_id", "device-2"),
+    ],
+)
+def test_identity_update_rejects_immutable_scope_changes(field, value, _bound):
+    original = WheelbaseIdentity(
+        user_id="user-aaaa", tenant_id="t1", client="desktop", device_id="device-1"
+    )
+    transport = _bound(original)
+    response = server.handle_request(
+        {"id": 1, "method": "identity.update", "params": {"jwt": "new", field: value}}
+    )
+    assert response["error"]["code"] == 4032
+    assert transport.wheelbase_identity is original
+
+
 def test_identity_update_rejected_without_identity(_bound):
     _bound(None)
     resp = server.handle_request(
         {"id": 1, "method": "identity.update", "params": {"jwt": "x"}}
     )
     assert resp["error"]["code"] == 4030
+
+
+@pytest.mark.parametrize(
+    "identity,attempted,error_code",
+    [
+        (
+            WheelbaseIdentity(
+                user_id="user-aaaa",
+                tenant_id="t1",
+                client="desktop",
+                device_id="device-1",
+            ),
+            True,
+            "desktop_unavailable",
+        ),
+        (
+            WheelbaseIdentity(
+                user_id="user-aaaa",
+                tenant_id="t1",
+                client="desktop",
+                device_id="device-1",
+                cdp_url="wss://cdp/online",
+                shell_relay_url="wss://shell/online",
+            ),
+            False,
+            "desktop_available",
+        ),
+        (
+            WheelbaseIdentity(
+                user_id="user-aaaa",
+                tenant_id="t1",
+                client="mobile",
+            ),
+            False,
+            "desktop_identity_required",
+        ),
+    ],
+)
+def test_runtime_probe_returns_safe_profile_and_fail_closed_evidence(
+    identity, attempted, error_code, tmp_path, _bound, monkeypatch
+):
+    profile_home = tmp_path / "tenants" / identity.tenant_id / "profiles" / f"wb-{identity.user_id}"
+    monkeypatch.setattr(server, "get_hermes_home", lambda: profile_home)
+    _bound(identity)
+
+    response = server.handle_request(
+        {"id": "probe", "method": "wheelbase.runtime.probe", "params": {}}
+    )
+
+    result = response["result"]
+    assert set(result) == {
+        "instance_fingerprint",
+        "profile_fingerprint",
+        "profile_scope_match",
+        "desktop_probe",
+    }
+    assert result["profile_scope_match"] is True
+    assert len(result["instance_fingerprint"]) == 20
+    assert len(result["profile_fingerprint"]) == 20
+    assert set(result["desktop_probe"]) == {
+        "attempted",
+        "error_code",
+        "fallback_invocations",
+    }
+    assert result["desktop_probe"] == {
+        "attempted": attempted,
+        "error_code": error_code,
+        "fallback_invocations": 0,
+    }
 
 
 def test_prompt_background_fail_closed_on_injection_error(monkeypatch):

@@ -7,6 +7,7 @@ other's.
 from __future__ import annotations
 
 import json
+import re
 
 import pytest
 
@@ -15,6 +16,7 @@ from tui_gateway.wheelbase_identity import WheelbaseIdentity, update_user_jwt
 from tui_gateway.wheelbase_inject import (
     apply_session_injection,
     contain_workspace_path,
+    user_sandbox_key,
     workspace_volume,
 )
 from wheelbase_sdk import runtime as wb_runtime
@@ -35,11 +37,18 @@ def _sandboxed_env(monkeypatch):
     # Resolver normally fetches /json/version; identity-resolve for tests.
     monkeypatch.setattr(browser_tool, "_resolve_cdp_override", lambda u: u)
     yield
-    for t in ("task-a", "task-b"):
+    for t in (
+        "task-a",
+        "task-b",
+        "task-origin",
+        "tenant-a-task",
+        "tenant-b-task",
+        "tenant-a-daytona",
+        "tenant-b-daytona",
+    ):
         browser_tool.register_task_cdp_url(t, "")
         terminal_tool._task_env_overrides.pop(t, None)
-    wb_runtime.clear_task("task-a")
-    wb_runtime.clear_task("task-b")
+        wb_runtime.clear_task(t)
     wb_runtime._current.set(None)
 
 
@@ -54,9 +63,18 @@ def test_two_users_no_cross_bleed(tmp_path):
     # Sandbox: each task mounts only its own user volume.
     vols_a = terminal_tool._task_env_overrides["task-a"]["docker_volumes"]
     vols_b = terminal_tool._task_env_overrides["task-b"]["docker_volumes"]
-    assert vols_a == [f"{workspace_volume(IDENT_A.user_id)}:/workspace"]
-    assert vols_b == [f"{workspace_volume(IDENT_B.user_id)}:/workspace"]
-    assert terminal_tool._task_env_overrides["task-a"]["docker_env"]["WHEELBASE_USER_ID"] == IDENT_A.user_id
+    assert vols_a == [
+        f"{workspace_volume(IDENT_A.tenant_id, IDENT_A.user_id)}:/workspace"
+    ]
+    assert vols_b == [
+        f"{workspace_volume(IDENT_B.tenant_id, IDENT_B.user_id)}:/workspace"
+    ]
+    assert (
+        terminal_tool._task_env_overrides["task-a"]["docker_env"][
+            "WHEELBASE_USER_ID"
+        ]
+        == IDENT_A.user_id
+    )
 
     # Credentials: distinct files, distinct tokens.
     cred_a = json.loads((tmp_path / "wheelbase-sessions" / "user-aaaa.json").read_text())
@@ -66,6 +84,37 @@ def test_two_users_no_cross_bleed(tmp_path):
 
     cleanup_a()
     cleanup_b()
+
+
+def test_same_user_in_two_tenants_gets_distinct_external_resources(tmp_path, monkeypatch):
+    same_user_a = WheelbaseIdentity(user_id="shared-user", tenant_id="tenant-a")
+    same_user_b = WheelbaseIdentity(user_id="shared-user", tenant_id="tenant-b")
+
+    apply_session_injection("tenant-a-task", same_user_a, tmp_path)()
+    apply_session_injection("tenant-b-task", same_user_b, tmp_path)()
+    vol_a = terminal_tool._task_env_overrides["tenant-a-task"]["docker_volumes"]
+    vol_b = terminal_tool._task_env_overrides["tenant-b-task"]["docker_volumes"]
+    assert vol_a != vol_b
+
+    monkeypatch.setenv("TERMINAL_ENV", "daytona")
+    apply_session_injection("tenant-a-daytona", same_user_a, tmp_path)()
+    apply_session_injection("tenant-b-daytona", same_user_b, tmp_path)()
+    key_a = terminal_tool._task_env_overrides["tenant-a-daytona"]["sandbox_key"]
+    key_b = terminal_tool._task_env_overrides["tenant-b-daytona"]["sandbox_key"]
+    assert key_a != key_b
+
+
+def test_external_resource_keys_are_deterministic_bounded_and_safe(monkeypatch):
+    monkeypatch.delenv("WHEELBASE_WORKSPACE_VOLUME_PREFIX", raising=False)
+    monkeypatch.delenv("WHEELBASE_SANDBOX_KEY_PREFIX", raising=False)
+    tenant_id = "t" * 64
+    user_id = "u" * 64
+
+    for key_factory in (workspace_volume, user_sandbox_key):
+        first = key_factory(tenant_id, user_id)
+        assert first == key_factory(tenant_id, user_id)
+        assert len(first) <= 64
+        assert re.fullmatch(r"[A-Za-z0-9_-]+", first)
 
 
 def test_sdk_context_set_and_reset(tmp_path):
@@ -81,6 +130,7 @@ def test_sdk_context_set_and_reset(tmp_path):
 def test_sdk_context_carries_immutable_client_device_origin(tmp_path):
     identity = WheelbaseIdentity(
         user_id="desktop-user",
+        tenant_id="desktop-tenant",
         client="desktop",
         device_id="550e8400-e29b-41d4-a716-446655440000",
     )
@@ -116,15 +166,23 @@ def test_daytona_mode_per_user_sandbox(tmp_path, monkeypatch):
 
     ov_a = terminal_tool._task_env_overrides["task-a"]
     ov_b = terminal_tool._task_env_overrides["task-b"]
-    assert ov_a["sandbox_key"] == user_sandbox_key(IDENT_A.user_id)
-    assert ov_b["sandbox_key"] == user_sandbox_key(IDENT_B.user_id)
+    assert ov_a["sandbox_key"] == user_sandbox_key(
+        IDENT_A.tenant_id, IDENT_A.user_id
+    )
+    assert ov_b["sandbox_key"] == user_sandbox_key(
+        IDENT_B.tenant_id, IDENT_B.user_id
+    )
     assert ov_a["sandbox_key"] != ov_b["sandbox_key"]
     # Daytona persists via the sandbox itself — no bind-mounted volume.
     assert "docker_volumes" not in ov_a and "docker_volumes" not in ov_b
 
     # Every turn for a user collapses to that user's own sandbox, never shared.
-    assert terminal_tool._resolve_container_task_id("task-a") == user_sandbox_key(IDENT_A.user_id)
-    assert terminal_tool._resolve_container_task_id("task-b") == user_sandbox_key(IDENT_B.user_id)
+    assert terminal_tool._resolve_container_task_id("task-a") == user_sandbox_key(
+        IDENT_A.tenant_id, IDENT_A.user_id
+    )
+    assert terminal_tool._resolve_container_task_id("task-b") == user_sandbox_key(
+        IDENT_B.tenant_id, IDENT_B.user_id
+    )
 
 
 def test_conversation_cwd_docker(tmp_path):
@@ -133,7 +191,9 @@ def test_conversation_cwd_docker(tmp_path):
     )()
     overrides = terminal_tool._task_env_overrides["task-a"]
     assert overrides["cwd"] == "/workspace/conversations/20260612_101500_ab12cd"
-    assert overrides["docker_volumes"] == [f"{workspace_volume(IDENT_A.user_id)}:/workspace"]
+    assert overrides["docker_volumes"] == [
+        f"{workspace_volume(IDENT_A.tenant_id, IDENT_A.user_id)}:/workspace"
+    ]
 
 
 def test_conversation_cwd_daytona(tmp_path, monkeypatch):
@@ -141,7 +201,7 @@ def test_conversation_cwd_daytona(tmp_path, monkeypatch):
     apply_session_injection("task-a", IDENT_A, tmp_path, conversation_id="sess-1")()
     overrides = terminal_tool._task_env_overrides["task-a"]
     assert overrides["cwd"] == "/workspace/conversations/sess-1"
-    assert overrides["sandbox_key"].endswith(IDENT_A.user_id)
+    assert overrides["sandbox_key"] == user_sandbox_key(IDENT_A.tenant_id, IDENT_A.user_id)
 
 
 def test_no_conversation_id_falls_back_to_workspace_root(tmp_path):
@@ -224,7 +284,7 @@ def test_jwt_refresh_only_touches_own_user(tmp_path):
 
 def test_missing_cdp_url_clears_registration(tmp_path):
     apply_session_injection("task-a", IDENT_A, tmp_path)()
-    no_browser = WheelbaseIdentity(user_id="user-aaaa", jwt="jwt-a", cdp_url="")
+    no_browser = WheelbaseIdentity(user_id="user-aaaa", tenant_id="t1", jwt="jwt-a", cdp_url="")
     apply_session_injection("task-a", no_browser, tmp_path)()
     # Falls back to env/config path (empty in tests -> empty string).
     assert browser_tool._get_cdp_override("task-a") != IDENT_A.cdp_url
@@ -242,7 +302,7 @@ def test_shell_relay_url_registered_for_task(tmp_path, monkeypatch):
     from tui_gateway.wheelbase_identity import WheelbaseIdentity
     from wheelbase_sdk import runtime as wb_runtime
 
-    identity = WheelbaseIdentity(user_id="u1", shell_relay_url="wss://relay/u1")
+    identity = WheelbaseIdentity(user_id="u1", tenant_id="t1", shell_relay_url="wss://relay/u1")
     cleanup = apply_session_injection("task-9", identity, tmp_path)
     try:
         ident = wb_runtime.get_task_identity("task-9")
@@ -265,7 +325,11 @@ def test_shell_relay_url_registered_for_task(tmp_path, monkeypatch):
 def test_desktop_relay_bypasses_sandbox_requirement(tmp_path, monkeypatch):
     monkeypatch.setenv("TERMINAL_ENV", "local")
     monkeypatch.delenv("WHEELBASE_ALLOW_UNSANDBOXED", raising=False)
-    identity = WheelbaseIdentity(user_id="u-desktop", shell_relay_url="wss://relay/u-desktop")
+    identity = WheelbaseIdentity(
+        user_id="u-desktop",
+        tenant_id="t1",
+        shell_relay_url="wss://relay/u-desktop",
+    )
     apply_session_injection("task-desktop", identity, tmp_path)()
 
 
@@ -273,7 +337,11 @@ def test_desktop_relay_with_already_sandboxed_env_still_works(tmp_path, monkeypa
     """A relay-available session on an ALSO-sandboxed gateway must not
     double-require anything extra — same as any other sandboxed session."""
     monkeypatch.setenv("TERMINAL_ENV", "daytona")
-    identity = WheelbaseIdentity(user_id="u-desktop", shell_relay_url="wss://relay/u-desktop")
+    identity = WheelbaseIdentity(
+        user_id="u-desktop",
+        tenant_id="t1",
+        shell_relay_url="wss://relay/u-desktop",
+    )
     apply_session_injection("task-desktop", identity, tmp_path)()
 
 
@@ -281,7 +349,7 @@ def test_mobile_no_relay_url_still_refused_on_local(tmp_path, monkeypatch):
     """No shell_relay_url (mobile/offline) -> unchanged from today: refused."""
     monkeypatch.setenv("TERMINAL_ENV", "local")
     monkeypatch.delenv("WHEELBASE_ALLOW_UNSANDBOXED", raising=False)
-    identity = WheelbaseIdentity(user_id="u-mobile", shell_relay_url="")
+    identity = WheelbaseIdentity(user_id="u-mobile", tenant_id="t1", shell_relay_url="")
     with pytest.raises(RuntimeError, match="TERMINAL_ENV"):
         apply_session_injection("task-mobile", identity, tmp_path)
 
@@ -290,7 +358,7 @@ def test_mobile_still_requires_sandboxed_env_regardless_of_desktop_bypass(tmp_pa
     """Mobile keeps requiring a real sandboxed backend (daytona in practice) —
     confirms the desktop bypass is additive, not a general relaxation."""
     monkeypatch.setenv("TERMINAL_ENV", "daytona")
-    identity = WheelbaseIdentity(user_id="u-mobile", shell_relay_url="")
+    identity = WheelbaseIdentity(user_id="u-mobile", tenant_id="t1", shell_relay_url="")
     apply_session_injection("task-mobile", identity, tmp_path)()
 
 
@@ -299,5 +367,5 @@ def test_allow_unsandboxed_escape_hatch_unaffected_by_relay_change(tmp_path, mon
     for a session with NO relay url."""
     monkeypatch.setenv("TERMINAL_ENV", "local")
     monkeypatch.setenv("WHEELBASE_ALLOW_UNSANDBOXED", "1")
-    identity = WheelbaseIdentity(user_id="u-dev", shell_relay_url="")
+    identity = WheelbaseIdentity(user_id="u-dev", tenant_id="t1", shell_relay_url="")
     apply_session_injection("task-dev", identity, tmp_path)()

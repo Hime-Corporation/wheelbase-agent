@@ -3,8 +3,9 @@
 Standalone Hermes plugin (spec §5.1). Registers a ``tool_execution`` middleware
 that, for a desktop user who is online (identity carries shell_relay_url), runs
 the built-in per-tool safety chain (spec §5.5) then relays the operation to the
-user's machine. Mobile/offline users (no relay url) and any ambiguous identity
-fall back to the sandboxed cloud path via next_call. Zero upstream-core edits.
+user's machine. Mobile-origin users (no relay URL) use the sandboxed cloud
+path; desktop-origin users with a missing/dead relay fail closed. Zero
+upstream-core edits.
 
 All 7 built-in tools route to the desktop when a relay url is present:
   * terminal/process        → ``_relay_command`` (bash `exec` frame).
@@ -132,8 +133,8 @@ def route_or_passthrough(
     if block is not None:
         return block
 
-    # 5. Relay. Pre-dispatch failure → next_call (cloud fallback). Post-dispatch
-    #    failure → tool error, NEVER re-dispatch (spec §5.1 M4).
+    # 5. Relay. Every relay failure returns stable desktop_unavailable. A
+    #    desktop-origin operation is never replayed through next_call.
     return _relay(tool_name, args, relay_url, identity, next_call,
                   task_id=task_id, session_id=session_id, tool_call_id=tool_call_id,
                   turn_id=turn_id, api_request_id=api_request_id)

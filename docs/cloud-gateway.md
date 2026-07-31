@@ -236,6 +236,120 @@ wscat \
 
 Missing or bad token/identity should close with 4003.
 
+### Authenticated child and relay-loss proof
+
+The backend exposes the current relay advertisement for an agent-session token:
+
+```http
+GET /v1/agent/relay-status?session=<agent-session-token>
+```
+
+A valid request returns HTTP 200 with `Cache-Control: no-store`. Desktop JSON
+has exactly this public shape:
+
+```json
+{
+  "client": "desktop",
+  "device_id": "<UUID>",
+  "cdp_relay_available": true,
+  "shell_relay_available": true
+}
+```
+
+Mobile JSON omits `device_id` and reports both desktop capabilities as false:
+
+```json
+{
+  "client": "mobile",
+  "cdp_relay_available": false,
+  "shell_relay_available": false
+}
+```
+
+An invalid, bad, or unregistered session token returns HTTP 401. Hub loss is
+represented directly by the corresponding availability boolean becoming false;
+there is no separate loss code. On its next 30-second poll, the chat broker
+refreshes the already-authenticated agent WebSocket with these exact JSON-RPC
+notifications:
+
+```json
+{
+  "method": "identity.update",
+  "params": {
+    "jwt": "<redacted>",
+    "client": "desktop",
+    "device_id": "<UUID>",
+    "cdp_url": "",
+    "shell_relay_url": ""
+  }
+}
+```
+
+```json
+{
+  "method": "identity.update",
+  "params": {
+    "jwt": "<redacted>",
+    "client": "mobile"
+  }
+}
+```
+
+Missing or empty capability fields clear prior capabilities. Tenant, user,
+client, and device scope are immutable on the connection.
+
+Use `wheelbase.runtime.probe` over that authenticated agent WebSocket to prove
+which physical child/profile served the request and, after loss, that a harmless
+desktop-required path fails closed. The method takes no parameters and does not
+require a live Hermes chat session:
+
+```json
+{"id":"runtime-proof","method":"wheelbase.runtime.probe","params":{}}
+```
+
+While either desktop capability is still advertised, the response is:
+
+```json
+{
+  "id": "runtime-proof",
+  "result": {
+    "instance_fingerprint": "<20 lowercase hex characters>",
+    "profile_fingerprint": "<20 lowercase hex characters>",
+    "profile_scope_match": true,
+    "desktop_probe": {
+      "attempted": false,
+      "error_code": "desktop_available",
+      "fallback_invocations": 0
+    }
+  }
+}
+```
+
+After relay status is false and the empty capability refresh has arrived, the
+same request must return the same fingerprints with:
+
+```json
+{
+  "desktop_probe": {
+    "attempted": true,
+    "error_code": "desktop_unavailable",
+    "fallback_invocations": 0
+  }
+}
+```
+
+The probe calls the real desktop-origin routing policy with a spy as its only
+fallback. It never sends a relay frame and the spy never executes a cloud,
+local, or gateway-host action. A mobile-origin connection receives
+`attempted: false`, `error_code: "desktop_identity_required"`, and the same
+child/profile fingerprints for the same tenant/user.
+
+For physical isolation evidence, connections D1, D2, and mobile for the same
+tenant/user must have identical instance/profile fingerprints. A different user
+or the same user identifier under a different tenant must have different
+fingerprints. Every response must report `profile_scope_match: true`. The RPC
+returns no paths, URLs, tokens, raw tenant/user identifiers, or prompt content.
+
 ---
 
 ## Volumes and State
