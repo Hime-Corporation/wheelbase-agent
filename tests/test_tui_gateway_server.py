@@ -4811,9 +4811,7 @@ def test_run_prompt_submit_prefers_origin_ui_session_id(monkeypatch, tmp_path):
     finally:
         server._sessions.pop("sid_b", None)
         process_registry._completion_consumed.discard(event["session_id"])
-
-
-
+def test_session_create_returns_durable_id_without_persisting_empty_row(monkeypatch):
     """session.create must NOT eagerly write a DB row.
 
     Every TUI/desktop launch opens a session here just to paint the composer;
@@ -4839,10 +4837,32 @@ def test_run_prompt_submit_prefers_origin_ui_session_id(monkeypatch, tmp_path):
     )
     sid = resp["result"]["session_id"]
     try:
-        assert resp["result"]["stored_session_id"]
+        assert sid == resp["result"]["stored_session_id"]
         assert created == [], "session.create should not persist an empty DB row"
     finally:
         server._sessions.pop(sid, None)
+
+
+def test_session_resume_missing_uses_neutral_unavailable_error(monkeypatch):
+    class _DB:
+        def get_session(self, _session_id):
+            return None
+
+        def get_session_by_title(self, _title):
+            return None
+
+    monkeypatch.setattr(server, "_get_db", lambda: _DB())
+
+    resp = server.handle_request(
+        {"id": "resume", "method": "session.resume", "params": {"session_id": "missing"}}
+    )
+
+    assert resp == {
+        "jsonrpc": "2.0",
+        "id": "resume",
+        "error": {"code": 4007, "message": "session unavailable"},
+    }
+    assert server._sessions == {}
 
 
 def test_ensure_session_db_row_persists_explicit_cwd(monkeypatch, tmp_path):

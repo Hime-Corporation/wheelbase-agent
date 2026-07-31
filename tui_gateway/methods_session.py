@@ -13,8 +13,10 @@ _profile_scoped = _registry.profile_scoped
 
 @method("session.create")
 def _(rid, params: dict) -> dict:
-    sid = uuid.uuid4().hex[:8]
     key = _new_session_key()
+    # Public and in-memory routing use the durable Hermes key. Keeping one ID
+    # at the boundary prevents clients from caching a short-lived runtime ID.
+    sid = key
     cols = int(params.get("cols", 80))
     history = _coerce_seed_history(params.get("messages"))
     title = str(params.get("title") or "").strip()
@@ -407,7 +409,7 @@ def _(rid, params: dict) -> dict:
             # streams the whole turn anyway and the row exists by upgrade time.
             found = {}
         else:
-            return _err(rid, 4007, "session not found")
+            return _err(rid, 4007, "session unavailable")
 
     # Follow the compression-continuation chain to the live tip so a resume on
     # a rotated-out parent id binds to the descendant that actually holds the
@@ -437,7 +439,7 @@ def _(rid, params: dict) -> dict:
     # the pre-resolution parent (which could belong to a different user).
     resume_ident = _transport_identity()
     if resume_ident is not None and (found.get("user_id") or "") != resume_ident.user_id:
-        return _err(rid, 4007, "session not found")
+        return _err(rid, 4007, "session unavailable")
 
     profile_resume_cwd = str(found.get("cwd") or "").strip() or _profile_configured_cwd(
         profile_home
@@ -474,7 +476,7 @@ def _(rid, params: dict) -> dict:
     # delegation. A later prompt.submit upgrades it via _start_agent_build
     # (resume_session_id keeps the upgrade on the stored conversation).
     if is_truthy_value(params.get("lazy", False)):
-        sid = uuid.uuid4().hex[:8]
+        sid = target
         source = _resolve_session_source(str(params.get("source") or "").strip() or None)
         lease = None  # claimed lazily on the first turn (_ensure_active_session_slot)
         try:
@@ -551,7 +553,7 @@ def _(rid, params: dict) -> dict:
     # branch above: a normal resume restores the full ancestor history and the
     # session's persisted runtime identity, and is a real (upgradable) session.
     if not is_truthy_value(params.get("eager_build", False)):
-        sid = uuid.uuid4().hex[:8]
+        sid = target
         source = _resolve_session_source(str(params.get("source") or "").strip() or None)
         lease = None  # claimed lazily on the first turn (_ensure_active_session_slot)
         # Interactive resume routes approvals/clarify through gateway prompts;
@@ -626,7 +628,7 @@ def _(rid, params: dict) -> dict:
     # (MCP discovery, prompt/skill build, AIAgent construction). Holding
     # _session_resume_lock across it would stall session.close on the main
     # dispatch thread (it's not a _LONG_HANDLER), blocking fast-path RPCs.
-    sid = uuid.uuid4().hex[:8]
+    sid = target
     source = _resolve_session_source(str(params.get("source") or "").strip() or None)
     lease = None  # claimed lazily on the first turn (_ensure_active_session_slot)
     _enable_gateway_prompts()
@@ -907,7 +909,7 @@ def _(rid, params: dict) -> dict:
         except Exception as e:
             return _err(rid, 5036, f"delete failed: {e}")
         if not deleted:
-            return _err(rid, 4007, "session not found")
+            return _err(rid, 4007, "session unavailable")
         return _ok(rid, {"deleted": target})
 
 
