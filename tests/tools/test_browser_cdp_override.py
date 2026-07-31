@@ -1,5 +1,7 @@
 from unittest.mock import Mock, patch
 
+import pytest
+
 
 HOST = "example-host"
 PORT = 9223
@@ -216,6 +218,27 @@ class TestResolveCdpOverride:
 
 
 class TestGetCdpOverride:
+    def test_desktop_missing_task_cdp_never_falls_back_to_provider(self, monkeypatch):
+        import tools.browser_tool as browser_tool
+        from wheelbase_sdk import runtime
+
+        runtime.set_task_identity(
+            "desktop-task",
+            {"client": "desktop", "device_id": "d1", "cdp_url": ""},
+        )
+        provider = Mock()
+        monkeypatch.setattr(browser_tool, "_active_sessions", {})
+        monkeypatch.setattr(browser_tool, "_start_browser_cleanup_thread", lambda: None)
+        monkeypatch.setattr(browser_tool, "_update_session_activity", lambda _task: None)
+        monkeypatch.setattr(browser_tool, "_get_cloud_provider", lambda: provider)
+        try:
+            with pytest.raises(browser_tool.DesktopUnavailableError) as exc:
+                browser_tool._get_session_info("desktop-task")
+            assert exc.value.code == "desktop_unavailable"
+            provider.create_session.assert_not_called()
+        finally:
+            runtime.clear_task("desktop-task")
+
     def test_prefers_env_var_over_config(self, monkeypatch):
         import tools.browser_tool as browser_tool
 

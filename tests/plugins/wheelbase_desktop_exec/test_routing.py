@@ -92,9 +92,22 @@ def test_missing_identity_fails_closed(plug):
     assert calls["n"] == 1
 
 
-def test_no_shell_relay_url_falls_back(plug):
+def test_desktop_without_shell_relay_fails_closed(plug):
     from wheelbase_sdk import runtime
-    runtime.set_task_identity("t-mobile", {"user_id": "u", "shell_relay_url": ""})
+    runtime.set_task_identity(
+        "t-mobile", {"user_id": "u", "client": "desktop", "device_id": "d1", "shell_relay_url": ""}
+    )
+    nc, calls = _next_call_spy()
+    out = plug.route_or_passthrough(
+        tool_name="terminal", args={"command": "ls"}, next_call=nc, task_id="t-mobile"
+    )
+    assert json.loads(out)["error_code"] == "desktop_unavailable"
+    assert calls["n"] == 0
+
+
+def test_mobile_without_shell_relay_uses_cloud(plug):
+    from wheelbase_sdk import runtime
+    runtime.set_task_identity("t-mobile", {"user_id": "u", "client": "mobile", "shell_relay_url": ""})
     nc, calls = _next_call_spy()
     out = plug.route_or_passthrough(
         tool_name="terminal", args={"command": "ls"}, next_call=nc, task_id="t-mobile"
@@ -180,10 +193,10 @@ def test_execute_code_does_not_reach_the_generic_safety_seam(plug, monkeypatch):
     out = plug.route_or_passthrough(
         tool_name="execute_code", args={"code": "1"}, next_call=nc, task_id="t-desk"
     )
-    # transport build failed -> fail-closed to cloud, but via the DEDICATED
-    # execute_code branch, never touching the generic safety seam.
-    assert out == "SANDBOX_RESULT"
-    assert calls["n"] == 1
+    # Transport construction failed in the dedicated branch: fail closed with
+    # stable provenance and never execute the code in cloud.
+    assert json.loads(out)["error_code"] == "desktop_unavailable"
+    assert calls["n"] == 0
 
 
 def test_guard_exception_fails_closed_to_deny(plug, monkeypatch):

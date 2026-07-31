@@ -1,5 +1,5 @@
 name: wheelbase-desktop-exec
 version: 0.1.0
-description: "Route shell/file/code tool execution to a desktop user's machine over the exec relay (cloud brain, local executor). Falls back to the cloud sandbox for mobile/offline users."
+description: "Route desktop-origin shell/file/code tools only to that installation; unavailable desktop relays fail closed. Mobile-origin tools use the cloud sandbox."
 author: "Wheelbase"
 kind: standalone

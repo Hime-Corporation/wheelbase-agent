@@ -100,9 +100,13 @@ def route_or_passthrough(
     if not identity:
         return next_call(args)
 
-    # 3. No relay url → mobile / offline → sandboxed cloud path (spec §5.1.3).
+    # 3. Origin policy is immutable for the session. Mobile starts in cloud;
+    # desktop must remain on its exact originating peer even if the advertised
+    # relay disappears between mint and dispatch.
     relay_url = (identity.get("shell_relay_url") or "").strip()
     if not relay_url:
+        if identity.get("client") == "desktop":
+            return _desktop_unavailable()
         return next_call(args)
 
     # 3b. execute_code is a DEDICATED branch, ahead of the generic safety/relay
@@ -352,6 +356,12 @@ def _tool_error(message: str) -> str:
                        "status": "error", "error": message}, ensure_ascii=False)
 
 
+def _desktop_unavailable(detail: str = "") -> str:
+    from wheelbase_sdk.runtime import desktop_unavailable_result
+
+    return json.dumps(desktop_unavailable_result(detail=detail), ensure_ascii=False)
+
+
 def _post_process_relayed_result(tool_name, args, result, *,
                                  task_id, session_id, tool_call_id,
                                  turn_id, api_request_id, duration_ms=0):
@@ -429,11 +439,15 @@ def _relay(tool_name, args, relay_url, identity, next_call, *,
 
     try:
         transport = _make_transport(relay_url, identity)
-    except PreDispatchError:
-        return next_call(args)          # connection never came up → cloud fallback
+    except PreDispatchError as exc:
+        try:
+            transport.close()
+        except Exception:
+            pass
+        return _desktop_unavailable(str(exc))
     except Exception as exc:
         logger.warning("relay transport build failed: %s", exc)
-        return next_call(args)
+        return _desktop_unavailable(str(exc))
 
     relay_ok = False
     try:
@@ -448,13 +462,12 @@ def _relay(tool_name, args, relay_url, identity, next_call, *,
         else:
             result = _relay_file(tool_name, args, transport, identity)
         relay_ok = True
-    except PreDispatchError:
-        # Nothing executed on the desktop → safe to fall back.
-        return next_call(args)
+    except PreDispatchError as exc:
+        return _desktop_unavailable(str(exc))
     except Exception as exc:
         # Post-dispatch failure: return a tool error, NEVER re-dispatch (M4).
         logger.warning("relay post-dispatch failure for %s: %s", tool_name, exc)
-        result = _tool_error(f"desktop exec failed: {exc}")
+        result = _desktop_unavailable(str(exc))
 
     # On a SUCCESSFUL relay, re-fire the built-in post-processing that the outer
     # relay path bypassed (post_tool_call + transform_tool_result) so security
@@ -476,7 +489,7 @@ def _relay(tool_name, args, relay_url, identity, next_call, *,
 
 
 def _relay_command(tool_name, args, transport, identity) -> str:
-    from .relay_env import DesktopRelayEnvironment
+    from .relay_env import DesktopRelayEnvironment, DESKTOP_UNAVAILABLE_EXIT_CODE
     env = DesktopRelayEnvironment(
         transport=transport,
         cwd=identity.get("cwd") or identity.get("workspace_root") or "/workspace",
@@ -486,6 +499,8 @@ def _relay_command(tool_name, args, transport, identity) -> str:
     env._snapshot_ready = True  # desktop shell is already a login shell
     command = _extract_command(tool_name, args)
     res = env.execute(command)
+    if res.get("returncode") == DESKTOP_UNAVAILABLE_EXIT_CODE:
+        return _desktop_unavailable(str(res.get("output") or "desktop relay failed"))
     return json.dumps({
         "output": res.get("output", ""),
         "exit_code": res.get("returncode", 0),
@@ -510,7 +525,7 @@ def _relay_file(tool_name, args, transport, identity) -> str:
                         "data": data, "workspace_root": workspace_root})
     frame = transport.recv(request_id, timeout=int(args.get("timeout") or 120))
     if frame.get("type") == "error":
-        return _tool_error(str(frame.get("message") or "file relay error"))
+        return _desktop_unavailable(str(frame.get("message") or "file relay error"))
     return json.dumps({"status": "success", "success": True,
                        "data": frame.get("data", ""), "path": path},
                       ensure_ascii=False)
@@ -664,10 +679,9 @@ def _relay_execute_code(args, relay_url, identity, next_call, *, task_id, tool_c
         transform_tool_result on its way out. Re-firing
         _post_process_relayed_result here would double-post-process.
 
-    Fail-closed: any failure building the transport/environment happens
-    BEFORE anything is injected into the shared cache, so next_call(args)
-    (cloud fallback) is always safe to call in that case — nothing has run
-    on the desktop yet.
+    Fail-closed: any failure building the transport/environment returns the
+    stable ``desktop_unavailable`` result. Desktop-origin code is never replayed
+    in a cloud environment, including failures before dispatch.
 
     Idempotency (spec §5.1 M2, same cache _relay uses): the concurrent
     executor double-wraps the middleware, so the SAME (task_id, tool_call_id)
@@ -695,11 +709,11 @@ def _relay_execute_code(args, relay_url, identity, next_call, *, task_id, tool_c
 
     try:
         transport = _make_transport(relay_url, identity)
-    except PreDispatchError:
-        return next_call(args)
+    except PreDispatchError as exc:
+        return _desktop_unavailable(str(exc))
     except Exception as exc:
         logger.warning("execute_code relay transport build failed: %s", exc)
-        return next_call(args)
+        return _desktop_unavailable(str(exc))
 
     try:
         from .relay_env import DesktopRelayEnvironment
@@ -711,7 +725,11 @@ def _relay_execute_code(args, relay_url, identity, next_call, *, task_id, tool_c
         )
     except Exception as exc:
         logger.warning("execute_code relay environment build failed: %s", exc)
-        return next_call(args)
+        try:
+            transport.close()
+        except Exception:
+            pass
+        return _desktop_unavailable(str(exc))
 
     env._snapshot_ready = True  # desktop shell is already a login shell
     # Never idle-reaped mid-call by the terminal_tool cleanup thread (spec:
@@ -762,6 +780,16 @@ def _relay_execute_code(args, relay_url, identity, next_call, *, task_id, tool_c
             env.cleanup()
         except Exception:
             pass
+
+    # Relay loss can be surfaced by BaseEnvironment as an ordinary non-zero
+    # execution result. Normalize the reserved transport exit code so callers
+    # still receive the stable machine-readable failure contract.
+    try:
+        parsed_result = json.loads(result) if isinstance(result, str) else result
+        if isinstance(parsed_result, dict) and parsed_result.get("returncode") == 252:
+            result = _desktop_unavailable(str(parsed_result.get("output") or ""))
+    except (TypeError, ValueError):
+        pass
 
     if cache_key:
         with _result_cache_lock:

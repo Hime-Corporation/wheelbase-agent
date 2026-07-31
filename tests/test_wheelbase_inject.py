@@ -78,6 +78,22 @@ def test_sdk_context_set_and_reset(tmp_path):
     assert wb_runtime.current_identity() is None, "cleanup must fail closed for thread reuse"
 
 
+def test_sdk_context_carries_immutable_client_device_origin(tmp_path):
+    identity = WheelbaseIdentity(
+        user_id="desktop-user",
+        client="desktop",
+        device_id="550e8400-e29b-41d4-a716-446655440000",
+    )
+    cleanup = apply_session_injection("task-origin", identity, tmp_path)
+    try:
+        scoped = wb_runtime.get_task_identity("task-origin")
+        assert scoped["client"] == "desktop"
+        assert scoped["device_id"] == identity.device_id
+    finally:
+        cleanup()
+        wb_runtime.clear_task("task-origin")
+
+
 def test_refused_without_docker_sandbox(tmp_path, monkeypatch):
     monkeypatch.setenv("TERMINAL_ENV", "local")
     monkeypatch.delenv("WHEELBASE_ALLOW_UNSANDBOXED", raising=False)

@@ -14,6 +14,7 @@ env.execute() on it.
 from __future__ import annotations
 
 import importlib
+import json
 
 import pytest
 
@@ -176,7 +177,7 @@ def test_execute_code_cleanup_runs_even_if_next_call_raises(monkeypatch):
     assert key not in _active_environments
 
 
-def test_execute_code_transport_build_failure_falls_back_with_no_injection(monkeypatch):
+def test_execute_code_transport_build_failure_is_desktop_unavailable(monkeypatch):
     from tools.terminal_tool import _active_environments, _resolve_container_task_id
     key = _resolve_container_task_id("t-desk")
 
@@ -195,12 +196,12 @@ def test_execute_code_transport_build_failure_falls_back_with_no_injection(monke
         tool_name="execute_code", args={"code": "1"}, next_call=nc,
         task_id="t-desk", tool_call_id="e6",
     )
-    assert out == "CLOUD"
-    assert calls["n"] == 1
+    assert json.loads(out)["error_code"] == "desktop_unavailable"
+    assert calls["n"] == 0
     assert key not in _active_environments
 
 
-def test_execute_code_predispatch_error_falls_back_with_no_injection(monkeypatch):
+def test_execute_code_predispatch_error_is_desktop_unavailable(monkeypatch):
     from tools.terminal_tool import _active_environments, _resolve_container_task_id
     key = _resolve_container_task_id("t-desk")
 
@@ -218,8 +219,8 @@ def test_execute_code_predispatch_error_falls_back_with_no_injection(monkeypatch
         tool_name="execute_code", args={"code": "1"}, next_call=nc,
         task_id="t-desk", tool_call_id="e7",
     )
-    assert out == "CLOUD"
-    assert calls["n"] == 1
+    assert json.loads(out)["error_code"] == "desktop_unavailable"
+    assert calls["n"] == 0
     assert key not in _active_environments
 
 

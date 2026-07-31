@@ -136,6 +136,12 @@ def test_clear_task_removes_identity():
         assert "task-x" not in runtime._by_task
 
 
+def test_desktop_unavailable_result_has_stable_code():
+    result = runtime.desktop_unavailable_result()
+    assert result["error_code"] == "desktop_unavailable"
+    assert result["status"] == "error"
+
+
 # ---------------------------------------------------------------------------
 # Bonus: activate_task re-binds context to stored identity
 # ---------------------------------------------------------------------------

@@ -152,6 +152,9 @@ def apply_session_injection(
                 "dealership_id": identity.dealership_id,
                 "credential_path": str(cred_path),
                 "shell_relay_url": identity.shell_relay_url or "",
+                "cdp_url": identity.cdp_url or "",
+                "client": identity.client or "",
+                "device_id": identity.device_id or "",
             },
         )
 

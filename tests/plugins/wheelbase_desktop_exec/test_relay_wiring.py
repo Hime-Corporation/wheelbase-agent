@@ -51,7 +51,7 @@ def _no_next():
     return nc
 
 
-def test_predispatch_failure_falls_back_to_next_call(monkeypatch):
+def test_predispatch_failure_returns_desktop_unavailable(monkeypatch):
     monkeypatch.setattr(plug, "_make_transport", lambda url, ident: FakeTransport(connected=False))
     calls = {"n": 0}
 
@@ -63,8 +63,8 @@ def test_predispatch_failure_falls_back_to_next_call(monkeypatch):
     out = plug.route_or_passthrough(
         tool_name="terminal", args={"command": "ls"}, next_call=nc,
         task_id="t-desk", tool_call_id="c1")
-    assert out == "SANDBOX"
-    assert calls["n"] == 1
+    assert json.loads(out)["error_code"] == "desktop_unavailable"
+    assert calls["n"] == 0
 
 
 def test_postdispatch_error_returns_tool_error_no_redispatch(monkeypatch):
@@ -75,7 +75,7 @@ def test_postdispatch_error_returns_tool_error_no_redispatch(monkeypatch):
         tool_name="terminal", args={"command": "ls"}, next_call=_no_next(),
         task_id="t-desk", tool_call_id="c2")
     parsed = json.loads(out)
-    assert parsed["returncode"] != 0 or parsed.get("exit_code", 1) != 0
+    assert parsed["error_code"] == "desktop_unavailable"
 
 
 def test_successful_terminal_relay(monkeypatch):

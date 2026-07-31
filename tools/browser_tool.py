@@ -506,6 +506,31 @@ _task_cdp_urls: dict[str, str] = {}
 _task_cdp_lock = threading.Lock()
 
 
+class DesktopUnavailableError(RuntimeError):
+    code = "desktop_unavailable"
+
+    def __init__(self, detail: str = "") -> None:
+        from wheelbase_sdk.runtime import DESKTOP_UNAVAILABLE_MESSAGE
+
+        super().__init__(DESKTOP_UNAVAILABLE_MESSAGE)
+        self.detail = detail
+
+
+def _desktop_requires_cdp(task_id: str) -> bool:
+    try:
+        from wheelbase_sdk.runtime import get_task_identity
+
+        identity = get_task_identity(task_id) or {}
+        return identity.get("client") == "desktop"
+    except ImportError:
+        return False
+
+
+def _desktop_task_cdp_raw(task_id: str) -> str:
+    with _task_cdp_lock:
+        return str(_task_cdp_urls.get(task_id, "") or "").strip()
+
+
 def register_task_cdp_url(task_id: str, url: str) -> None:
     """Per-task CDP endpoint for the multi-user cloud gateway. Overrides the
     process-global BROWSER_CDP_URL/browser.cdp_url for this task only."""
@@ -2173,6 +2198,10 @@ def _get_session_info(task_id: Optional[str] = None) -> Dict[str, Any]:
     if task_id is None:
         task_id = "default"
 
+    desktop_required = _desktop_requires_cdp(task_id)
+    if desktop_required and not _desktop_task_cdp_raw(task_id):
+        raise DesktopUnavailableError("desktop CDP relay was not advertised")
+
     # Start the cleanup thread if not running (handles inactivity timeouts)
     _start_browser_cleanup_thread()
 
@@ -2192,6 +2221,8 @@ def _get_session_info(task_id: Optional[str] = None) -> Dict[str, Any]:
 
     # Create session outside the lock (network call in cloud mode)
     cdp_override = _get_cdp_override(task_id)
+    if desktop_required and not cdp_override:
+        raise DesktopUnavailableError("desktop CDP relay discovery failed")
     if cdp_override and not force_local:
         try:
             session_info = _create_cdp_session(task_id, cdp_override)
@@ -2468,6 +2499,25 @@ def _run_browser_command(
         timeout = _safe_command_timeout()
     args = args or []
 
+    # Evaluate immutable desktop origin before any local binary/provider gate.
+    # A missing or dead relay must not be masked by a Chromium install error or
+    # redirected into Browserbase/Browser Use/local browser selection.
+    if _desktop_requires_cdp(task_id or "default"):
+        raw_desktop_cdp = _desktop_task_cdp_raw(task_id or "default")
+        resolved_desktop_cdp = (
+            _resolve_cdp_override(raw_desktop_cdp) if raw_desktop_cdp else ""
+        )
+        if not resolved_desktop_cdp:
+            from wheelbase_sdk.runtime import desktop_unavailable_result
+
+            return desktop_unavailable_result(
+                detail=(
+                    "desktop CDP relay discovery failed"
+                    if raw_desktop_cdp
+                    else "desktop CDP relay was not advertised"
+                )
+            )
+
     # Build the command
     try:
         browser_cmd = _find_agent_browser()
@@ -2513,6 +2563,10 @@ def _run_browser_command(
         session_info = _get_session_info(task_id)
     except Exception as e:
         logger.warning("Failed to create browser session for task=%s: %s", task_id, e)
+        if isinstance(e, DesktopUnavailableError):
+            from wheelbase_sdk.runtime import desktop_unavailable_result
+
+            return desktop_unavailable_result(detail=e.detail)
         return {"success": False, "error": f"Failed to create browser session: {str(e)}"}
 
     # Build the command with the appropriate backend flag.

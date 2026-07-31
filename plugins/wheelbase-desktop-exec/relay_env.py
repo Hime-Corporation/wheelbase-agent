@@ -14,6 +14,8 @@ from tools.environments.base import BaseEnvironment, _ThreadedProcessHandle
 
 from .transport import ExecTransport, PreDispatchError
 
+DESKTOP_UNAVAILABLE_EXIT_CODE = 252
+
 
 class DesktopRelayEnvironment(BaseEnvironment):
     # No stdin pipe over the relay — embed stdin as a heredoc like Daytona.
@@ -112,7 +114,10 @@ class DesktopRelayEnvironment(BaseEnvironment):
                 elif ftype == "result":
                     return (frame.get("data") or "".join(chunks), 0)
                 elif ftype == "error":
-                    return ("".join(chunks) + "\n" + str(frame.get("message") or "relay error"), 1)
+                    return (
+                        str(frame.get("message") or "relay error"),
+                        DESKTOP_UNAVAILABLE_EXIT_CODE,
+                    )
                 # unknown frame types are ignored (forward-compat)
 
         return _ThreadedProcessHandle(exec_fn, cancel_fn=cancel)

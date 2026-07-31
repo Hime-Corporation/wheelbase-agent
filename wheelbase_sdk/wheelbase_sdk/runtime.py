@@ -23,6 +23,25 @@ _current: contextvars.ContextVar[Optional[dict]] = contextvars.ContextVar("wb_ta
 _by_task: dict[str, dict] = {}
 _lock = threading.Lock()
 
+DESKTOP_UNAVAILABLE_CODE = "desktop_unavailable"
+DESKTOP_UNAVAILABLE_MESSAGE = (
+    "The originating desktop is unavailable. Reconnect that desktop and retry."
+)
+
+
+def desktop_unavailable_result(*, detail: str = "") -> dict[str, Any]:
+    """Stable fail-closed tool result shared by desktop shell/browser paths."""
+    return {
+        "output": "",
+        "returncode": 1,
+        "exit_code": 1,
+        "success": False,
+        "status": "error",
+        "error_code": DESKTOP_UNAVAILABLE_CODE,
+        "error": DESKTOP_UNAVAILABLE_MESSAGE,
+        **({"detail": detail} if detail else {}),
+    }
+
 
 def set_task_identity(task_id: str, identity: dict[str, Any]) -> contextvars.Token:
     """Bind the current execution context to a task's identity.

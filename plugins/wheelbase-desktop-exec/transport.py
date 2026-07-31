@@ -13,12 +13,9 @@ from typing import Any, Mapping, Optional
 class PreDispatchError(Exception):
     """Raised when the relay fails BEFORE the desktop starts executing.
 
-    The middleware treats this as a cloud-fallback signal (→ next_call). Any
-    failure AFTER dispatch must NOT be a PreDispatchError (→ tool error,
-    no re-dispatch) — spec §5.1 M4.
+    The middleware maps this to ``desktop_unavailable``. Desktop-origin calls
+    never fall back or replay, regardless of whether dispatch began.
     """
-
-
 class ExecTransport(ABC):
     @abstractmethod
     def send(self, frame: Mapping[str, Any]) -> None:
