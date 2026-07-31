@@ -9,13 +9,15 @@ from wheelbase_sdk.errors import WheelbaseAuthError, WheelbaseForbiddenError
 
 def _env(monkeypatch, tmp_path, token="tok"):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_DESKTOP", "1")
     monkeypatch.setenv("SUPABASE_URL", "https://sb.example")
     monkeypatch.setenv("SUPABASE_ANON_KEY", "anon")
     monkeypatch.setenv("WHEELBASE_GO_API_ORIGIN", "https://api.example")
     if token:
         (tmp_path / "wheelbase-session.json").write_text(
-            json.dumps({"access_token": token, "expires_at": 9999999999, "revision": 1, "source": "local"})
+            json.dumps({"access_token": token, "expires_at": 9999999999})
         )
+        (tmp_path / "wheelbase-session.json").chmod(0o600)
 
 
 def test_raises_when_signed_out(tmp_path, monkeypatch, caplog):

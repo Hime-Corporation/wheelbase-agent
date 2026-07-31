@@ -66,8 +66,13 @@ def test_no_identity_falls_back_to_legacy(tmp_path, monkeypatch):
     runtime._current.set(None)
 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_DESKTOP", "1")
     legacy_file = tmp_path / "wheelbase-session.json"
-    _write_cred(legacy_file, "legacy-token-xyz", 1893456000)
+    legacy_file.write_text(
+        json.dumps({"access_token": "legacy-token-xyz", "expires_at": 1893456000}),
+        encoding="utf-8",
+    )
+    legacy_file.chmod(0o600)
 
     session = load_session()
     assert session is not None
@@ -112,6 +117,7 @@ def test_two_threads_no_cross_bleed(tmp_path):
 
 def test_missing_task_credential_fails_closed_even_with_legacy(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_DESKTOP", "1")
     legacy_file = tmp_path / "wheelbase-session.json"
     _write_cred(legacy_file, "fallback-token")
 

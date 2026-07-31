@@ -27,15 +27,20 @@ class WheelbaseSession:
 AUTH_EXPIRY_SKEW_SECONDS = 30
 
 
-def _task_session(path: Path) -> WheelbaseSession:
+def _credential_session(
+    path: Path,
+    *,
+    lifecycle_source: str,
+    require_task_metadata: bool,
+) -> WheelbaseSession:
     from .errors import WheelbaseAuthError, log_auth_lifecycle
 
     def auth_error(reason: str, data: object = None) -> WheelbaseAuthError:
         payload = data if isinstance(data, dict) else {}
         log_auth_lifecycle(
             reason,
-            source="task",
-            revision=payload.get("revision"),
+            source=lifecycle_source,
+            revision=payload.get("revision") if require_task_metadata else None,
             expires_at=payload.get("expires_at"),
         )
         return WheelbaseAuthError(reason, reason=reason)
@@ -62,15 +67,34 @@ def _task_session(path: Path) -> WheelbaseSession:
         raise auth_error("not_signed_in", data)
     if not isinstance(expiry, int) or isinstance(expiry, bool):
         raise auth_error("refresh_pending", data)
-    if expiry <= int(time.time()):
+    now = int(time.time())
+    if expiry <= now:
         raise auth_error("expired", data)
-    if expiry <= int(time.time()) + AUTH_EXPIRY_SKEW_SECONDS:
+    if expiry <= now + AUTH_EXPIRY_SKEW_SECONDS:
         raise auth_error("refresh_pending", data)
-    if not isinstance(revision, int) or isinstance(revision, bool) or revision <= 0:
-        raise auth_error("refresh_pending", data)
-    if not isinstance(source, str) or not source.strip():
-        raise auth_error("refresh_pending", data)
-    return WheelbaseSession(token.strip(), expiry, revision, source.strip(), path)
+    if require_task_metadata:
+        if not isinstance(revision, int) or isinstance(revision, bool) or revision <= 0:
+            raise auth_error("refresh_pending", data)
+        if not isinstance(source, str) or not source.strip():
+            raise auth_error("refresh_pending", data)
+        return WheelbaseSession(token.strip(), expiry, revision, source.strip(), path)
+    return WheelbaseSession(token.strip(), expiry, 0, "local", path)
+
+
+def _task_session(path: Path) -> WheelbaseSession:
+    return _credential_session(
+        path,
+        lifecycle_source="task",
+        require_task_metadata=True,
+    )
+
+
+def _desktop_singleton_session(path: Path) -> WheelbaseSession:
+    return _credential_session(
+        path,
+        lifecycle_source="local",
+        require_task_metadata=False,
+    )
 
 
 def _session_path() -> Path:
@@ -79,11 +103,11 @@ def _session_path() -> Path:
 
 
 def load_session() -> WheelbaseSession | None:
-    """Return the current session, or None when signed out / file absent / malformed.
+    """Return the current session, or None when no permitted credential exists.
 
     Resolution order:
     1. Task-scoped identity (cloud gateway: per-user credential file injected per turn).
-    2. Legacy singleton $HERMES_HOME/wheelbase-session.json (desktop / dev mode).
+    2. Singleton $HERMES_HOME/wheelbase-session.json (explicit desktop mode only).
     """
     # --- 1. Task-scoped identity (cloud gateway) ---
     try:
@@ -99,25 +123,16 @@ def load_session() -> WheelbaseSession | None:
             raise WheelbaseAuthError("refresh_pending", reason="refresh_pending")
         return _task_session(Path(raw_path))
 
-    # --- 2. Legacy singleton file ---
+    # --- 2. Desktop singleton file ---
+    if os.environ.get("HERMES_DESKTOP") != "1":
+        return None
+
+    path = _session_path()
     try:
-        raw = _session_path().read_text(encoding="utf-8")
+        path.lstat()
+    except FileNotFoundError:
+        return None
     except OSError:
-        return None
-    try:
-        data = json.loads(raw)
-    except (json.JSONDecodeError, ValueError):
-        return None
-    if not isinstance(data, dict):
-        return None
-    token = data.get("access_token")
-    if not isinstance(token, str) or not token:
-        return None
-    exp = data.get("expires_at")
-    return WheelbaseSession(
-        access_token=token,
-        expires_at=exp if isinstance(exp, int) else None,
-        revision=data.get("revision") if isinstance(data.get("revision"), int) else 0,
-        source=str(data.get("source") or "local"),
-        credential_path=_session_path(),
-    )
+        # Let the credential reader emit the bounded lifecycle reason.
+        pass
+    return _desktop_singleton_session(path)

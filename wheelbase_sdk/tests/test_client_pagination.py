@@ -10,12 +10,14 @@ from wheelbase_sdk.client import WheelbaseClient
 
 def _env(monkeypatch, tmp_path, token="tok"):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_DESKTOP", "1")
     monkeypatch.setenv("SUPABASE_URL", "https://sb.example")
     monkeypatch.setenv("SUPABASE_ANON_KEY", "anon")
     monkeypatch.setenv("WHEELBASE_GO_API_ORIGIN", "https://api.example")
     (tmp_path / "wheelbase-session.json").write_text(
-        json.dumps({"access_token": token})
+        json.dumps({"access_token": token, "expires_at": 9999999999})
     )
+    (tmp_path / "wheelbase-session.json").chmod(0o600)
 
 
 def _make_client(monkeypatch, tmp_path, content_range, rows=None):
