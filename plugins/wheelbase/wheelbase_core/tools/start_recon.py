@@ -5,8 +5,10 @@ inventory_status_definition where code = 'recon'.
 """
 
 from wheelbase_sdk import WheelbaseClient, WheelbaseAuthError, signed_out_result, ok, err
+from ._auth import auth_result, authenticated_client
 
 
+@auth_result
 def start_recon(args: dict, **kwargs) -> str:
     car_id = str(args.get("carId") or "").strip()
     if not car_id:
@@ -15,7 +17,7 @@ def start_recon(args: dict, **kwargs) -> str:
     recon_status_id = args.get("reconStatusId")
 
     try:
-        client = WheelbaseClient()
+        client = authenticated_client(WheelbaseClient)
     except WheelbaseAuthError:
         return signed_out_result()
     try:

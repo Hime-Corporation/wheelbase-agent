@@ -4,11 +4,13 @@ Three handlers for manipulating recon stages and findings.
 """
 
 from wheelbase_sdk import WheelbaseClient, WheelbaseAuthError, signed_out_result, ok, err
+from ._auth import auth_result, authenticated_client
 
 _VALID_HOLD_TYPES = {"parts", "vendor", "approval", "transport"}
 _VALID_STATUSES = {"todo", "ready", "in_progress", "blocked", "done", "skipped", "cancelled"}
 
 
+@auth_result
 def complete_stage(args: dict, **kwargs) -> str:
     """Mark a recon stage as done."""
     stage_id = str(args.get("stageId") or "").strip()
@@ -16,7 +18,7 @@ def complete_stage(args: dict, **kwargs) -> str:
         return err("stageId is required (uuid string)")
 
     try:
-        client = WheelbaseClient()
+        client = authenticated_client(WheelbaseClient)
     except WheelbaseAuthError:
         return signed_out_result()
     try:
@@ -34,6 +36,7 @@ def complete_stage(args: dict, **kwargs) -> str:
         client.close()
 
 
+@auth_result
 def update_stage(args: dict, **kwargs) -> str:
     """Update mutable fields on a recon stage."""
     stage_id = str(args.get("stageId") or "").strip()
@@ -49,7 +52,7 @@ def update_stage(args: dict, **kwargs) -> str:
         return err(f"status must be one of {sorted(_VALID_STATUSES)}")
 
     try:
-        client = WheelbaseClient()
+        client = authenticated_client(WheelbaseClient)
     except WheelbaseAuthError:
         return signed_out_result()
     try:

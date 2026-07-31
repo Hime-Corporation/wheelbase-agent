@@ -4,8 +4,10 @@ Schema: work_item_comment(id, tenant_id, work_item_id, content, created_by [serv
 """
 
 from wheelbase_sdk import WheelbaseClient, WheelbaseAuthError, signed_out_result, ok, err
+from ._auth import auth_result, authenticated_client
 
 
+@auth_result
 def add_work_item_comment(args: dict, **kwargs) -> str:
     work_item_id = str(args.get("workItemId") or "").strip()
     if not work_item_id:
@@ -17,7 +19,7 @@ def add_work_item_comment(args: dict, **kwargs) -> str:
     content = content.strip()
 
     try:
-        client = WheelbaseClient()
+        client = authenticated_client(WheelbaseClient)
     except WheelbaseAuthError:
         return signed_out_result()
     try:

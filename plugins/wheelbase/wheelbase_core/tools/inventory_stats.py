@@ -9,13 +9,15 @@ one dealership the context is resolved automatically.
 """
 
 from wheelbase_sdk import WheelbaseClient, WheelbaseAuthError, signed_out_result, ok, err
+from ._auth import auth_result, authenticated_client
 
 from ._context import resolve_dealership_context
 
 
+@auth_result
 def get_inventory_stats(args: dict, **kwargs) -> str:
     try:
-        client = WheelbaseClient()
+        client = authenticated_client(WheelbaseClient)
     except WheelbaseAuthError:
         return signed_out_result()
 
@@ -40,9 +42,10 @@ def get_inventory_stats(args: dict, **kwargs) -> str:
         client.close()
 
 
+@auth_result
 def get_inventory_filter_options(args: dict, **kwargs) -> str:
     try:
-        client = WheelbaseClient()
+        client = authenticated_client(WheelbaseClient)
     except WheelbaseAuthError:
         return signed_out_result()
 

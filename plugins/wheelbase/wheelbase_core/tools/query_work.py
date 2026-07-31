@@ -5,6 +5,7 @@ Optional args: status, type, vendorId, assignedToUserId, dueBefore, dueAfter,
 """
 
 from wheelbase_sdk import WheelbaseClient, WheelbaseAuthError, signed_out_result, ok, err
+from ._auth import auth_result, authenticated_client
 
 _VALID_STATUSES = {"todo", "ready", "in_progress", "blocked", "done", "skipped", "cancelled"}
 _VALID_TYPES = {"recon_run", "stage", "task", "work_order", "work_order_line", "finding", "reminder"}
@@ -16,6 +17,7 @@ _SELECT = (
 )
 
 
+@auth_result
 def query_work(args: dict, **kwargs) -> str:
     status = args.get("status")
     if status is not None and status not in _VALID_STATUSES:
@@ -45,7 +47,7 @@ def query_work(args: dict, **kwargs) -> str:
     due_after = args.get("dueAfter")
 
     try:
-        client = WheelbaseClient()
+        client = authenticated_client(WheelbaseClient)
     except WheelbaseAuthError:
         return signed_out_result()
 

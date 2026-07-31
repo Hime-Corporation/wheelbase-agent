@@ -9,8 +9,10 @@ scoping first (RLS-scoped — only returns the caller's own car).
 """
 
 from wheelbase_sdk import WheelbaseClient, WheelbaseAuthError, signed_out_result, ok, err
+from ._auth import auth_result, authenticated_client
 
 
+@auth_result
 def update_inventory_status(args: dict, **kwargs) -> str:
     car_id = str(args.get("carId") or "").strip()
     if not car_id:
@@ -29,7 +31,7 @@ def update_inventory_status(args: dict, **kwargs) -> str:
         return err("note must be a string")
 
     try:
-        client = WheelbaseClient()
+        client = authenticated_client(WheelbaseClient)
     except WheelbaseAuthError:
         return signed_out_result()
     try:

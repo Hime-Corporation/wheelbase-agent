@@ -1,15 +1,17 @@
 """get_vendor — fetch the full record for a vendor by UUID."""
 
 from wheelbase_sdk import WheelbaseClient, WheelbaseAuthError, signed_out_result, ok, err
+from ._auth import auth_result, authenticated_client
 
 
+@auth_result
 def get_vendor(args: dict, **kwargs) -> str:
     vendor_id = str(args.get("vendorId") or "").strip()
     if not vendor_id:
         return err("vendorId is required (uuid string)")
 
     try:
-        client = WheelbaseClient()
+        client = authenticated_client(WheelbaseClient)
     except WheelbaseAuthError:
         return signed_out_result()
     try:

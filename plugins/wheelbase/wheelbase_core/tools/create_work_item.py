@@ -1,6 +1,7 @@
 """create_work_item — insert a row into the unified `work_item` table."""
 
 from wheelbase_sdk import WheelbaseClient, WheelbaseAuthError, signed_out_result, ok, err
+from ._auth import auth_result, authenticated_client
 
 _ROOT_TYPES = {"task", "reminder", "recon_run"}
 _CHILD_TYPES = {"finding", "work_order", "work_order_line", "stage"}
@@ -8,6 +9,7 @@ _ALLOWED = {"task", "work_order", "reminder", "finding", "work_order_line"}
 _PRIORITIES = {"low", "medium", "high", "urgent"}
 
 
+@auth_result
 def create_work_item(args: dict, **kwargs) -> str:
     title = str(args.get("title") or "").strip()
     if not title:
@@ -36,7 +38,7 @@ def create_work_item(args: dict, **kwargs) -> str:
         return err("estCostCents must be a non-negative integer")
 
     try:
-        client = WheelbaseClient()
+        client = authenticated_client(WheelbaseClient)
     except WheelbaseAuthError:
         return signed_out_result()
     try:

@@ -21,6 +21,7 @@ rather than silently creating a dangling note.
 """
 
 from wheelbase_sdk import WheelbaseClient, WheelbaseAuthError, signed_out_result, ok, err
+from ._auth import auth_result, authenticated_client
 
 INSPECTION_TABLE = "vehicle_recon_intake_inspection"
 ITEM_RESULT_TABLE = "inspection_item_result"
@@ -31,6 +32,7 @@ _GENERAL_GROUP = "general"
 _DEFAULT_ITEM_ID = "general_note"
 
 
+@auth_result
 def create_inspection_note(args: dict, **kwargs) -> str:
     car_id = str(args.get("carId") or "").strip()
     if not car_id:
@@ -51,7 +53,7 @@ def create_inspection_note(args: dict, **kwargs) -> str:
     )
 
     try:
-        client = WheelbaseClient()
+        client = authenticated_client(WheelbaseClient)
     except WheelbaseAuthError:
         return signed_out_result()
     try:

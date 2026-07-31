@@ -5,6 +5,7 @@ If no recon_run root exists, returns a flat items list instead.
 """
 
 from wheelbase_sdk import WheelbaseClient, WheelbaseAuthError, signed_out_result, ok, err
+from ._auth import auth_result, authenticated_client
 
 _VIEW = "work_item_tree"
 _SELECT = (
@@ -31,13 +32,14 @@ def _build_tree(rows: list[dict]) -> dict:
     return None
 
 
+@auth_result
 def get_recon_board(args: dict, **kwargs) -> str:
     car_id = str(args.get("carId") or "").strip()
     if not car_id:
         return err("carId is required (uuid string)")
 
     try:
-        client = WheelbaseClient()
+        client = authenticated_client(WheelbaseClient)
     except WheelbaseAuthError:
         return signed_out_result()
     try:

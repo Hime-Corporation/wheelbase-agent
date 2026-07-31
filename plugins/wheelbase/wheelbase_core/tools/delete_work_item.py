@@ -1,15 +1,17 @@
 """delete_work_item — delete a work_item row (with cascade-aware confirmation pre-fetch)."""
 
 from wheelbase_sdk import WheelbaseClient, WheelbaseAuthError, signed_out_result, ok, err
+from ._auth import auth_result, authenticated_client
 
 
+@auth_result
 def delete_work_item(args: dict, **kwargs) -> str:
     work_item_id = str(args.get("workItemId") or "").strip()
     if not work_item_id:
         return err("workItemId is required (uuid string)")
 
     try:
-        client = WheelbaseClient()
+        client = authenticated_client(WheelbaseClient)
     except WheelbaseAuthError:
         return signed_out_result()
     try:

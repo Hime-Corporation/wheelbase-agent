@@ -10,14 +10,16 @@ The module-level `WheelbaseClient` name is the test seam — tests monkeypatch i
 """
 
 from wheelbase_sdk import WheelbaseClient, WheelbaseAuthError, signed_out_result, ok, err
+from ._auth import auth_result, authenticated_client
 
 
+@auth_result
 def get_car(args: dict, **kwargs) -> str:
     car_id = str(args.get("carId") or "").strip()
     if not car_id:
         return err("carId must be a non-empty UUID string")
     try:
-        client = WheelbaseClient()
+        client = authenticated_client(WheelbaseClient)
     except WheelbaseAuthError:
         return signed_out_result()
     try:

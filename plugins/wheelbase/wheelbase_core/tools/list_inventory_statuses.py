@@ -1,11 +1,13 @@
 """list_inventory_statuses — return all configured inventory status definitions."""
 
 from wheelbase_sdk import WheelbaseClient, WheelbaseAuthError, signed_out_result, ok, err
+from ._auth import auth_result, authenticated_client
 
 
+@auth_result
 def list_inventory_statuses(args: dict, **kwargs) -> str:
     try:
-        client = WheelbaseClient()
+        client = authenticated_client(WheelbaseClient)
     except WheelbaseAuthError:
         return signed_out_result()
     try:

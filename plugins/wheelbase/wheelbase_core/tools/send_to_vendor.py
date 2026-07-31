@@ -6,8 +6,10 @@ correct state for items awaiting a vendor — 'scheduled' is not a valid work_st
 """
 
 from wheelbase_sdk import WheelbaseClient, WheelbaseAuthError, signed_out_result, ok, err
+from ._auth import auth_result, authenticated_client
 
 
+@auth_result
 def send_to_vendor(args: dict, **kwargs) -> str:
     work_order_id = str(args.get("workOrderId") or "").strip()
     if not work_order_id:
@@ -22,7 +24,7 @@ def send_to_vendor(args: dict, **kwargs) -> str:
         return err("scheduledAt must be an ISO date string")
 
     try:
-        client = WheelbaseClient()
+        client = authenticated_client(WheelbaseClient)
     except WheelbaseAuthError:
         return signed_out_result()
     try:

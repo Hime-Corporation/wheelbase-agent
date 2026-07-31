@@ -1,6 +1,7 @@
 """list_vendors — query the `vendor` table with optional type/search filters."""
 
 from wheelbase_sdk import WheelbaseClient, WheelbaseAuthError, signed_out_result, ok, err
+from ._auth import auth_result, authenticated_client
 
 VALID_VENDOR_TYPES = {
     "body_shop",
@@ -15,6 +16,7 @@ VALID_VENDOR_TYPES = {
 }
 
 
+@auth_result
 def list_vendors(args: dict, **kwargs) -> str:
     vendor_type = args.get("type")
     if vendor_type is not None:
@@ -28,7 +30,7 @@ def list_vendors(args: dict, **kwargs) -> str:
         return err("search must be a string")
 
     try:
-        client = WheelbaseClient()
+        client = authenticated_client(WheelbaseClient)
     except WheelbaseAuthError:
         return signed_out_result()
     try:

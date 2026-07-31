@@ -1,6 +1,7 @@
 """get_work_item — read work_item rows (flat) or the work_item_tree view (nested)."""
 
 from wheelbase_sdk import WheelbaseClient, WheelbaseAuthError, signed_out_result, ok, err
+from ._auth import auth_result, authenticated_client
 
 # Flat mode: query `work_item` base table — effective_status, depth, root_id are VIEW-only columns.
 _SELECT_FLAT = (
@@ -11,13 +12,14 @@ _SELECT_FLAT = (
 _SELECT_TREE = _SELECT_FLAT + ",effective_status,depth,root_id"
 
 
+@auth_result
 def get_work_item(args: dict, **kwargs) -> str:
     car_id = str(args.get("carId") or "").strip()
     work_item_id = str(args.get("workItemId") or "").strip()
     if not car_id and not work_item_id:
         return err("Provide carId and/or workItemId")
     try:
-        client = WheelbaseClient()
+        client = authenticated_client(WheelbaseClient)
     except WheelbaseAuthError:
         return signed_out_result()
     try:

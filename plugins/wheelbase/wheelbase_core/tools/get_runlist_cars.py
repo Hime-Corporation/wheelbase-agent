@@ -1,8 +1,10 @@
 """get_runlist_cars — fetch vehicles from `runlist_cars_view` for a runlist."""
 
 from wheelbase_sdk import WheelbaseClient, WheelbaseAuthError, signed_out_result, ok, err
+from ._auth import auth_result, authenticated_client
 
 
+@auth_result
 def get_runlist_cars(args: dict, **kwargs) -> str:
     runlist_id = str(args.get("runlistId") or "").strip()
     if not runlist_id:
@@ -18,7 +20,7 @@ def get_runlist_cars(args: dict, **kwargs) -> str:
             return err("limit must be a number")
 
     try:
-        client = WheelbaseClient()
+        client = authenticated_client(WheelbaseClient)
     except WheelbaseAuthError:
         return signed_out_result()
     try:

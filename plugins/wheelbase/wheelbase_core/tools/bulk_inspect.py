@@ -21,6 +21,7 @@ from zero.
 """
 
 from wheelbase_sdk import WheelbaseClient, WheelbaseAuthError, signed_out_result, ok, err
+from ._auth import auth_result, authenticated_client
 
 INSPECTION_TABLE = "vehicle_recon_intake_inspection"
 
@@ -63,6 +64,7 @@ def _extract_scores(row: dict) -> dict:
     return scores
 
 
+@auth_result
 def bulk_inspect(args: dict, **kwargs) -> str:
     car_ids = args.get("carIds")
     if not isinstance(car_ids, list) or len(car_ids) == 0:
@@ -73,7 +75,7 @@ def bulk_inspect(args: dict, **kwargs) -> str:
         return err("carIds may contain at most 200 entries")
 
     try:
-        client = WheelbaseClient()
+        client = authenticated_client(WheelbaseClient)
     except WheelbaseAuthError:
         return signed_out_result()
     try:
