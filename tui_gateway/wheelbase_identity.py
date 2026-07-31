@@ -25,6 +25,8 @@ HEADER_DEALERSHIP = "x-wheelbase-dealership-id"
 HEADER_JWT = "x-wheelbase-user-jwt"
 HEADER_CDP = "x-wheelbase-cdp-url"
 HEADER_SHELL_RELAY = "x-wheelbase-shell-relay-url"
+HEADER_CLIENT = "x-wheelbase-client"
+HEADER_DEVICE = "x-wheelbase-device-id"
 
 # Supabase UUID format and safe identifiers: alphanumeric, underscores, hyphens, 1-64 chars.
 _USER_ID_RE = re.compile(r'^[A-Za-z0-9_-]{1,64}$')
@@ -43,6 +45,8 @@ class WheelbaseIdentity:
     jwt: str = ""
     cdp_url: str = ""
     shell_relay_url: str = ""
+    client: str = ""
+    device_id: str = ""
 
 
 def identity_from_headers(headers: Mapping[str, str]) -> Optional[WheelbaseIdentity]:
@@ -67,6 +71,8 @@ def identity_from_headers(headers: Mapping[str, str]) -> Optional[WheelbaseIdent
         jwt=lowered.get(HEADER_JWT, "").strip(),
         cdp_url=lowered.get(HEADER_CDP, "").strip(),
         shell_relay_url=lowered.get(HEADER_SHELL_RELAY, "").strip(),
+        client=lowered.get(HEADER_CLIENT, "").strip(),
+        device_id=lowered.get(HEADER_DEVICE, "").strip(),
     )
 
 

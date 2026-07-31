@@ -133,6 +133,30 @@ class TestIdentityFromHeaders:
         assert identity is not None
         assert identity.shell_relay_url == ""
 
+    def test_desktop_client_and_device_scope_are_parsed(self):
+        device_id = "550e8400-e29b-41d4-a716-446655440000"
+        identity = identity_from_headers(
+            {
+                "x-wheelbase-user-id": "user-123",
+                "x-wheelbase-client": "desktop",
+                "x-wheelbase-device-id": device_id,
+            }
+        )
+        assert identity is not None
+        assert identity.client == "desktop"
+        assert identity.device_id == device_id
+
+    def test_mobile_scope_has_no_device(self):
+        identity = identity_from_headers(
+            {
+                "x-wheelbase-user-id": "user-123",
+                "x-wheelbase-client": "mobile",
+            }
+        )
+        assert identity is not None
+        assert identity.client == "mobile"
+        assert identity.device_id == ""
+
 
 # ---------------------------------------------------------------------------
 # write_credential_file

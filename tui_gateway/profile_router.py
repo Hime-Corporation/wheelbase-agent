@@ -87,6 +87,9 @@ _WHEELBASE_HEADER_CANONICAL = {
     "x-wheelbase-dealership-id": "X-Wheelbase-Dealership-Id",
     "x-wheelbase-user-jwt": "X-Wheelbase-User-Jwt",
     "x-wheelbase-cdp-url": "X-Wheelbase-Cdp-Url",
+    "x-wheelbase-shell-relay-url": "X-Wheelbase-Shell-Relay-Url",
+    "x-wheelbase-client": "X-Wheelbase-Client",
+    "x-wheelbase-device-id": "X-Wheelbase-Device-Id",
 }
 
 

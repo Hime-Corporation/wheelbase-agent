@@ -525,6 +525,8 @@ def test_ws_proxies_frames_and_forwards_identity_headers(ws_router):
         "X-Wheelbase-Dealership-Id": "d1",
         "X-Wheelbase-User-Jwt": "jwt-a",
         "X-Wheelbase-Cdp-Url": "http://cdp/user-aaaa",
+        "X-Wheelbase-Client": "desktop",
+        "X-Wheelbase-Device-Id": "550e8400-e29b-41d4-a716-446655440000",
     }
     with client.websocket_connect("/api/ws?token=router-secret", headers=headers) as ws:
         ws.send_text('{"jsonrpc":"2.0","method":"ping","id":1}')
@@ -537,3 +539,5 @@ def test_ws_proxies_frames_and_forwards_identity_headers(ws_router):
     assert lowered["x-wheelbase-user-id"] == "user-aaaa"
     assert lowered["x-wheelbase-user-jwt"] == "jwt-a"
     assert lowered["x-wheelbase-cdp-url"] == "http://cdp/user-aaaa"
+    assert lowered["x-wheelbase-client"] == "desktop"
+    assert lowered["x-wheelbase-device-id"] == "550e8400-e29b-41d4-a716-446655440000"
