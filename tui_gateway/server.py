@@ -2597,6 +2597,20 @@ def _transport_identity():
     return getattr(t, "wheelbase_identity", None) if t is not None else None
 
 
+def _wheelbase_connection_id(transport) -> str:
+    """Stable process-local owner key for one exact authenticated transport."""
+    if transport is None:
+        return ""
+    with _sessions_lock:
+        connection_id = str(
+            getattr(transport, "_wheelbase_connection_id", "") or ""
+        )
+        if not connection_id:
+            connection_id = f"connection-{uuid.uuid4().hex}"
+            setattr(transport, "_wheelbase_connection_id", connection_id)
+        return connection_id
+
+
 def _wheelbase_explicit_cwd(session: dict | None) -> str | None:
     if session and session.get("explicit_cwd") and session.get("cwd"):
         return str(session["cwd"])
@@ -9345,6 +9359,9 @@ def _run_prompt_submit(
                     Path(get_hermes_home()),
                     conversation_id=session["session_key"],
                     explicit_cwd=_wheelbase_explicit_cwd(session),
+                    connection_id=_wheelbase_connection_id(
+                        session.get("transport")
+                    ),
                 )
             cols = session.get("cols", 80)
             streamer = make_stream_renderer(cols)

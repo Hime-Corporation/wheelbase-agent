@@ -127,6 +127,22 @@ def test_sdk_context_set_and_reset(tmp_path):
     assert wb_runtime.current_identity() is None, "cleanup must fail closed for thread reuse"
 
 
+def test_sdk_task_identity_records_exact_connection_owner(tmp_path):
+    cleanup = apply_session_injection(
+        "task-origin",
+        IDENT_A,
+        tmp_path,
+        connection_id="connection-d1",
+    )
+    try:
+        assert (
+            wb_runtime.get_task_identity("task-origin")["_connection_id"]
+            == "connection-d1"
+        )
+    finally:
+        cleanup()
+
+
 def test_sdk_context_carries_immutable_client_device_origin(tmp_path):
     identity = WheelbaseIdentity(
         user_id="desktop-user",

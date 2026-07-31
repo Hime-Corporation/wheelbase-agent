@@ -528,6 +528,17 @@ def _desktop_requires_cdp(task_id: str) -> bool:
 
 
 def _desktop_task_cdp_raw(task_id: str) -> str:
+    try:
+        from wheelbase_sdk.runtime import get_task_identity
+
+        identity = get_task_identity(task_id) or {}
+        if identity.get("client") == "desktop":
+            # Active-turn identity is the authoritative capability source. It
+            # is refreshed atomically when the broker renews or clears relays;
+            # the browser registry remains the lifecycle/session cache below.
+            return str(identity.get("cdp_url") or "").strip()
+    except ImportError:
+        pass
     with _task_cdp_lock:
         return str(_task_cdp_urls.get(task_id, "") or "").strip()
 

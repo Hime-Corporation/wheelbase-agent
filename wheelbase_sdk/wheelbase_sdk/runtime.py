@@ -49,9 +49,14 @@ def set_task_identity(task_id: str, identity: dict[str, Any]) -> contextvars.Tok
     Returns a token the caller MUST pass to reset_identity() when the turn
     ends (in a finally block) so reused threads never leak identity.
     """
+    scoped = dict(identity)
     with _lock:
-        _by_task[task_id] = dict(identity)
-    return _current.set(dict(identity))
+        _by_task[task_id] = scoped
+    # The ContextVar and task registry deliberately share this object. A
+    # broker capability refresh mutates it under _lock so a turn already in
+    # progress observes the new URLs through both current_identity() and the
+    # by-task tool routing path.
+    return _current.set(scoped)
 
 
 def reset_identity(token: contextvars.Token) -> None:
@@ -72,11 +77,13 @@ def activate_task(task_id: str) -> Optional[contextvars.Token]:
     """
     with _lock:
         ident = _by_task.get(task_id)
-    return _current.set(dict(ident) if ident else None)
+    return _current.set(ident)
 
 
 def current_identity() -> Optional[dict]:
-    return _current.get()
+    ident = _current.get()
+    with _lock:
+        return dict(ident) if ident is not None else None
 
 
 def get_task_identity(task_id: str) -> Optional[dict]:
@@ -92,6 +99,42 @@ def get_task_identity(task_id: str) -> Optional[dict]:
     with _lock:
         ident = _by_task.get(task_id)
     return dict(ident) if ident is not None else None
+
+
+def refresh_connection_tasks(
+    connection_id: str, refreshed: dict[str, Any]
+) -> tuple[str, ...]:
+    """Refresh active tasks owned by one exact broker connection.
+
+    Immutable scope fields must match before a task is touched. The shared
+    per-task dict is mutated in place so an already-running ContextVar sees
+    the same atomic capability replacement as by-task tool lookups.
+    """
+    if not connection_id:
+        return ()
+    immutable = ("tenant_id", "user_id", "client", "device_id")
+    refreshed_scope = {
+        field: str(refreshed.get(field) or "").strip() for field in immutable
+    }
+    updated: list[str] = []
+    with _lock:
+        for task_id, current in _by_task.items():
+            if current.get("_connection_id") != connection_id:
+                continue
+            current_scope = {
+                field: str(current.get(field) or "").strip() for field in immutable
+            }
+            if current_scope != refreshed_scope:
+                continue
+            current.update(
+                jwt=str(refreshed.get("jwt") or "").strip(),
+                cdp_url=str(refreshed.get("cdp_url") or "").strip(),
+                shell_relay_url=str(
+                    refreshed.get("shell_relay_url") or ""
+                ).strip(),
+            )
+            updated.append(task_id)
+    return tuple(updated)
 
 
 def clear_task(task_id: str) -> None:

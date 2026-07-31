@@ -134,6 +134,7 @@ def apply_session_injection(
     *,
     conversation_id: Optional[str] = None,
     explicit_cwd: Optional[str] = None,
+    connection_id: str = "",
 ) -> Callable[[], None]:
     """Scope the upcoming turn to *identity*. Returns a cleanup callable the
     turn's finally block MUST invoke (resets the SDK context for thread reuse).
@@ -169,6 +170,7 @@ def apply_session_injection(
                 "cdp_url": identity.cdp_url or "",
                 "client": identity.client or "",
                 "device_id": identity.device_id or "",
+                "_connection_id": str(connection_id or ""),
             },
         )
 

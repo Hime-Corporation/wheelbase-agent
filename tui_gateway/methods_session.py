@@ -341,6 +341,16 @@ def _(rid, params: dict) -> dict:
             for session in _sessions.values():
                 if session.get("transport") is transport:
                     session["wheelbase_identity"] = refreshed
+            from wheelbase_sdk import runtime as wheelbase_runtime
+
+            active_task_ids = wheelbase_runtime.refresh_connection_tasks(
+                _wheelbase_connection_id(transport),
+                refreshed.__dict__,
+            )
+        from tools.browser_tool import register_task_cdp_url
+
+        for task_id in active_task_ids:
+            register_task_cdp_url(task_id, refreshed.cdp_url)
     except Exception as e:
         return _err(rid, 5040, f"credential refresh failed: {e}")
     return _ok(
@@ -358,32 +368,96 @@ def _(rid, params: dict) -> dict:
 
 @method("wheelbase.runtime.probe")
 def _(rid, params: dict) -> dict:
-    """Return non-secret child/profile proof and a side-effect-free relay probe.
+    """Validate relay challenge v2 and prove desktop loss fails closed.
 
-    The desktop probe is attempted only after both advertised desktop
-    capabilities are absent. It calls the real desktop-routing policy with a
-    spy fallback, so a regression is observed without executing on the desktop,
-    cloud sandbox, or gateway host.
+    The backend owns the challenge and passes its result to this diagnostic.
+    We return only the bounded challenge states and fingerprints. When a
+    desktop challenge did not pass *and* the matching capability has already
+    been cleared, the real shell/browser routing policy is exercised with no
+    application command or fallback execution.
     """
     ident = _transport_identity()
     if ident is None:
         return _err(rid, 4030, "connection identity required")
 
-    result = _wheelbase_runtime_fingerprints(ident)
-    probe = {
-        "attempted": False,
-        "error_code": "desktop_identity_required",
-        "fallback_invocations": 0,
+    relay_status = params.get("relay_status_v2")
+    if not isinstance(relay_status, dict):
+        return _err(rid, 4004, "relay_status_v2 required")
+
+    common_fields = {
+        "version",
+        "client",
+        "cdp_relay_challenge",
+        "shell_relay_challenge",
     }
-    if ident.client != "desktop":
-        result["desktop_probe"] = probe
-        return _ok(rid, result)
-    if ident.cdp_url or ident.shell_relay_url:
-        probe["error_code"] = "desktop_available"
-        result["desktop_probe"] = probe
+    client = relay_status.get("client")
+    if type(relay_status.get("version")) is not int or relay_status.get("version") != 2:
+        return _err(rid, 4004, "invalid relay_status_v2 schema")
+    if client not in {"desktop", "mobile"}:
+        return _err(rid, 4004, "invalid relay_status_v2 schema")
+    if client != ident.client:
+        return _err(rid, 4032, "relay challenge identity scope mismatch")
+
+    cdp_challenge = relay_status.get("cdp_relay_challenge")
+    shell_challenge = relay_status.get("shell_relay_challenge")
+    if client == "desktop":
+        if set(relay_status) != common_fields | {"device_id"}:
+            return _err(rid, 4004, "invalid relay_status_v2 schema")
+        if cdp_challenge not in {"passed", "failed", "unavailable"}:
+            return _err(rid, 4004, "invalid relay_status_v2 schema")
+        if shell_challenge not in {"passed", "failed", "unavailable"}:
+            return _err(rid, 4004, "invalid relay_status_v2 schema")
+        if not ident.device_id or relay_status.get("device_id") != ident.device_id:
+            return _err(rid, 4032, "relay challenge identity scope mismatch")
+    else:
+        if set(relay_status) != common_fields:
+            return _err(rid, 4004, "invalid relay_status_v2 schema")
+        if cdp_challenge != "not_applicable" or shell_challenge != "not_applicable":
+            return _err(rid, 4004, "invalid relay_status_v2 schema")
+
+    result = _wheelbase_runtime_fingerprints(ident)
+    result["version"] = 2
+    result["relay_challenge"] = {
+        "client": client,
+        "scope_match": True,
+        "cdp_relay_challenge": cdp_challenge,
+        "shell_relay_challenge": shell_challenge,
+    }
+    policies = {}
+    capability_by_surface = {
+        "cdp": ident.cdp_url,
+        "shell": ident.shell_relay_url,
+    }
+    challenge_by_surface = {
+        "cdp": cdp_challenge,
+        "shell": shell_challenge,
+    }
+    for surface in ("cdp", "shell"):
+        if client != "desktop":
+            error_code = "desktop_identity_required"
+        elif challenge_by_surface[surface] == "passed":
+            error_code = "challenge_passed"
+        elif capability_by_surface[surface]:
+            # The challenge result and agent identity crossed during refresh.
+            # Do not touch a possibly live relay; the caller can poll again.
+            error_code = "identity_refresh_pending"
+        else:
+            error_code = ""
+        policies[surface] = {
+            "attempted": False,
+            "error_code": error_code,
+            "fallback_invocations": 0,
+        }
+
+    lost_surfaces = [
+        surface
+        for surface in ("cdp", "shell")
+        if client == "desktop" and not policies[surface]["error_code"]
+    ]
+    if not lost_surfaces:
+        result["desktop_policies"] = policies
         return _ok(rid, result)
 
-    probe["attempted"] = True
     task_id = f"wheelbase-runtime-probe-{uuid.uuid4().hex}"
     wheelbase_runtime = None
     runtime_token = None
@@ -403,38 +477,60 @@ def _(rid, params: dict) -> dict:
                 "shell_relay_url": "",
             },
         )
-        fallback_count = 0
 
-        def diagnostic_fallback(_args):
-            nonlocal fallback_count
-            fallback_count += 1
-            return json.dumps({"error_code": "diagnostic_fallback_invoked"})
+        if "cdp" in lost_surfaces:
+            policies["cdp"]["attempted"] = True
+            from tools import browser_tool
 
-        plugin = sys.modules.get("hermes_plugins.wheelbase_desktop_exec")
-        if plugin is None:
-            plugin = importlib.import_module("plugins.wheelbase-desktop-exec")
-        raw = plugin.route_or_passthrough(
-            tool_name="terminal",
-            args={"command": ":"},
-            next_call=diagnostic_fallback,
-            task_id=task_id,
-            tool_call_id=uuid.uuid4().hex,
-        )
-        parsed = json.loads(raw) if isinstance(raw, str) else dict(raw or {})
-        probe["error_code"] = str(
-            parsed.get("error_code") or "diagnostic_unexpected_result"
-        )
-        probe["fallback_invocations"] = fallback_count
+            browser_tool.register_task_cdp_url(task_id, "")
+            parsed = browser_tool._run_browser_command(task_id, "snapshot", [])
+            policies["cdp"]["error_code"] = str(
+                parsed.get("error_code") or "diagnostic_unexpected_result"
+            )
+
+        if "shell" in lost_surfaces:
+            policies["shell"]["attempted"] = True
+            fallback_count = 0
+
+            def diagnostic_fallback(_args):
+                nonlocal fallback_count
+                fallback_count += 1
+                return json.dumps({"error_code": "diagnostic_fallback_invoked"})
+
+            plugin = sys.modules.get("hermes_plugins.wheelbase_desktop_exec")
+            if plugin is None:
+                plugin = importlib.import_module("plugins.wheelbase-desktop-exec")
+            raw = plugin.route_or_passthrough(
+                tool_name="terminal",
+                args={"command": ":"},
+                next_call=diagnostic_fallback,
+                task_id=task_id,
+                tool_call_id=uuid.uuid4().hex,
+            )
+            parsed = json.loads(raw) if isinstance(raw, str) else dict(raw or {})
+            policies["shell"]["error_code"] = str(
+                parsed.get("error_code") or "diagnostic_unexpected_result"
+            )
+            policies["shell"]["fallback_invocations"] = fallback_count
     except Exception:
         logger.exception("wheelbase.runtime.probe failed")
-        probe["error_code"] = "diagnostic_unavailable"
+        for surface in lost_surfaces:
+            if not policies[surface]["error_code"]:
+                policies[surface]["error_code"] = "diagnostic_unavailable"
     finally:
         if wheelbase_runtime is not None and runtime_token is not None:
             wheelbase_runtime.reset_identity(runtime_token)
         if wheelbase_runtime is not None:
             wheelbase_runtime.clear_task(task_id)
+        if "cdp" in lost_surfaces:
+            try:
+                from tools import browser_tool
 
-    result["desktop_probe"] = probe
+                browser_tool.register_task_cdp_url(task_id, "")
+            except Exception:
+                pass
+
+    result["desktop_policies"] = policies
     return _ok(rid, result)
 
 

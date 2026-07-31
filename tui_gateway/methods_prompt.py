@@ -691,6 +691,8 @@ def _(rid, params: dict) -> dict:
     if not text:
         return _err(rid, 4012, "text required")
     task_id = f"bg_{uuid.uuid4().hex[:6]}"
+    owner_transport = current_transport() or session.get("transport")
+    owner_connection_id = _wheelbase_connection_id(owner_transport)
 
     def run():
         wb_cleanup = None
@@ -700,7 +702,9 @@ def _(rid, params: dict) -> dict:
             # per-user scoping as the parent turn (SDK credential, CDP relay,
             # sandbox volume). FAIL CLOSED: injection failure aborts the task
             # via the except below — never unscoped execution (spec §5/§7).
-            wb_ident = session.get("wheelbase_identity")
+            wb_ident = getattr(owner_transport, "wheelbase_identity", None)
+            if wb_ident is None:
+                wb_ident = session.get("wheelbase_identity")
             if wb_ident is not None:
                 from tui_gateway.wheelbase_inject import apply_session_injection
 
@@ -710,6 +714,7 @@ def _(rid, params: dict) -> dict:
                     Path(get_hermes_home()),
                     conversation_id=str(session.get("session_key") or "") or None,
                     explicit_cwd=_wheelbase_explicit_cwd(session),
+                    connection_id=owner_connection_id,
                 )
 
             from run_agent import AIAgent
@@ -764,6 +769,8 @@ def _(rid, params: dict) -> dict:
         return _err(rid, 4012, "url required")
 
     task_id = f"preview_{uuid.uuid4().hex[:6]}"
+    owner_transport = current_transport() or session.get("transport")
+    owner_connection_id = _wheelbase_connection_id(owner_transport)
     parent = params.get("session_id", "")
     parent_history = _preview_restart_history(session)
     has_history = bool(parent_history)
@@ -826,7 +833,9 @@ def _(rid, params: dict) -> dict:
             # except below. Injection runs after the preview cwd registration so
             # its /workspace cwd wins for identified sessions (host paths are
             # meaningless inside the per-user sandbox).
-            wb_ident = session.get("wheelbase_identity")
+            wb_ident = getattr(owner_transport, "wheelbase_identity", None)
+            if wb_ident is None:
+                wb_ident = session.get("wheelbase_identity")
             if wb_ident is not None:
                 from tui_gateway.wheelbase_inject import apply_session_injection
 
@@ -836,6 +845,7 @@ def _(rid, params: dict) -> dict:
                     Path(get_hermes_home()),
                     conversation_id=str(session.get("session_key") or "") or None,
                     explicit_cwd=_wheelbase_explicit_cwd(session),
+                    connection_id=owner_connection_id,
                 )
 
             history_note = (

@@ -238,39 +238,49 @@ Missing or bad token/identity should close with 4003.
 
 ### Authenticated child and relay-loss proof
 
-The backend exposes the current relay advertisement for an agent-session token:
+The backend challenges the exact desktop relays owned by an agent-session
+token:
 
 ```http
-GET /v1/agent/relay-status?session=<agent-session-token>
+GET /v1/agent/relay-status
+Authorization: Bearer <agent-session-token>
 ```
 
 A valid request returns HTTP 200 with `Cache-Control: no-store`. Desktop JSON
-has exactly this public shape:
+has exactly this v2 shape:
 
 ```json
 {
+  "version": 2,
   "client": "desktop",
   "device_id": "<UUID>",
-  "cdp_relay_available": true,
-  "shell_relay_available": true
+  "cdp_relay_challenge": "passed",
+  "shell_relay_challenge": "passed"
 }
 ```
 
-Mobile JSON omits `device_id` and reports both desktop capabilities as false:
+Each desktop challenge is `passed`, `failed`, or `unavailable`. `unavailable`
+means there is no exact connected peer for that device. `failed` means the
+peer did not return the matching opaque pong before the timeout. `passed`
+means the matching pong arrived. The backend starts the shell and CDP
+challenges concurrently; neither challenge contains an application command or
+a CDP method.
+
+Mobile JSON omits `device_id` and marks both desktop-only challenges not
+applicable:
 
 ```json
 {
+  "version": 2,
   "client": "mobile",
-  "cdp_relay_available": false,
-  "shell_relay_available": false
+  "cdp_relay_challenge": "not_applicable",
+  "shell_relay_challenge": "not_applicable"
 }
 ```
 
-An invalid, bad, or unregistered session token returns HTTP 401. Hub loss is
-represented directly by the corresponding availability boolean becoming false;
-there is no separate loss code. On its next 30-second poll, the chat broker
-refreshes the already-authenticated agent WebSocket with these exact JSON-RPC
-notifications:
+An invalid, bad, or unregistered session token returns HTTP 401. After a failed
+or unavailable challenge, the chat broker clears the affected capability on
+the already-authenticated agent WebSocket with `identity.update`:
 
 ```json
 {
@@ -296,59 +306,101 @@ notifications:
 ```
 
 Missing or empty capability fields clear prior capabilities. Tenant, user,
-client, and device scope are immutable on the connection.
+client, and device scope are immutable on the connection. A refresh immediately
+updates active turns owned by that exact connection; it cannot update another
+desktop device for the same tenant/user.
 
 Use `wheelbase.runtime.probe` over that authenticated agent WebSocket to prove
-which physical child/profile served the request and, after loss, that a harmless
-desktop-required path fails closed. The method takes no parameters and does not
-require a live Hermes chat session:
+which physical child/profile served the request and, after loss, that both real
+desktop-required policies fail closed. Pass the backend response unchanged as
+`relay_status_v2`; the method validates its version and exact connection scope
+but returns only sanitized challenge states:
 
 ```json
-{"id":"runtime-proof","method":"wheelbase.runtime.probe","params":{}}
+{
+  "id": "runtime-proof",
+  "method": "wheelbase.runtime.probe",
+  "params": {
+    "relay_status_v2": {
+      "version": 2,
+      "client": "desktop",
+      "device_id": "<UUID>",
+      "cdp_relay_challenge": "passed",
+      "shell_relay_challenge": "passed"
+    }
+  }
+}
 ```
 
-While either desktop capability is still advertised, the response is:
+While both challenges pass, the response is:
 
 ```json
 {
   "id": "runtime-proof",
   "result": {
+    "version": 2,
     "instance_fingerprint": "<20 lowercase hex characters>",
     "profile_fingerprint": "<20 lowercase hex characters>",
     "profile_scope_match": true,
-    "desktop_probe": {
-      "attempted": false,
-      "error_code": "desktop_available",
+    "relay_challenge": {
+      "client": "desktop",
+      "scope_match": true,
+      "cdp_relay_challenge": "passed",
+      "shell_relay_challenge": "passed"
+    },
+    "desktop_policies": {
+      "cdp": {
+        "attempted": false,
+        "error_code": "challenge_passed",
+        "fallback_invocations": 0
+      },
+      "shell": {
+        "attempted": false,
+        "error_code": "challenge_passed",
+        "fallback_invocations": 0
+      }
+    }
+  }
+}
+```
+
+After D1 loses both relays and its empty capability refresh has arrived, pass
+D1's `failed` or `unavailable` states. The response must return the same
+fingerprints with:
+
+```json
+{
+  "desktop_policies": {
+    "cdp": {
+      "attempted": true,
+      "error_code": "desktop_unavailable",
+      "fallback_invocations": 0
+    },
+    "shell": {
+      "attempted": true,
+      "error_code": "desktop_unavailable",
       "fallback_invocations": 0
     }
   }
 }
 ```
 
-After relay status is false and the empty capability refresh has arrived, the
-same request must return the same fingerprints with:
-
-```json
-{
-  "desktop_probe": {
-    "attempted": true,
-    "error_code": "desktop_unavailable",
-    "fallback_invocations": 0
-  }
-}
-```
-
-The probe calls the real desktop-origin routing policy with a spy as its only
-fallback. It never sends a relay frame and the spy never executes a cloud,
-local, or gateway-host action. A mobile-origin connection receives
-`attempted: false`, `error_code: "desktop_identity_required"`, and the same
-child/profile fingerprints for the same tenant/user.
+The probe calls the real shell and browser desktop-origin policies. The shell
+policy has a counting spy as its fallback, and the browser policy is evaluated
+before browser discovery. Neither policy sends a relay frame or executes a
+cloud, local, gateway-host, application, or CDP action. If a failed challenge
+arrives before its capability-clear refresh, that surface reports
+`identity_refresh_pending` without attempting the policy. A mobile-origin
+connection reports `attempted: false`, `error_code:
+"desktop_identity_required"` for both policies.
 
 For physical isolation evidence, connections D1, D2, and mobile for the same
 tenant/user must have identical instance/profile fingerprints. A different user
 or the same user identifier under a different tenant must have different
-fingerprints. Every response must report `profile_scope_match: true`. The RPC
-returns no paths, URLs, tokens, raw tenant/user identifiers, or prompt content.
+fingerprints. Losing D1 must leave D2's identity and both active capabilities
+unchanged. Every response must report `profile_scope_match: true`. The RPC
+returns no nonce, device ID, paths, URLs, tokens, raw tenant/user identifiers,
+or prompt content.
 
 ---
 

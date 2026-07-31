@@ -5,6 +5,7 @@ persistence on session rows, and the identity.update credential refresh.
 """
 from __future__ import annotations
 
+import importlib
 import json
 import threading
 from pathlib import Path
@@ -16,6 +17,7 @@ from tui_gateway import server
 from tui_gateway.transport import bind_transport, reset_transport
 from tui_gateway import wheelbase_identity
 from tui_gateway.wheelbase_identity import WheelbaseIdentity
+from wheelbase_sdk import runtime as wb_runtime
 
 
 @pytest.fixture(autouse=True)
@@ -261,7 +263,213 @@ def test_identity_update_rejected_without_identity(_bound):
 
 
 @pytest.mark.parametrize(
-    "identity,attempted,error_code",
+    "new_cdp,new_shell",
+    [
+        ("wss://cdp/new", "wss://shell/new"),
+        ("", ""),
+    ],
+)
+def test_identity_update_refreshes_active_shell_and_browser_policy_immediately(
+    new_cdp, new_shell, tmp_path, monkeypatch
+):
+    from tools import browser_tool
+
+    plugin = importlib.import_module("plugins.wheelbase-desktop-exec")
+    task_id = "active-d1"
+    connection_id = "connection-d1"
+    old = WheelbaseIdentity(
+        user_id="user-aaaa",
+        tenant_id="t1",
+        client="desktop",
+        device_id="device-1",
+        jwt="jwt-old",
+        cdp_url="wss://cdp/old",
+        shell_relay_url="wss://shell/old",
+    )
+    transport = _FakeTransport(old)
+    transport._wheelbase_connection_id = connection_id
+    session = {
+        "session_key": task_id,
+        "transport": transport,
+        "wheelbase_identity": old,
+    }
+    runtime_token = wb_runtime.set_task_identity(
+        task_id,
+        {**old.__dict__, "_connection_id": connection_id},
+    )
+    browser_tool.register_task_cdp_url(task_id, old.cdp_url)
+    monkeypatch.setattr(server, "_sessions", {task_id: session})
+    monkeypatch.setattr(server, "get_hermes_home", lambda: str(tmp_path))
+    transport_token = bind_transport(transport)
+    fallback_calls = []
+    try:
+        response = server.handle_request(
+            {
+                "id": "refresh",
+                "method": "identity.update",
+                "params": {
+                    "jwt": "jwt-new",
+                    "client": "desktop",
+                    "device_id": "device-1",
+                    "cdp_url": new_cdp,
+                    "shell_relay_url": new_shell,
+                },
+            }
+        )
+        assert response["result"]["ok"] is True
+
+        active_identity = wb_runtime.get_task_identity(task_id)
+        assert active_identity["cdp_url"] == new_cdp
+        assert active_identity["shell_relay_url"] == new_shell
+        assert wb_runtime.current_identity()["cdp_url"] == new_cdp
+        assert browser_tool._desktop_task_cdp_raw(task_id) == new_cdp
+
+        if new_shell:
+            relayed = {}
+            monkeypatch.setattr(
+                plugin,
+                "_make_transport",
+                lambda relay_url, identity: relayed.update(
+                    relay_url=relay_url, identity=identity
+                )
+                or object(),
+            )
+            monkeypatch.setattr(
+                plugin,
+                "_relay_command",
+                lambda *_args, **_kwargs: json.dumps({"success": True}),
+            )
+            shell_result = json.loads(
+                plugin.route_or_passthrough(
+                    tool_name="terminal",
+                    args={"command": ":"},
+                    next_call=lambda args: fallback_calls.append(args),
+                    task_id=task_id,
+                    tool_call_id="renewed-shell",
+                )
+            )
+            assert shell_result["success"] is True
+            assert relayed["relay_url"] == new_shell
+            resolved_cdp = []
+            monkeypatch.setattr(
+                browser_tool,
+                "_resolve_cdp_override",
+                lambda raw: resolved_cdp.append(raw) or raw,
+            )
+            monkeypatch.setattr(
+                browser_tool,
+                "_find_agent_browser",
+                lambda: (_ for _ in ()).throw(FileNotFoundError("diagnostic")),
+            )
+            browser_tool._run_browser_command(task_id, "snapshot", [])
+            assert resolved_cdp == [new_cdp]
+        else:
+            shell_result = json.loads(
+                plugin.route_or_passthrough(
+                    tool_name="terminal",
+                    args={"command": ":"},
+                    next_call=lambda args: fallback_calls.append(args),
+                    task_id=task_id,
+                    tool_call_id="disconnected-shell",
+                )
+            )
+            assert shell_result["error_code"] == "desktop_unavailable"
+            browser_result = browser_tool._run_browser_command(
+                task_id, "snapshot", []
+            )
+            assert browser_result["error_code"] == "desktop_unavailable"
+        assert fallback_calls == []
+    finally:
+        reset_transport(transport_token)
+        wb_runtime.reset_identity(runtime_token)
+        wb_runtime.clear_task(task_id)
+        browser_tool.register_task_cdp_url(task_id, "")
+
+
+def test_identity_update_does_not_refresh_another_device_active_tasks(
+    tmp_path, monkeypatch
+):
+    from tools import browser_tool
+
+    d1 = WheelbaseIdentity(
+        user_id="user-aaaa",
+        tenant_id="t1",
+        client="desktop",
+        device_id="device-1",
+        cdp_url="wss://cdp/d1-old",
+        shell_relay_url="wss://shell/d1-old",
+    )
+    d2 = WheelbaseIdentity(
+        user_id="user-aaaa",
+        tenant_id="t1",
+        client="desktop",
+        device_id="device-2",
+        cdp_url="wss://cdp/d2",
+        shell_relay_url="wss://shell/d2",
+    )
+    t1 = _FakeTransport(d1)
+    t1._wheelbase_connection_id = "connection-d1"
+    t2 = _FakeTransport(d2)
+    t2._wheelbase_connection_id = "connection-d2"
+    task1, task2 = "active-d1", "active-d2"
+    token1 = wb_runtime.set_task_identity(
+        task1, {**d1.__dict__, "_connection_id": "connection-d1"}
+    )
+    token2 = wb_runtime.set_task_identity(
+        task2, {**d2.__dict__, "_connection_id": "connection-d2"}
+    )
+    browser_tool.register_task_cdp_url(task1, d1.cdp_url)
+    browser_tool.register_task_cdp_url(task2, d2.cdp_url)
+    monkeypatch.setattr(
+        server,
+        "_sessions",
+        {
+            task1: {
+                "session_key": task1,
+                "transport": t1,
+                "wheelbase_identity": d1,
+            },
+            task2: {
+                "session_key": task2,
+                "transport": t2,
+                "wheelbase_identity": d2,
+            },
+        },
+    )
+    monkeypatch.setattr(server, "get_hermes_home", lambda: str(tmp_path))
+    transport_token = bind_transport(t1)
+    try:
+        server.handle_request(
+            {
+                "id": "disconnect-d1",
+                "method": "identity.update",
+                "params": {
+                    "jwt": "jwt-new",
+                    "client": "desktop",
+                    "device_id": "device-1",
+                    "cdp_url": "",
+                    "shell_relay_url": "",
+                },
+            }
+        )
+        assert wb_runtime.get_task_identity(task1)["shell_relay_url"] == ""
+        assert browser_tool._desktop_task_cdp_raw(task1) == ""
+        assert (
+            wb_runtime.get_task_identity(task2)["shell_relay_url"]
+            == d2.shell_relay_url
+        )
+        assert browser_tool._desktop_task_cdp_raw(task2) == d2.cdp_url
+    finally:
+        reset_transport(transport_token)
+        wb_runtime.reset_identity(token2)
+        wb_runtime.reset_identity(token1)
+        for task_id in (task1, task2):
+            wb_runtime.clear_task(task_id)
+            browser_tool.register_task_cdp_url(task_id, "")
+
+
+@pytest.mark.parametrize(
+    "identity,relay_status,attempted,error_code",
     [
         (
             WheelbaseIdentity(
@@ -270,6 +478,13 @@ def test_identity_update_rejected_without_identity(_bound):
                 client="desktop",
                 device_id="device-1",
             ),
+            {
+                "version": 2,
+                "client": "desktop",
+                "device_id": "device-1",
+                "cdp_relay_challenge": "failed",
+                "shell_relay_challenge": "unavailable",
+            },
             True,
             "desktop_unavailable",
         ),
@@ -282,8 +497,15 @@ def test_identity_update_rejected_without_identity(_bound):
                 cdp_url="wss://cdp/online",
                 shell_relay_url="wss://shell/online",
             ),
+            {
+                "version": 2,
+                "client": "desktop",
+                "device_id": "device-1",
+                "cdp_relay_challenge": "passed",
+                "shell_relay_challenge": "passed",
+            },
             False,
-            "desktop_available",
+            "challenge_passed",
         ),
         (
             WheelbaseIdentity(
@@ -291,41 +513,204 @@ def test_identity_update_rejected_without_identity(_bound):
                 tenant_id="t1",
                 client="mobile",
             ),
+            {
+                "version": 2,
+                "client": "mobile",
+                "cdp_relay_challenge": "not_applicable",
+                "shell_relay_challenge": "not_applicable",
+            },
             False,
             "desktop_identity_required",
         ),
     ],
 )
 def test_runtime_probe_returns_safe_profile_and_fail_closed_evidence(
-    identity, attempted, error_code, tmp_path, _bound, monkeypatch
+    identity, relay_status, attempted, error_code, tmp_path, _bound, monkeypatch
 ):
-    profile_home = tmp_path / "tenants" / identity.tenant_id / "profiles" / f"wb-{identity.user_id}"
+    from tools import browser_tool
+
+    profile_home = (
+        tmp_path
+        / "tenants"
+        / identity.tenant_id
+        / "profiles"
+        / f"wb-{identity.user_id}"
+    )
     monkeypatch.setattr(server, "get_hermes_home", lambda: profile_home)
+    monkeypatch.setattr(
+        browser_tool,
+        "_find_agent_browser",
+        lambda: (_ for _ in ()).throw(AssertionError("host browser action")),
+    )
     _bound(identity)
 
     response = server.handle_request(
-        {"id": "probe", "method": "wheelbase.runtime.probe", "params": {}}
+        {
+            "id": "probe",
+            "method": "wheelbase.runtime.probe",
+            "params": {"relay_status_v2": relay_status},
+        }
     )
 
     result = response["result"]
     assert set(result) == {
+        "version",
         "instance_fingerprint",
         "profile_fingerprint",
         "profile_scope_match",
-        "desktop_probe",
+        "relay_challenge",
+        "desktop_policies",
     }
+    assert result["version"] == 2
     assert result["profile_scope_match"] is True
     assert len(result["instance_fingerprint"]) == 20
     assert len(result["profile_fingerprint"]) == 20
-    assert set(result["desktop_probe"]) == {
-        "attempted",
-        "error_code",
-        "fallback_invocations",
+    assert result["relay_challenge"] == {
+        "client": relay_status["client"],
+        "scope_match": True,
+        "cdp_relay_challenge": relay_status["cdp_relay_challenge"],
+        "shell_relay_challenge": relay_status["shell_relay_challenge"],
     }
-    assert result["desktop_probe"] == {
-        "attempted": attempted,
-        "error_code": error_code,
-        "fallback_invocations": 0,
+    assert set(result["desktop_policies"]) == {"cdp", "shell"}
+    for policy in result["desktop_policies"].values():
+        assert policy == {
+            "attempted": attempted,
+            "error_code": error_code,
+            "fallback_invocations": 0,
+        }
+
+
+def test_runtime_probe_rejects_relay_challenge_from_another_device(
+    tmp_path, _bound, monkeypatch
+):
+    identity = WheelbaseIdentity(
+        user_id="user-aaaa",
+        tenant_id="t1",
+        client="desktop",
+        device_id="device-1",
+    )
+    monkeypatch.setattr(server, "get_hermes_home", lambda: tmp_path)
+    _bound(identity)
+
+    response = server.handle_request(
+        {
+            "id": "wrong-device",
+            "method": "wheelbase.runtime.probe",
+            "params": {
+                "relay_status_v2": {
+                    "version": 2,
+                    "client": "desktop",
+                    "device_id": "device-2",
+                    "cdp_relay_challenge": "unavailable",
+                    "shell_relay_challenge": "unavailable",
+                }
+            },
+        }
+    )
+    assert response["error"]["code"] == 4032
+
+
+@pytest.mark.parametrize(
+    "relay_status",
+    [
+        {},
+        {
+            "version": 1,
+            "client": "desktop",
+            "device_id": "device-1",
+            "cdp_relay_challenge": "passed",
+            "shell_relay_challenge": "passed",
+        },
+        {
+            "version": 2,
+            "client": "desktop",
+            "device_id": "device-1",
+            "cdp_relay_challenge": "passed",
+            "shell_relay_challenge": "passed",
+            "nonce": "must-not-be-forwarded",
+        },
+        {
+            "version": 2,
+            "client": "mobile",
+            "device_id": "device-1",
+            "cdp_relay_challenge": "not_applicable",
+            "shell_relay_challenge": "not_applicable",
+        },
+    ],
+)
+def test_runtime_probe_rejects_noncanonical_relay_status_v2(
+    relay_status, tmp_path, _bound, monkeypatch
+):
+    identity = WheelbaseIdentity(
+        user_id="user-aaaa",
+        tenant_id="t1",
+        client=str(relay_status.get("client") or "desktop"),
+        device_id=(
+            "device-1" if relay_status.get("client", "desktop") == "desktop" else ""
+        ),
+    )
+    monkeypatch.setattr(server, "get_hermes_home", lambda: tmp_path)
+    _bound(identity)
+
+    response = server.handle_request(
+        {
+            "id": "bad-contract",
+            "method": "wheelbase.runtime.probe",
+            "params": {"relay_status_v2": relay_status},
+        }
+    )
+
+    assert response["error"]["code"] == 4004
+
+
+def test_runtime_probe_evaluates_lost_surface_independently(
+    tmp_path, _bound, monkeypatch
+):
+    from tools import browser_tool
+
+    identity = WheelbaseIdentity(
+        user_id="user-aaaa",
+        tenant_id="t1",
+        client="desktop",
+        device_id="device-1",
+        cdp_url="wss://cdp/still-live",
+        shell_relay_url="",
+    )
+    monkeypatch.setattr(server, "get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(
+        browser_tool,
+        "_find_agent_browser",
+        lambda: (_ for _ in ()).throw(AssertionError("host browser action")),
+    )
+    _bound(identity)
+
+    response = server.handle_request(
+        {
+            "id": "mixed",
+            "method": "wheelbase.runtime.probe",
+            "params": {
+                "relay_status_v2": {
+                    "version": 2,
+                    "client": "desktop",
+                    "device_id": "device-1",
+                    "cdp_relay_challenge": "passed",
+                    "shell_relay_challenge": "unavailable",
+                }
+            },
+        }
+    )
+
+    assert response["result"]["desktop_policies"] == {
+        "cdp": {
+            "attempted": False,
+            "error_code": "challenge_passed",
+            "fallback_invocations": 0,
+        },
+        "shell": {
+            "attempted": True,
+            "error_code": "desktop_unavailable",
+            "fallback_invocations": 0,
+        },
     }
 
 
