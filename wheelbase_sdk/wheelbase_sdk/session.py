@@ -28,38 +28,48 @@ AUTH_EXPIRY_SKEW_SECONDS = 30
 
 
 def _task_session(path: Path) -> WheelbaseSession:
-    from .errors import WheelbaseAuthError
+    from .errors import WheelbaseAuthError, log_auth_lifecycle
+
+    def auth_error(reason: str, data: object = None) -> WheelbaseAuthError:
+        payload = data if isinstance(data, dict) else {}
+        log_auth_lifecycle(
+            reason,
+            source="task",
+            revision=payload.get("revision"),
+            expires_at=payload.get("expires_at"),
+        )
+        return WheelbaseAuthError(reason, reason=reason)
 
     try:
         info = path.lstat()
     except OSError as exc:
-        raise WheelbaseAuthError("refresh_pending", reason="refresh_pending") from exc
+        raise auth_error("refresh_pending") from exc
     if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
-        raise WheelbaseAuthError("refresh_pending", reason="refresh_pending")
+        raise auth_error("refresh_pending")
     if stat.S_IMODE(info.st_mode) != 0o600:
-        raise WheelbaseAuthError("refresh_pending", reason="refresh_pending")
+        raise auth_error("refresh_pending")
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
-        raise WheelbaseAuthError("refresh_pending", reason="refresh_pending") from exc
+        raise auth_error("refresh_pending") from exc
     if not isinstance(data, dict):
-        raise WheelbaseAuthError("refresh_pending", reason="refresh_pending")
+        raise auth_error("refresh_pending")
     token = data.get("access_token")
     expiry = data.get("expires_at")
     revision = data.get("revision")
     source = data.get("source")
     if not isinstance(token, str) or not token.strip():
-        raise WheelbaseAuthError("not_signed_in", reason="not_signed_in")
+        raise auth_error("not_signed_in", data)
     if not isinstance(expiry, int) or isinstance(expiry, bool):
-        raise WheelbaseAuthError("refresh_pending", reason="refresh_pending")
+        raise auth_error("refresh_pending", data)
     if expiry <= int(time.time()):
-        raise WheelbaseAuthError("expired", reason="expired")
+        raise auth_error("expired", data)
     if expiry <= int(time.time()) + AUTH_EXPIRY_SKEW_SECONDS:
-        raise WheelbaseAuthError("refresh_pending", reason="refresh_pending")
+        raise auth_error("refresh_pending", data)
     if not isinstance(revision, int) or isinstance(revision, bool) or revision <= 0:
-        raise WheelbaseAuthError("refresh_pending", reason="refresh_pending")
+        raise auth_error("refresh_pending", data)
     if not isinstance(source, str) or not source.strip():
-        raise WheelbaseAuthError("refresh_pending", reason="refresh_pending")
+        raise auth_error("refresh_pending", data)
     return WheelbaseSession(token.strip(), expiry, revision, source.strip(), path)
 
 
@@ -84,7 +94,8 @@ def load_session() -> WheelbaseSession | None:
     if ident is not None:
         raw_path = ident.get("credential_path")
         if not isinstance(raw_path, str) or not raw_path.strip():
-            from .errors import WheelbaseAuthError
+            from .errors import WheelbaseAuthError, log_auth_lifecycle
+            log_auth_lifecycle("refresh_pending", source="task")
             raise WheelbaseAuthError("refresh_pending", reason="refresh_pending")
         return _task_session(Path(raw_path))
 

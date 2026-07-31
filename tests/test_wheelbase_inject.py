@@ -16,6 +16,8 @@ from tools import browser_tool, terminal_tool
 from tui_gateway.wheelbase_identity import WheelbaseIdentity
 from tui_gateway.wheelbase_inject import (
     apply_session_injection,
+    cleanup_connection_credential,
+    clear_task_credential_state,
     contain_workspace_path,
     user_sandbox_key,
     workspace_volume,
@@ -150,6 +152,58 @@ def test_sdk_task_identity_records_exact_connection_owner(tmp_path):
         )
     finally:
         cleanup()
+
+
+def test_task_teardown_removes_only_exact_jti_credential(tmp_path, caplog):
+    caplog.set_level("INFO")
+    cleanup_a = apply_session_injection("task-a", IDENT_A, tmp_path)
+    cleanup_b = apply_session_injection("task-b", IDENT_B, tmp_path)
+    cleanup_a()
+    cleanup_b()
+
+    path_a = tmp_path / "wheelbase-sessions" / f"{IDENT_A.session_jti_hash}.json"
+    path_b = tmp_path / "wheelbase-sessions" / f"{IDENT_B.session_jti_hash}.json"
+    clear_task_credential_state("task-a", tmp_path, reason="test_teardown")
+
+    assert not path_a.exists()
+    assert path_b.exists()
+    assert wb_runtime.get_task_identity("task-b") is not None
+    signal = next(
+        record.message for record in caplog.records
+        if "wheelbase_identity_lifecycle" in record.message
+    )
+    assert '"event":"credential_cleanup"' in signal
+    assert '"action":"deleted"' in signal
+    assert IDENT_A.user_id not in signal
+    assert IDENT_A.jwt not in signal
+    assert IDENT_A.session_jti_hash not in signal
+
+
+def test_task_teardown_retains_credential_while_same_jti_task_is_active(tmp_path):
+    cleanup_a = apply_session_injection("task-a", IDENT_A, tmp_path)
+    cleanup_origin = apply_session_injection("task-origin", IDENT_A, tmp_path)
+    cleanup_a()
+    cleanup_origin()
+    path = tmp_path / "wheelbase-sessions" / f"{IDENT_A.session_jti_hash}.json"
+
+    clear_task_credential_state("task-a", tmp_path, reason="test_teardown")
+    assert path.exists()
+
+    clear_task_credential_state("task-origin", tmp_path, reason="test_teardown")
+    assert not path.exists()
+
+
+def test_connection_cleanup_retains_active_jti_then_removes_when_unused(tmp_path):
+    cleanup = apply_session_injection("task-a", IDENT_A, tmp_path)
+    cleanup()
+    path = tmp_path / "wheelbase-sessions" / f"{IDENT_A.session_jti_hash}.json"
+
+    assert cleanup_connection_credential(IDENT_A, tmp_path, reason="disconnect") is False
+    assert path.exists()
+
+    wb_runtime.clear_task("task-a")
+    assert cleanup_connection_credential(IDENT_A, tmp_path, reason="disconnect") is True
+    assert not path.exists()
 
 
 def test_sdk_context_carries_immutable_client_device_origin(tmp_path):

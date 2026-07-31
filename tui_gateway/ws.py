@@ -29,10 +29,12 @@ import json
 import logging
 import socket
 import threading
+from pathlib import Path
 from typing import Any
 
 from tui_gateway import server
 from tui_gateway.wheelbase_identity import _attach_identity_to_transport
+from tui_gateway.wheelbase_inject import cleanup_connection_credential
 
 _log = logging.getLogger(__name__)
 
@@ -452,6 +454,16 @@ async def handle_ws(ws: Any) -> None:
                 )
             except Exception:
                 _log.exception("ws transport teardown failed peer=%s", peer)
+            try:
+                await asyncio.to_thread(
+                    cleanup_connection_credential,
+                    getattr(transport, "wheelbase_identity", None),
+                    Path(server.get_hermes_home()),
+                    reason="ws_disconnect",
+                    connection_id=server._wheelbase_connection_id(transport),
+                )
+            except Exception:
+                _log.exception("ws credential teardown failed peer=%s", peer)
         try:
             await ws.close()
         except Exception as exc:

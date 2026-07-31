@@ -72,6 +72,83 @@ class WheelbaseIdentity:
     credential_source: str = "agent_session"
 
 
+def _signal_value(identity: WheelbaseIdentity | Mapping[str, Any], field: str) -> Any:
+    if isinstance(identity, Mapping):
+        return identity.get(field)
+    return getattr(identity, field, None)
+
+
+def _signal_fingerprint(value: Any) -> str:
+    raw = str(value or "").strip()
+    return hashlib.sha256(raw.encode()).hexdigest()[:12] if raw else "none"
+
+
+def identity_signal_fields(
+    identity: WheelbaseIdentity | Mapping[str, Any],
+    *,
+    connection_id: str = "",
+    now: int | None = None,
+) -> dict[str, Any]:
+    """Return bounded lifecycle fields with sensitive scope values hashed."""
+    current = int(time.time()) if now is None else int(now)
+    expiry = _signal_value(identity, "credential_expires_at")
+    expiry = expiry if isinstance(expiry, int) and not isinstance(expiry, bool) else 0
+    revision = _signal_value(identity, "credential_revision")
+    revision = revision if isinstance(revision, int) and not isinstance(revision, bool) else 0
+    client = str(_signal_value(identity, "client") or "").strip().lower()
+    source = str(_signal_value(identity, "credential_source") or "").strip().lower()
+    return {
+        "user_fp": _signal_fingerprint(_signal_value(identity, "user_id")),
+        "tenant_fp": _signal_fingerprint(_signal_value(identity, "tenant_id")),
+        "device_fp": _signal_fingerprint(_signal_value(identity, "device_id")),
+        "jti_fp": _signal_fingerprint(_signal_value(identity, "session_jti_hash")),
+        "connection_fp": _signal_fingerprint(connection_id),
+        "client": client if client in {"desktop", "mobile"} else "unknown",
+        "source": source
+        if source in {"agent_session", "agent_gateway_identity", "local"}
+        else "unknown",
+        "revision": revision,
+        "expiry_age_s": current - expiry if expiry else None,
+        "expiry_skew_s": expiry - current if expiry else None,
+    }
+
+
+def log_identity_lifecycle(
+    event: str,
+    identity: WheelbaseIdentity | Mapping[str, Any],
+    *,
+    reason: str = "",
+    connection_id: str = "",
+    attempted_revision: Any = None,
+    attempted_expires_at: Any = None,
+    active_task_count: int | None = None,
+    action: str = "",
+) -> None:
+    """Emit one token-safe structured broker credential lifecycle signal."""
+    payload = {
+        "event": str(event or "unknown"),
+        **identity_signal_fields(identity, connection_id=connection_id),
+    }
+    if reason:
+        payload["reason"] = str(reason)
+    if isinstance(attempted_revision, int) and not isinstance(attempted_revision, bool):
+        payload["attempted_revision"] = attempted_revision
+    if isinstance(attempted_expires_at, int) and not isinstance(attempted_expires_at, bool):
+        now = int(time.time())
+        payload["attempted_expiry_age_s"] = now - attempted_expires_at
+        payload["attempted_expiry_skew_s"] = attempted_expires_at - now
+    if active_task_count is not None:
+        payload["active_task_count"] = max(0, int(active_task_count))
+    if action:
+        payload["action"] = str(action)
+    level = logging.WARNING if event.endswith("dropped") else logging.INFO
+    _log.log(
+        level,
+        "wheelbase_identity_lifecycle %s",
+        json.dumps(payload, separators=(",", ":"), sort_keys=True),
+    )
+
+
 def _decode_segment(segment: str) -> bytes:
     if not segment or "=" in segment:
         raise ValueError("invalid identity envelope encoding")

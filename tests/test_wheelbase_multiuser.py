@@ -123,6 +123,31 @@ def test_ensure_session_db_row_persists_user_id(db, monkeypatch):
     assert db.get_session("sess-key-2")["user_id"] is None
 
 
+def test_session_teardown_releases_exact_task_credential(tmp_path, monkeypatch):
+    identity = WheelbaseIdentity(
+        user_id="user-aaaa",
+        tenant_id="t1",
+        jwt="jwt-a",
+        session_jti_hash="a" * 64,
+        credential_revision=1,
+        credential_expires_at=9999999999,
+    )
+    from tui_gateway.wheelbase_identity import write_credential_file
+
+    credential = write_credential_file(tmp_path, identity)
+    wb_runtime.set_task_identity(
+        "session-task",
+        {"session_jti_hash": identity.session_jti_hash, "credential_path": str(credential)},
+    )
+    monkeypatch.setattr(server, "get_hermes_home", lambda: str(tmp_path))
+    monkeypatch.setattr(server, "_finalize_session", lambda *_args, **_kwargs: None)
+
+    server._teardown_session({"session_key": "session-task"}, end_reason="test_close")
+
+    assert not credential.exists()
+    assert wb_runtime.get_task_identity("session-task") is None
+
+
 def test_identity_update_rewrites_credential_file(tmp_path, _bound, monkeypatch):
     monkeypatch.setattr(server, "get_hermes_home", lambda: str(tmp_path))
     _bound(IDENT_A)
@@ -258,7 +283,9 @@ def test_identity_update_rejects_immutable_scope_changes(field, value, _bound):
     assert transport.closed is True
 
 
-def test_identity_update_rejects_non_newer_revision_without_mutation(tmp_path, _bound, monkeypatch):
+def test_identity_update_rejects_non_newer_revision_without_mutation(
+    tmp_path, _bound, monkeypatch, caplog
+):
     monkeypatch.setattr(server, "get_hermes_home", lambda: str(tmp_path))
     transport = _bound(IDENT_A)
     response = server.handle_request({"id": 1, "method": "identity.update", "params": {
@@ -269,6 +296,38 @@ def test_identity_update_rejects_non_newer_revision_without_mutation(tmp_path, _
     assert response["error"]["code"] == 4033
     assert transport.wheelbase_identity is IDENT_A
     assert transport.closed is True
+    signal = next(
+        record.message for record in caplog.records
+        if "wheelbase_identity_lifecycle" in record.message
+    )
+    assert '"event":"update_dropped"' in signal
+    assert '"reason":"stale_revision"' in signal
+    assert '"attempted_revision":1' in signal
+    assert IDENT_A.user_id not in signal
+    assert IDENT_A.jwt not in signal
+    assert IDENT_A.session_jti_hash not in signal
+
+
+def test_identity_update_applied_signal_is_safe(tmp_path, _bound, monkeypatch, caplog):
+    caplog.set_level("INFO")
+    monkeypatch.setattr(server, "get_hermes_home", lambda: str(tmp_path))
+    transport = _bound(IDENT_A)
+
+    response = server.handle_request({"id": 1, "method": "identity.update", "params": {
+        "jwt": "sensitive-new-token", "session_jti_hash": IDENT_A.session_jti_hash,
+        "credential_revision": 2, "credential_expires_at": 9999999999,
+    }})
+
+    assert response["result"]["ok"] is True
+    signal = next(
+        record.message for record in caplog.records
+        if "wheelbase_identity_lifecycle" in record.message
+    )
+    assert '"event":"update_applied"' in signal
+    assert '"revision":2' in signal
+    assert IDENT_A.user_id not in signal
+    assert IDENT_A.jwt not in signal
+    assert "sensitive-new-token" not in signal
 
 
 def test_identity_update_rejected_without_identity(_bound):

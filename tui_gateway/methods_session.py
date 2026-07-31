@@ -307,10 +307,32 @@ def _(rid, params: dict) -> dict:
     ident = _transport_identity()
     if ident is None:
         return _err(rid, 4030, "no identity on this connection")
+    transport = current_transport()
+
+    def emit(
+        event: str,
+        *,
+        reason: str = "",
+        observed_identity=None,
+        active_task_count: int | None = None,
+    ) -> None:
+        from tui_gateway.wheelbase_identity import log_identity_lifecycle
+
+        log_identity_lifecycle(
+            event,
+            observed_identity or ident,
+            reason=reason,
+            connection_id=_wheelbase_connection_id(transport),
+            attempted_revision=params.get("credential_revision"),
+            attempted_expires_at=params.get("credential_expires_at"),
+            active_task_count=active_task_count,
+        )
+
     cloud_envelope_mode = bool(os.environ.get("AGENT_GATEWAY_IDENTITY_KEYS", "").strip())
     envelope_identity = None
     if cloud_envelope_mode:
         if set(params) != {"identity_envelope"}:
+            emit("update_dropped", reason="signed_envelope_required")
             return _err(rid, 4031, "signed identity envelope required")
         try:
             from tui_gateway.wheelbase_identity import identity_from_headers
@@ -319,39 +341,40 @@ def _(rid, params: dict) -> dict:
                 {"X-Wheelbase-Identity-Envelope": str(params["identity_envelope"])}
             )
         except ValueError:
+            emit("update_dropped", reason="invalid_envelope")
             return _err(rid, 4031, "invalid identity envelope")
         if envelope_identity is None:
+            emit("update_dropped", reason="signed_envelope_required")
             return _err(rid, 4031, "signed identity envelope required")
         params = envelope_identity.__dict__
     jwt = str(params.get("jwt") or "").strip()
     if not jwt:
+        emit("update_dropped", reason="missing_credential")
         return _err(rid, 4031, "jwt required")
-    transport = current_transport()
 
-    def reject(code: int, message: str) -> dict:
+    def reject(code: int, message: str, reason: str) -> dict:
         if transport is not None:
             try:
                 transport.close()
             except Exception:
                 pass
-        logger.warning(
-            "identity.update dropped reason=%s client=%s revision=%s",
-            message,
-            ident.client,
-            ident.credential_revision,
-        )
+        emit("update_dropped", reason=reason)
         return _err(rid, code, message)
 
     for field in ("user_id", "tenant_id", "client", "device_id", "session_jti_hash"):
         current_value = str(getattr(ident, field) or "").strip()
         if field in params and str(params.get(field) or "").strip() != current_value:
-            return reject(4032, f"immutable identity scope mismatch: {field}")
+            return reject(
+                4032, f"immutable identity scope mismatch: {field}", "scope_mismatch"
+            )
     revision = params.get("credential_revision")
     expires_at = params.get("credential_expires_at")
     if not isinstance(revision, int) or isinstance(revision, bool) or revision < ident.credential_revision:
-        return reject(4033, "credential revision is stale")
+        return reject(4033, "credential revision is stale", "stale_revision")
     if not isinstance(expires_at, int) or isinstance(expires_at, bool) or expires_at <= 0:
-        return reject(4034, "authoritative credential expiry required")
+        return reject(
+            4034, "authoritative credential expiry required", "invalid_expiry"
+        )
     try:
         from dataclasses import replace
         from tui_gateway.wheelbase_identity import write_credential_file
@@ -367,7 +390,9 @@ def _(rid, params: dict) -> dict:
             refreshed.jwt != ident.jwt
             or refreshed.credential_expires_at != ident.credential_expires_at
         ):
-            return reject(4033, "credential revision did not advance")
+            return reject(
+                4033, "credential revision did not advance", "stale_revision"
+            )
         credential_file = write_credential_file(Path(get_hermes_home()), refreshed)
 
         if transport is None:
@@ -391,8 +416,14 @@ def _(rid, params: dict) -> dict:
 
         for task_id in active_task_ids:
             register_task_cdp_url(task_id, refreshed.cdp_url)
-    except Exception as e:
-        return _err(rid, 5040, f"credential refresh failed: {e}")
+        emit(
+            "update_applied",
+            observed_identity=refreshed,
+            active_task_count=len(active_task_ids),
+        )
+    except Exception:
+        emit("update_dropped", reason="refresh_failed")
+        return _err(rid, 5040, "credential refresh failed")
     return _ok(
         rid,
         {

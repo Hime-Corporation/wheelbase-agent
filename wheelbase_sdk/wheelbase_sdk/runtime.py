@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import contextvars
 import threading
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 _current: contextvars.ContextVar[Optional[dict]] = contextvars.ContextVar("wb_task_identity", default=None)
 _by_task: dict[str, dict] = {}
@@ -151,6 +151,50 @@ def refresh_connection_tasks(
     return tuple(updated)
 
 
-def clear_task(task_id: str) -> None:
+def release_task(
+    task_id: str,
+    *,
+    on_credential_unused: Callable[[str], None] | None = None,
+) -> tuple[Optional[dict], bool]:
+    """Remove one task and clean its credential only when no peer uses it.
+
+    The unused check and callback run while the registry lock is held. That
+    prevents a task for the same connection/JTI from being registered between
+    the final-use check and the credential unlink.
+
+    Returns ``(removed_identity, credential_retained)``. Unknown tasks are an
+    idempotent no-op.
+    """
     with _lock:
-        _by_task.pop(task_id, None)
+        removed = _by_task.pop(task_id, None)
+        if removed is None:
+            return None, False
+        jti_hash = str(removed.get("session_jti_hash") or "").strip()
+        retained = bool(jti_hash) and any(
+            str(identity.get("session_jti_hash") or "").strip() == jti_hash
+            for identity in _by_task.values()
+        )
+        if jti_hash and not retained and on_credential_unused is not None:
+            on_credential_unused(jti_hash)
+        return dict(removed), retained
+
+
+def cleanup_if_credential_unused(
+    session_jti_hash: str, on_credential_unused: Callable[[str], None]
+) -> bool:
+    """Run an exact-JTI cleanup callback only when no active task uses it."""
+    jti_hash = str(session_jti_hash or "").strip()
+    if not jti_hash:
+        return False
+    with _lock:
+        if any(
+            str(identity.get("session_jti_hash") or "").strip() == jti_hash
+            for identity in _by_task.values()
+        ):
+            return False
+        on_credential_unused(jti_hash)
+        return True
+
+
+def clear_task(task_id: str) -> None:
+    release_task(task_id)

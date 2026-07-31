@@ -151,6 +151,30 @@ def test_task_credentials_fail_closed(kind, tmp_path, monkeypatch):
         load_session()
 
 
+def test_expired_task_credential_emits_safe_reason_signal(tmp_path, monkeypatch, caplog):
+    import wheelbase_sdk.session as session_module
+
+    path = tmp_path / "sensitive-credential-name.json"
+    secret = "sensitive-access-token"
+    monkeypatch.setattr(session_module.time, "time", lambda: 1_000)
+    _write_cred(path, secret, expires_at=999, revision=9)
+    runtime.set_task_identity("task", {"credential_path": str(path)})
+
+    with pytest.raises(WheelbaseAuthError) as raised:
+        load_session()
+
+    assert raised.value.reason == "expired"
+    signal = next(
+        record.message for record in caplog.records
+        if "wheelbase_auth_lifecycle" in record.message
+    )
+    assert '"reason":"expired"' in signal
+    assert '"source":"task"' in signal
+    assert '"revision":9' in signal
+    assert secret not in signal
+    assert str(path) not in signal
+
+
 # ---------------------------------------------------------------------------
 # Bonus: clear_task removes the stored identity
 # ---------------------------------------------------------------------------
@@ -164,6 +188,48 @@ def test_clear_task_removes_identity():
     runtime.clear_task("task-x")
     with runtime._lock:
         assert "task-x" not in runtime._by_task
+
+
+def test_release_task_runs_cleanup_only_for_last_task_with_same_jti():
+    cleaned: list[str] = []
+    shared = {"credential_path": "/shared", "session_jti_hash": "jti-shared"}
+    runtime.set_task_identity("task-a", shared)
+    runtime.set_task_identity("task-b", shared)
+
+    removed_a, retained_a = runtime.release_task(
+        "task-a", on_credential_unused=cleaned.append
+    )
+    assert removed_a["session_jti_hash"] == "jti-shared"
+    assert retained_a is True
+    assert cleaned == []
+
+    removed_b, retained_b = runtime.release_task(
+        "task-b", on_credential_unused=cleaned.append
+    )
+    assert removed_b["session_jti_hash"] == "jti-shared"
+    assert retained_b is False
+    assert cleaned == ["jti-shared"]
+
+
+def test_release_task_cannot_cleanup_another_jti():
+    cleaned: list[str] = []
+    runtime.set_task_identity("task-d1", {"session_jti_hash": "jti-d1"})
+    runtime.set_task_identity("task-d2", {"session_jti_hash": "jti-d2"})
+
+    runtime.release_task("task-d1", on_credential_unused=cleaned.append)
+
+    assert cleaned == ["jti-d1"]
+    assert runtime.get_task_identity("task-d2") == {"session_jti_hash": "jti-d2"}
+
+
+def test_cleanup_if_credential_unused_retains_active_jti():
+    cleaned: list[str] = []
+    runtime.set_task_identity("task-active", {"session_jti_hash": "jti-active"})
+
+    assert runtime.cleanup_if_credential_unused("jti-active", cleaned.append) is False
+    assert cleaned == []
+    assert runtime.cleanup_if_credential_unused("jti-unused", cleaned.append) is True
+    assert cleaned == ["jti-unused"]
 
 
 def test_desktop_unavailable_result_has_stable_code():

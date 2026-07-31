@@ -18,10 +18,16 @@ def _env(monkeypatch, tmp_path, token="tok"):
         )
 
 
-def test_raises_when_signed_out(tmp_path, monkeypatch):
+def test_raises_when_signed_out(tmp_path, monkeypatch, caplog):
     _env(monkeypatch, tmp_path, token=None)
     with pytest.raises(WheelbaseAuthError):
         WheelbaseClient()
+    signal = next(
+        record.message for record in caplog.records
+        if "wheelbase_auth_lifecycle" in record.message
+    )
+    assert '"reason":"not_signed_in"' in signal
+    assert '"source":"local"' in signal
 
 
 def test_postgrest_get_sends_auth_headers(tmp_path, monkeypatch):
@@ -75,7 +81,7 @@ def test_go_api_uses_origin_and_bearer(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize("surface", ["postgrest", "go"])
-def test_401_is_typed_and_403_is_preserved(surface, tmp_path, monkeypatch):
+def test_401_is_typed_and_403_is_preserved(surface, tmp_path, monkeypatch, caplog):
     _env(monkeypatch, tmp_path)
     statuses = iter((401, 403))
     c = WheelbaseClient(transport=httpx.MockTransport(lambda req: httpx.Response(next(statuses), request=req)))
@@ -86,6 +92,13 @@ def test_401_is_typed_and_403_is_preserved(surface, tmp_path, monkeypatch):
     with pytest.raises(WheelbaseAuthError) as forbidden:
         call()
     assert forbidden.value.reason == "forbidden"
+    signals = [
+        record.message for record in caplog.records
+        if "wheelbase_auth_lifecycle" in record.message
+    ]
+    assert any('"reason":"not_signed_in"' in signal and '"status":401' in signal for signal in signals)
+    assert any('"reason":"forbidden"' in signal and '"status":403' in signal for signal in signals)
+    assert all("tok" not in signal for signal in signals)
 
 
 def test_safe_get_retries_once_only_for_newer_task_revision(tmp_path, monkeypatch):

@@ -120,6 +120,27 @@ def test_ws_disconnect_releases_wake_word_owner(monkeypatch):
     assert released == created
 
 
+def test_ws_disconnect_attempts_exact_connection_credential_cleanup(monkeypatch):
+    identity = object()
+    cleaned = []
+    monkeypatch.setattr(
+        ws_mod,
+        "_attach_identity_to_transport",
+        lambda _ws, transport: setattr(transport, "wheelbase_identity", identity),
+    )
+    monkeypatch.setattr(
+        ws_mod,
+        "cleanup_connection_credential",
+        lambda observed, _home, *, reason, connection_id: cleaned.append(
+            (observed, reason, bool(connection_id))
+        ),
+    )
+
+    _run_disconnect(monkeypatch, lambda _transport: None)
+
+    assert cleaned == [(identity, "ws_disconnect", True)]
+
+
 
 
 def test_ws_starts_mcp_discovery_before_ready(monkeypatch):
@@ -226,5 +247,3 @@ def test_ws_transport_preserves_cross_batch_order():
         assert entered == ["A1", "A2", "B1", "B2"]
 
     asyncio.run(scenario())
-
-

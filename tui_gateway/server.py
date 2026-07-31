@@ -840,6 +840,15 @@ def _teardown_session(session: dict | None, *, end_reason: str = "tui_close") ->
             agent.close()
     except Exception:
         pass
+    try:
+        if key := session.get("session_key"):
+            from tui_gateway.wheelbase_inject import clear_task_credential_state
+
+            clear_task_credential_state(
+                key, Path(get_hermes_home()), reason=end_reason
+            )
+    except Exception:
+        logger.exception("failed to release Wheelbase session credential")
     # NOTE: the slash-worker is closed inside _finalize_session (the single
     # _finalized-guarded chokepoint that main folded it into), exactly once.
     # We deliberately do NOT re-close it here — _teardown_session's job beyond

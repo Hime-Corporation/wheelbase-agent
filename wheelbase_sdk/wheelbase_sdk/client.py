@@ -15,7 +15,7 @@ from typing import Any, Callable
 
 import httpx
 
-from .errors import WheelbaseAuthError
+from .errors import WheelbaseAuthError, log_auth_lifecycle
 from .session import load_session
 
 
@@ -28,6 +28,7 @@ class WheelbaseClient:
     ) -> None:
         session = load_session()
         if session is None:
+            log_auth_lifecycle("not_signed_in", source="local")
             raise WheelbaseAuthError("not signed in")
         self._session = session
         self._token = session.access_token
@@ -39,6 +40,7 @@ class WheelbaseClient:
     def _reload(self) -> None:
         session = load_session()
         if session is None:
+            log_auth_lifecycle("not_signed_in", source="request")
             raise WheelbaseAuthError("not signed in", reason="not_signed_in")
         self._session = session
         self._token = session.access_token
@@ -63,8 +65,22 @@ class WheelbaseClient:
                     self._token = replacement.access_token
                     response = build()
             if response.status_code == 401:
+                log_auth_lifecycle(
+                    "not_signed_in",
+                    source="request",
+                    revision=self._session.revision,
+                    expires_at=self._session.expires_at,
+                    status=401,
+                )
                 raise WheelbaseAuthError("not signed in", reason="not_signed_in")
         if response.status_code == 403:
+            log_auth_lifecycle(
+                "forbidden",
+                source="request",
+                revision=self._session.revision,
+                expires_at=self._session.expires_at,
+                status=403,
+            )
             raise WheelbaseAuthError("forbidden", reason="forbidden")
         response.raise_for_status()
         return response

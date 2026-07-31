@@ -20,11 +20,48 @@ import pytest
 from tui_gateway.wheelbase_identity import (
     WheelbaseIdentity,
     credential_path,
+    identity_signal_fields,
     identity_from_headers,
     remove_credential_file,
     write_credential_file,
     _attach_identity_to_transport,
 )
+
+
+def test_identity_signal_fields_are_safe_and_structured():
+    identity = WheelbaseIdentity(
+        user_id="sensitive-user-id",
+        tenant_id="sensitive-tenant-id",
+        device_id="sensitive-device-id",
+        jwt="secret-access-token",
+        session_jti_hash="b" * 64,
+        client="desktop",
+        credential_revision=7,
+        credential_expires_at=1_050,
+        credential_source="agent_gateway_identity",
+    )
+
+    fields = identity_signal_fields(
+        identity, connection_id="sensitive-connection-id", now=1_000
+    )
+
+    encoded = json.dumps(fields, sort_keys=True)
+    assert fields["revision"] == 7
+    assert fields["expiry_age_s"] == -50
+    assert fields["expiry_skew_s"] == 50
+    assert fields["client"] == "desktop"
+    assert fields["source"] == "agent_gateway_identity"
+    for secret in (
+        identity.user_id,
+        identity.tenant_id,
+        identity.device_id,
+        identity.jwt,
+        identity.session_jti_hash,
+        "sensitive-connection-id",
+    ):
+        assert secret not in encoded
+    for key in ("user_fp", "tenant_fp", "device_fp", "jti_fp", "connection_fp"):
+        assert len(fields[key]) == 12
 
 
 def _b64(raw: bytes) -> str:

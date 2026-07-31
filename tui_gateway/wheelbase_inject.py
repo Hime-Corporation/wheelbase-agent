@@ -25,7 +25,11 @@ import re
 from pathlib import Path
 from typing import Callable, Optional
 
-from tui_gateway.wheelbase_identity import WheelbaseIdentity, write_credential_file
+from tui_gateway.wheelbase_identity import (
+    WheelbaseIdentity,
+    remove_credential_file,
+    write_credential_file,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -140,11 +144,11 @@ def clear_ephemeral_task_state(task_id: str) -> None:
         return
 
     try:
-        from wheelbase_sdk import runtime as wb_runtime
-
-        wb_runtime.clear_task(task_id)
-    except ImportError:
-        pass
+        clear_task_credential_state(
+            task_id,
+            Path(os.environ.get("HERMES_HOME") or str(Path.home() / ".hermes")),
+            reason="ephemeral_task_end",
+        )
     except Exception:
         logger.exception("failed to clear ephemeral Wheelbase runtime task")
 
@@ -161,6 +165,75 @@ def clear_ephemeral_task_state(task_id: str) -> None:
         clear_task_env_overrides(task_id)
     except Exception:
         logger.exception("failed to clear ephemeral terminal task")
+
+
+def clear_task_credential_state(
+    task_id: str, hermes_home: Path, *, reason: str
+) -> bool:
+    """Release one task and unlink only its now-unused JTI credential."""
+    if not task_id:
+        return False
+    try:
+        from wheelbase_sdk import runtime as wb_runtime
+    except ImportError:
+        return False
+
+    deleted = False
+
+    def remove_exact(jti_hash: str) -> None:
+        nonlocal deleted
+        deleted = remove_credential_file(hermes_home, jti_hash)
+
+    removed, retained = wb_runtime.release_task(
+        task_id, on_credential_unused=remove_exact
+    )
+    if removed is not None:
+        from tui_gateway.wheelbase_identity import log_identity_lifecycle
+
+        log_identity_lifecycle(
+            "credential_cleanup",
+            removed,
+            reason=reason,
+            connection_id=str(removed.get("_connection_id") or ""),
+            action="retained" if retained else ("deleted" if deleted else "absent"),
+        )
+    return deleted
+
+
+def cleanup_connection_credential(
+    identity: WheelbaseIdentity | None,
+    hermes_home: Path,
+    *,
+    reason: str,
+    connection_id: str = "",
+) -> bool:
+    """Unlink a disconnected connection's credential when no task retains it."""
+    if identity is None or not identity.session_jti_hash:
+        return False
+    try:
+        from wheelbase_sdk import runtime as wb_runtime
+    except ImportError:
+        return False
+
+    deleted = False
+
+    def remove_exact(jti_hash: str) -> None:
+        nonlocal deleted
+        deleted = remove_credential_file(hermes_home, jti_hash)
+
+    unused = wb_runtime.cleanup_if_credential_unused(
+        identity.session_jti_hash, remove_exact
+    )
+    from tui_gateway.wheelbase_identity import log_identity_lifecycle
+
+    log_identity_lifecycle(
+        "credential_cleanup",
+        identity,
+        reason=reason,
+        connection_id=connection_id,
+        action="deleted" if deleted else ("absent" if unused else "retained"),
+    )
+    return deleted
 
 
 def apply_session_injection(
@@ -202,6 +275,10 @@ def apply_session_injection(
                 "tenant_id": identity.tenant_id,
                 "dealership_id": identity.dealership_id,
                 "credential_path": str(cred_path),
+                "session_jti_hash": identity.session_jti_hash,
+                "credential_revision": identity.credential_revision,
+                "credential_expires_at": identity.credential_expires_at,
+                "credential_source": identity.credential_source,
                 "shell_relay_url": identity.shell_relay_url or "",
                 "cdp_url": identity.cdp_url or "",
                 "client": identity.client or "",

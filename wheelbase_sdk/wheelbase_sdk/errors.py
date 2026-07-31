@@ -7,7 +7,11 @@ make that uniform.
 from __future__ import annotations
 
 import json
+import logging
+import time
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 
 class WheelbaseAuthError(Exception):
@@ -19,6 +23,38 @@ class WheelbaseAuthError(Exception):
         inferred = reason or (message if message in self.VALID_REASONS else "not_signed_in")
         self.reason = inferred if inferred in self.VALID_REASONS else "not_signed_in"
         super().__init__(message)
+
+
+def log_auth_lifecycle(
+    reason: str,
+    *,
+    source: str,
+    revision: Any = None,
+    expires_at: Any = None,
+    status: int | None = None,
+) -> None:
+    """Emit a bounded auth-rejection signal without credentials or paths."""
+    normalized_reason = (
+        reason if reason in WheelbaseAuthError.VALID_REASONS else "not_signed_in"
+    )
+    normalized_source = source if source in {"task", "local", "request"} else "unknown"
+    payload: dict[str, Any] = {
+        "event": "credential_rejected",
+        "reason": normalized_reason,
+        "source": normalized_source,
+    }
+    if isinstance(revision, int) and not isinstance(revision, bool):
+        payload["revision"] = revision
+    if isinstance(expires_at, int) and not isinstance(expires_at, bool):
+        now = int(time.time())
+        payload["expiry_age_s"] = now - expires_at
+        payload["expiry_skew_s"] = expires_at - now
+    if isinstance(status, int):
+        payload["status"] = status
+    logger.warning(
+        "wheelbase_auth_lifecycle %s",
+        json.dumps(payload, separators=(",", ":"), sort_keys=True),
+    )
 
 
 def signed_out_result() -> str:
