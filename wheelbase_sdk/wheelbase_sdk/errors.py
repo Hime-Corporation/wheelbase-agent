@@ -17,12 +17,16 @@ logger = logging.getLogger(__name__)
 class WheelbaseAuthError(Exception):
     """Raised by WheelbaseClient when there is no signed-in Supabase session."""
 
-    VALID_REASONS = frozenset({"not_signed_in", "expired", "refresh_pending", "forbidden"})
+    VALID_REASONS = frozenset({"not_signed_in", "expired", "refresh_pending"})
 
     def __init__(self, message: str = "not signed in", *, reason: str | None = None) -> None:
         inferred = reason or (message if message in self.VALID_REASONS else "not_signed_in")
         self.reason = inferred if inferred in self.VALID_REASONS else "not_signed_in"
         super().__init__(message)
+
+
+class WheelbaseForbiddenError(Exception):
+    """Raised when authentication succeeded but the action is not permitted."""
 
 
 def log_auth_lifecycle(
@@ -34,9 +38,8 @@ def log_auth_lifecycle(
     status: int | None = None,
 ) -> None:
     """Emit a bounded auth-rejection signal without credentials or paths."""
-    normalized_reason = (
-        reason if reason in WheelbaseAuthError.VALID_REASONS else "not_signed_in"
-    )
+    signal_reasons = WheelbaseAuthError.VALID_REASONS | {"forbidden"}
+    normalized_reason = reason if reason in signal_reasons else "not_signed_in"
     normalized_source = source if source in {"task", "local", "request"} else "unknown"
     payload: dict[str, Any] = {
         "event": "credential_rejected",
@@ -63,6 +66,16 @@ def signed_out_result() -> str:
         {
             "error": "not_signed_in",
             "message": "Sign in to Wheelbase to use this tool.",
+        }
+    )
+
+
+def forbidden_result() -> str:
+    """Standard tool result for an authenticated but unauthorized action."""
+    return json.dumps(
+        {
+            "error": "forbidden",
+            "message": "You do not have permission to use this Wheelbase action.",
         }
     )
 

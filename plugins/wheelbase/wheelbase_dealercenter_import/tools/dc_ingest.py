@@ -3,19 +3,21 @@
 REFERENCE HANDLER PATTERN (copy this for every Wheelbase tool):
   - signature `def fn(args: dict, **kwargs) -> str`
   - validate args -> `err(...)` on bad input
-  - build the client; `WheelbaseAuthError` -> `signed_out_result()`
+  - use the shared auth boundary for signed-out and forbidden results
   - do the work; ALWAYS return a JSON string; NEVER raise (catch -> `err(...)`)
   - close the client in `finally`
 The module-level `WheelbaseClient` name is the test seam — tests monkeypatch it.
 """
 
 from wheelbase_sdk import WheelbaseClient, WheelbaseAuthError, signed_out_result, ok, err
+from wheelbase_sdk.tool_auth import auth_result, authenticated_client
 
 from ..parsing import parse_export, normalize_rows
 
 _BATCH_SIZE = 200
 
 
+@auth_result
 def dc_ingest(args: dict, **kwargs) -> str:  # noqa: ARG001
     path = str(args.get("path") or "").strip()
     if not path:
@@ -41,7 +43,7 @@ def dc_ingest(args: dict, **kwargs) -> str:  # noqa: ARG001
 
     client = None
     try:
-        client = WheelbaseClient()
+        client = authenticated_client(WheelbaseClient)
         created = 0
         updated = 0
         skipped = 0

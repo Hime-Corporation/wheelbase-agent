@@ -5,8 +5,10 @@ Maps: overrides[] → Go API body.
 """
 
 from wheelbase_sdk import WheelbaseClient, WheelbaseAuthError, signed_out_result, ok, err
+from wheelbase_sdk.tool_auth import auth_result, authenticated_client
 
 
+@auth_result
 def save_demand_overrides(args: dict, **kwargs) -> str:  # noqa: ARG001
     overrides = args.get("overrides")
     if not isinstance(overrides, list) or len(overrides) == 0:
@@ -25,7 +27,7 @@ def save_demand_overrides(args: dict, **kwargs) -> str:  # noqa: ARG001
             )
 
     try:
-        client = WheelbaseClient()
+        client = authenticated_client(WheelbaseClient)
     except WheelbaseAuthError:
         return signed_out_result()
 

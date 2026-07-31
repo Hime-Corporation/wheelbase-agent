@@ -5,8 +5,10 @@ Maps: labels[].inventoryCarId → inventory_car.id, labels[].key → inventory_c
 """
 
 from wheelbase_sdk import WheelbaseClient, WheelbaseAuthError, signed_out_result, ok, err
+from wheelbase_sdk.tool_auth import auth_result, authenticated_client
 
 
+@auth_result
 def save_inventory_demand_labels(args: dict, **kwargs) -> str:  # noqa: ARG001
     labels = args.get("labels")
     if not isinstance(labels, list) or len(labels) == 0:
@@ -23,7 +25,7 @@ def save_inventory_demand_labels(args: dict, **kwargs) -> str:  # noqa: ARG001
             return err(f"labels[{i}].key must be a non-empty string")
 
     try:
-        client = WheelbaseClient()
+        client = authenticated_client(WheelbaseClient)
     except WheelbaseAuthError:
         return signed_out_result()
 

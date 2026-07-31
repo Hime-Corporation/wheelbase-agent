@@ -1,5 +1,6 @@
 import json
 
+import wheelbase_sdk.errors as errors
 from wheelbase_sdk.errors import WheelbaseAuthError, signed_out_result, ok, err
 
 
@@ -26,3 +27,18 @@ def test_err_has_message_and_extra():
 
 def test_auth_error_is_exception():
     assert issubclass(WheelbaseAuthError, Exception)
+
+
+def test_forbidden_result_is_distinct_and_action_safe():
+    assert issubclass(errors.WheelbaseForbiddenError, Exception)
+    assert not issubclass(errors.WheelbaseForbiddenError, WheelbaseAuthError)
+    result = json.loads(errors.forbidden_result())
+    assert result == {
+        "error": "forbidden",
+        "message": "You do not have permission to use this Wheelbase action.",
+    }
+
+
+def test_auth_error_cannot_represent_forbidden():
+    error = WheelbaseAuthError("forbidden", reason="forbidden")
+    assert error.reason == "not_signed_in"

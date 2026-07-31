@@ -6,11 +6,13 @@ out of demand-matrix setup mode.
 """
 
 from wheelbase_sdk import WheelbaseClient, WheelbaseAuthError, signed_out_result, ok, err
+from wheelbase_sdk.tool_auth import auth_result, authenticated_client
 
 
+@auth_result
 def complete_demand_matrix_setup(args: dict, **kwargs) -> str:  # noqa: ARG001
     try:
-        client = WheelbaseClient()
+        client = authenticated_client(WheelbaseClient)
     except WheelbaseAuthError:
         return signed_out_result()
 

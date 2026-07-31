@@ -15,7 +15,7 @@ from typing import Any, Callable
 
 import httpx
 
-from .errors import WheelbaseAuthError, log_auth_lifecycle
+from .errors import WheelbaseAuthError, WheelbaseForbiddenError, log_auth_lifecycle
 from .session import load_session
 
 
@@ -81,7 +81,7 @@ class WheelbaseClient:
                 expires_at=self._session.expires_at,
                 status=403,
             )
-            raise WheelbaseAuthError("forbidden", reason="forbidden")
+            raise WheelbaseForbiddenError("forbidden")
         response.raise_for_status()
         return response
 

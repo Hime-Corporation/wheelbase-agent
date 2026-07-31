@@ -4,7 +4,7 @@ import httpx
 import pytest
 
 from wheelbase_sdk.client import WheelbaseClient
-from wheelbase_sdk.errors import WheelbaseAuthError
+from wheelbase_sdk.errors import WheelbaseAuthError, WheelbaseForbiddenError
 
 
 def _env(monkeypatch, tmp_path, token="tok"):
@@ -84,14 +84,22 @@ def test_go_api_uses_origin_and_bearer(tmp_path, monkeypatch):
 def test_401_is_typed_and_403_is_preserved(surface, tmp_path, monkeypatch, caplog):
     _env(monkeypatch, tmp_path)
     statuses = iter((401, 403))
-    c = WheelbaseClient(transport=httpx.MockTransport(lambda req: httpx.Response(next(statuses), request=req)))
+    calls = 0
+
+    def respond(req):
+        nonlocal calls
+        calls += 1
+        return httpx.Response(next(statuses), request=req)
+
+    c = WheelbaseClient(transport=httpx.MockTransport(respond))
     call = (lambda: c.postgrest_get("cars", {})) if surface == "postgrest" else (lambda: c.go_api("GET", "/cars"))
     with pytest.raises(WheelbaseAuthError) as unauthorized:
         call()
     assert unauthorized.value.reason == "not_signed_in"
-    with pytest.raises(WheelbaseAuthError) as forbidden:
+    with pytest.raises(WheelbaseForbiddenError) as forbidden:
         call()
-    assert forbidden.value.reason == "forbidden"
+    assert not isinstance(forbidden.value, WheelbaseAuthError)
+    assert calls == 2
     signals = [
         record.message for record in caplog.records
         if "wheelbase_auth_lifecycle" in record.message
@@ -99,6 +107,50 @@ def test_401_is_typed_and_403_is_preserved(surface, tmp_path, monkeypatch, caplo
     assert any('"reason":"not_signed_in"' in signal and '"status":401' in signal for signal in signals)
     assert any('"reason":"forbidden"' in signal and '"status":403' in signal for signal in signals)
     assert all("tok" not in signal for signal in signals)
+
+
+@pytest.mark.parametrize("surface", ["postgrest", "go"])
+def test_403_never_retries_after_newer_revision(
+    surface, tmp_path, monkeypatch
+):
+    from wheelbase_sdk import runtime
+
+    credential = tmp_path / "jti.json"
+    credential.write_text(json.dumps({
+        "access_token": "old",
+        "expires_at": 9999999999,
+        "revision": 1,
+        "source": "agent_session",
+    }))
+    credential.chmod(0o600)
+    runtime.set_task_identity("task", {"credential_path": str(credential)})
+    monkeypatch.setenv("SUPABASE_URL", "https://sb.example")
+    monkeypatch.setenv("SUPABASE_ANON_KEY", "anon")
+    monkeypatch.setenv("WHEELBASE_GO_API_ORIGIN", "https://api.example")
+    calls = 0
+
+    def respond(req):
+        nonlocal calls
+        calls += 1
+        credential.write_text(json.dumps({
+            "access_token": "new",
+            "expires_at": 9999999999,
+            "revision": 2,
+            "source": "agent_session",
+        }))
+        credential.chmod(0o600)
+        return httpx.Response(403, request=req)
+
+    client = WheelbaseClient(transport=httpx.MockTransport(respond))
+    call = (
+        (lambda: client.postgrest_get("cars", {}))
+        if surface == "postgrest"
+        else (lambda: client.go_api("GET", "/cars"))
+    )
+    with pytest.raises(WheelbaseForbiddenError):
+        call()
+
+    assert calls == 1
 
 
 def test_safe_get_retries_once_only_for_newer_task_revision(tmp_path, monkeypatch):
