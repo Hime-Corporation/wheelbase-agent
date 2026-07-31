@@ -1170,10 +1170,26 @@ def _request_profile(params: dict | None) -> str | None:
     Returns None for single-user / legacy connections (no identity, no
     profile) → callers fall back to the shared launch store.
     """
+    profile_present = isinstance(params, dict) and "profile" in params
     profile = None
-    if isinstance(params, dict):
-        profile = (params.get("profile") or "").strip() or None
-    return profile if profile is not None else _identity_derived_profile()
+    if profile_present:
+        raw_profile = params.get("profile")
+        if not isinstance(raw_profile, str):
+            raise ValueError("profile must be a string")
+        profile = raw_profile.strip() or None
+
+    derived = _identity_derived_profile()
+    if derived is not None:
+        if profile_present:
+            logger.warning("rejected profile override on identified connection")
+            raise ValueError("profile parameter not permitted")
+        return derived
+
+    if profile is not None:
+        from hermes_cli.profiles import validate_profile_name
+
+        validate_profile_name(profile)
+    return profile
 
 
 def _db_for_profile(profile: str | None = None):
@@ -1247,9 +1263,10 @@ def _profile_db(params: dict | None = None):
     # is fail-closed (identity-derived) or benign (client-supplied). Handing it
     # _request_profile()'s already-derived value made `identified` permanently
     # False, which silently rendered the fail-closed guard unreachable.
-    explicit = None
-    if isinstance(params, dict):
-        explicit = (params.get("profile") or "").strip() or None
+    explicit = _request_profile(params)
+    # Preserve the identity-derived fail-closed distinction in _db_for_profile.
+    if _identity_derived_profile() is not None:
+        explicit = None
     db, owns = _db_for_profile(explicit)
     try:
         yield db
@@ -1796,6 +1813,16 @@ def _normalize_request(req: Any) -> tuple[Any, str, dict] | dict:
         params = {}
     elif not isinstance(params, dict):
         return _err(rid, -32602, "invalid params: expected an object")
+
+    # Profile selection is an ingress concern, not something individual RPC
+    # handlers may opt into. Authenticated cloud connections are already bound
+    # to their per-user child/profile and may never override it in JSON-RPC.
+    # Local/unidentified callers retain profile selection after strict name
+    # validation, before any path construction occurs.
+    try:
+        _request_profile(params)
+    except (TypeError, ValueError) as exc:
+        return _err(rid, -32602, f"invalid params: {exc}")
 
     return rid, method, params
 

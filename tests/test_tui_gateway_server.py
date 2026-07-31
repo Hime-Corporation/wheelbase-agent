@@ -10501,8 +10501,8 @@ def test_session_delete_success_returns_deleted_id(monkeypatch):
 # --------------------------------------------------------------------------
 
 
-def test_session_list_honors_params_profile_opens_profile_db(monkeypatch, tmp_path):
-    """Issue #62503: session.list must read the profile's state.db, not launch."""
+def test_identified_session_list_rejects_params_profile_without_opening_db(monkeypatch, tmp_path):
+    """An authenticated connection may not select a profile in its RPC body."""
     profile_home = tmp_path / "profiles" / "mlperf"
     profile_home.mkdir(parents=True)
     (profile_home / "state.db").write_bytes(b"")
@@ -10541,6 +10541,11 @@ def test_session_list_honors_params_profile_opens_profile_db(monkeypatch, tmp_pa
         def close(self):
             seen["closed"] = True
 
+    monkeypatch.setattr(
+        server,
+        "_transport_identity",
+        lambda: types.SimpleNamespace(user_id="identified-user"),
+    )
     monkeypatch.setattr(server, "_profile_home", lambda p: profile_home if p == "mlperf" else None)
     monkeypatch.setattr(server, "_get_db", lambda: LaunchDB())
     monkeypatch.setattr("hermes_state.SessionDB", ProfileDB)
@@ -10552,12 +10557,32 @@ def test_session_list_honors_params_profile_opens_profile_db(monkeypatch, tmp_pa
             "params": {"profile": "mlperf", "limit": 5},
         }
     )
-    assert "result" in resp, resp
-    assert resp["result"]["sessions"][0]["id"] == "ml-1"
-    assert seen.get("profile") is True
+    assert resp["error"]["code"] == -32602
+    assert resp["error"]["message"] == "invalid params: profile parameter not permitted"
+    assert seen.get("profile") is None
     assert seen.get("launch") is None
-    assert str(seen.get("db_path")).endswith("state.db")
-    assert seen.get("closed") is True
+    assert seen.get("db_path") is None
+    assert seen.get("closed") is None
+
+
+@pytest.mark.parametrize("profile", ["../../tenants/t2/profiles/wb-u2", "bad/name", "UPPER"])
+def test_unidentified_session_profile_is_validated_before_path_resolution(
+    monkeypatch, profile
+):
+    resolved = []
+    monkeypatch.setattr(server, "_transport_identity", lambda: None)
+    monkeypatch.setattr(
+        "hermes_cli.profiles.get_profile_dir",
+        lambda name: resolved.append(name),
+    )
+
+    resp = server.handle_request(
+        {"id": "1", "method": "session.list", "params": {"profile": profile}}
+    )
+
+    assert resp["error"]["code"] == -32602
+    assert resp["error"]["message"].startswith("invalid params:")
+    assert resolved == []
 
 
 def test_session_most_recent_honors_params_profile(monkeypatch, tmp_path):
