@@ -10,13 +10,57 @@ mirrors (recording HTTP stub child, ``make_manager`` fake-spawn pattern).
 from __future__ import annotations
 
 import http.server
+import base64
+import hashlib
+import hmac
 import json
 import threading
+import time
+import uuid
 
 import pytest
 from starlette.testclient import TestClient
 
 from tui_gateway.profile_router import ChildManager, build_app
+
+
+_ENVELOPE_KEY = b"k" * 32
+
+
+def _b64(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
+
+
+def _auth_headers() -> dict[str, str]:
+    now = int(time.time())
+    header = {"alg": "HS256", "typ": "JWT", "kid": "k1"}
+    payload = {
+        "iss": "wheelbase-api",
+        "aud": "wheelbase-agent-gateway",
+        "kind": "agent_gateway_identity",
+        "ver": 2,
+        "iat": now,
+        "exp": now + 20,
+        "nonce": str(uuid.uuid4()),
+        "bundle": {
+            "user_id": "user-aaaa",
+            "tenant_id": "tenant-1111",
+            "client": "mobile",
+            "device_id": "",
+            "session_jti_hash": "a" * 64,
+            "credential_revision": 1,
+            "credential_expires_at": now + 300,
+            "access_token": "test-access-token",
+        },
+    }
+    encoded_header = _b64(json.dumps(header, separators=(",", ":"), sort_keys=True).encode())
+    encoded_payload = _b64(json.dumps(payload, separators=(",", ":"), sort_keys=True).encode())
+    signing = f"{encoded_header}.{encoded_payload}"
+    signature = _b64(hmac.new(_ENVELOPE_KEY, signing.encode(), hashlib.sha256).digest())
+    return {
+        "X-Hermes-Session-Token": "router-secret",
+        "X-Wheelbase-Identity-Envelope": f"{signing}.{signature}",
+    }
 
 
 class FakeProc:
@@ -93,6 +137,10 @@ class _RecordingChildHTTP(threading.Thread):
 @pytest.fixture
 def router_client(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_DASHBOARD_SESSION_TOKEN", "router-secret")
+    monkeypatch.setenv(
+        "AGENT_GATEWAY_IDENTITY_KEYS",
+        json.dumps({"k1": base64.b64encode(_ENVELOPE_KEY).decode()}),
+    )
     stub = _RecordingChildHTTP()
     stub.start()
     mgr, _ = make_manager(tmp_path)
@@ -104,17 +152,12 @@ def router_client(tmp_path, monkeypatch):
         stub.stop()
 
 
-AUTH_HEADERS = {
-    "X-Hermes-Session-Token": "router-secret",
-    "X-Wheelbase-User-Id": "user-aaaa",
-    "X-Wheelbase-Tenant-Id": "tenant-1111",
-}
 OWN_PROFILE = "wb-user-aaaa"
 
 
 def test_no_profile_param_forwarded_unchanged(router_client):
     client, stub, _ = router_client
-    resp = client.get("/api/cron/list?limit=5", headers=AUTH_HEADERS)
+    resp = client.get("/api/cron/list?limit=5", headers=_auth_headers())
     assert resp.status_code == 201
     assert stub.requests[0]["path"] == "/api/cron/list?limit=5"
 
@@ -122,7 +165,7 @@ def test_no_profile_param_forwarded_unchanged(router_client):
 def test_own_profile_param_stripped(router_client):
     client, stub, _ = router_client
     resp = client.get(
-        f"/api/cron/list?profile={OWN_PROFILE}", headers=AUTH_HEADERS
+        f"/api/cron/list?profile={OWN_PROFILE}", headers=_auth_headers()
     )
     assert resp.status_code == 201
     forwarded_path = stub.requests[0]["path"]
@@ -132,7 +175,7 @@ def test_own_profile_param_stripped(router_client):
 
 def test_current_profile_param_stripped(router_client):
     client, stub, _ = router_client
-    resp = client.get("/api/cron/list?profile=current", headers=AUTH_HEADERS)
+    resp = client.get("/api/cron/list?profile=current", headers=_auth_headers())
     assert resp.status_code == 201
     forwarded_path = stub.requests[0]["path"]
     assert "profile" not in forwarded_path
@@ -141,7 +184,7 @@ def test_current_profile_param_stripped(router_client):
 
 def test_empty_profile_param_stripped(router_client):
     client, stub, _ = router_client
-    resp = client.get("/api/cron/list?profile=", headers=AUTH_HEADERS)
+    resp = client.get("/api/cron/list?profile=", headers=_auth_headers())
     assert resp.status_code == 201
     forwarded_path = stub.requests[0]["path"]
     assert "profile" not in forwarded_path
@@ -150,7 +193,7 @@ def test_empty_profile_param_stripped(router_client):
 def test_other_user_profile_param_rejected(router_client):
     client, stub, _ = router_client
     resp = client.get(
-        "/api/cron/list?profile=wb-user-victim", headers=AUTH_HEADERS
+        "/api/cron/list?profile=wb-user-victim", headers=_auth_headers()
     )
     assert resp.status_code == 403
     assert resp.json() == {"error": "profile parameter not permitted"}
@@ -160,7 +203,7 @@ def test_other_user_profile_param_rejected(router_client):
 def test_garbage_profile_param_rejected(router_client):
     client, stub, _ = router_client
     resp = client.get(
-        "/api/cron/list?profile=../../etc/passwd", headers=AUTH_HEADERS
+        "/api/cron/list?profile=../../etc/passwd", headers=_auth_headers()
     )
     assert resp.status_code == 403
     assert resp.json() == {"error": "profile parameter not permitted"}
@@ -171,10 +214,25 @@ def test_other_params_survive_profile_stripping(router_client):
     client, stub, _ = router_client
     resp = client.get(
         f"/api/cron/list?limit=5&profile={OWN_PROFILE}&foo=bar",
-        headers=AUTH_HEADERS,
+        headers=_auth_headers(),
     )
     assert resp.status_code == 201
     forwarded_path = stub.requests[0]["path"]
     assert "profile" not in forwarded_path
     assert "limit=5" in forwarded_path
     assert "foo=bar" in forwarded_path
+
+
+def test_unsigned_identity_headers_are_rejected_before_profile_routing(router_client):
+    client, stub, _ = router_client
+    response = client.get(
+        "/api/cron/list?limit=5",
+        headers={
+            "X-Hermes-Session-Token": "router-secret",
+            "X-Wheelbase-User-Id": "user-aaaa",
+            "X-Wheelbase-Tenant-Id": "tenant-1111",
+        },
+    )
+    assert response.status_code == 403
+    assert response.json() == {"error": "invalid identity envelope"}
+    assert not stub.requests

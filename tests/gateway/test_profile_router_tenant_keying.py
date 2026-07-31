@@ -20,16 +20,60 @@ real thing.
 from __future__ import annotations
 
 import http.server
+import base64
+import hashlib
+import hmac
 import json
 import sys
 import threading
+import time
 import types
+import uuid
 from dataclasses import dataclass, field
 
 import pytest
 from starlette.testclient import TestClient
 
 from tui_gateway.profile_router import ChildManager, build_app
+
+
+_ENVELOPE_KEY = b"k" * 32
+
+
+def _b64(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
+
+
+def _auth_headers(*, user_id: str = "user-aaaa", tenant_id: str = "tenant-one") -> dict[str, str]:
+    now = int(time.time())
+    header = {"alg": "HS256", "typ": "JWT", "kid": "k1"}
+    payload = {
+        "iss": "wheelbase-api",
+        "aud": "wheelbase-agent-gateway",
+        "kind": "agent_gateway_identity",
+        "ver": 2,
+        "iat": now,
+        "exp": now + 20,
+        "nonce": str(uuid.uuid4()),
+        "bundle": {
+            "user_id": user_id,
+            "tenant_id": tenant_id,
+            "client": "mobile",
+            "device_id": "",
+            "session_jti_hash": "a" * 64,
+            "credential_revision": 1,
+            "credential_expires_at": now + 300,
+            "access_token": "test-access-token",
+        },
+    }
+    encoded_header = _b64(json.dumps(header, separators=(",", ":"), sort_keys=True).encode())
+    encoded_payload = _b64(json.dumps(payload, separators=(",", ":"), sort_keys=True).encode())
+    signing = f"{encoded_header}.{encoded_payload}"
+    signature = _b64(hmac.new(_ENVELOPE_KEY, signing.encode(), hashlib.sha256).digest())
+    return {
+        "X-Hermes-Session-Token": "router-secret",
+        "X-Wheelbase-Identity-Envelope": f"{signing}.{signature}",
+    }
 
 
 class FakeProc:
@@ -106,6 +150,10 @@ class _RecordingChildHTTP(threading.Thread):
 @pytest.fixture
 def router_client(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_DASHBOARD_SESSION_TOKEN", "router-secret")
+    monkeypatch.setenv(
+        "AGENT_GATEWAY_IDENTITY_KEYS",
+        json.dumps({"k1": base64.b64encode(_ENVELOPE_KEY).decode()}),
+    )
     stub = _RecordingChildHTTP()
     stub.start()
     mgr, _ = make_manager(tmp_path)
@@ -115,13 +163,6 @@ def router_client(tmp_path, monkeypatch):
         yield client, stub, mgr
     finally:
         stub.stop()
-
-
-AUTH_HEADERS = {
-    "X-Hermes-Session-Token": "router-secret",
-    "X-Wheelbase-User-Id": "user-aaaa",
-    "X-Wheelbase-Tenant-Id": "tenant-one",
-}
 
 
 # --- (a) child spawned under tenants/<tid>/profiles/wb-<uid> ---------------
@@ -175,13 +216,10 @@ def test_ensure_child_rejects_invalid_tenant_id(tmp_path):
 
 def test_rest_rejects_missing_tenant_header(router_client):
     client, stub, _ = router_client
-    headers = {
-        "X-Hermes-Session-Token": "router-secret",
-        "X-Wheelbase-User-Id": "user-aaaa",
-    }
+    headers = _auth_headers(tenant_id="")
     resp = client.get("/api/cron/list", headers=headers)
     assert resp.status_code == 403
-    assert "Tenant" in resp.json()["error"]
+    assert resp.json() == {"error": "invalid identity envelope"}
     assert not stub.requests
 
 
@@ -190,14 +228,10 @@ def test_rest_rejects_missing_tenant_header(router_client):
 
 def test_rest_rejects_invalid_tenant_header(router_client):
     client, stub, _ = router_client
-    headers = {
-        "X-Hermes-Session-Token": "router-secret",
-        "X-Wheelbase-User-Id": "user-aaaa",
-        "X-Wheelbase-Tenant-Id": "../evil",
-    }
+    headers = _auth_headers(tenant_id="../evil")
     resp = client.get("/api/cron/list", headers=headers)
     assert resp.status_code == 403
-    assert "Tenant" in resp.json()["error"]
+    assert resp.json() == {"error": "invalid identity envelope"}
     assert not stub.requests
 
 
@@ -206,14 +240,15 @@ def test_rest_proxies_with_valid_tenant_and_user(router_client):
     resp = client.post(
         "/api/cron/list?limit=5",
         content=b'{"x":1}',
-        headers=AUTH_HEADERS,
+        headers=_auth_headers(),
     )
     assert resp.status_code == 201
     child = mgr.ensure_child("tenant-one", "user-aaaa")
     forwarded = stub.requests[0]
     assert forwarded["headers"]["X-Hermes-Session-Token"] == child.token
-    assert forwarded["headers"]["X-Wheelbase-User-Id"] == "user-aaaa"
-    assert forwarded["headers"]["X-Wheelbase-Tenant-Id"] == "tenant-one"
+    assert "X-Wheelbase-Identity-Envelope" in forwarded["headers"]
+    assert "X-Wheelbase-User-Id" not in forwarded["headers"]
+    assert "X-Wheelbase-Tenant-Id" not in forwarded["headers"]
 
 
 class _EchoChildWS(threading.Thread):
@@ -265,6 +300,10 @@ class _EchoChildWS(threading.Thread):
 @pytest.fixture
 def ws_router(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_DASHBOARD_SESSION_TOKEN", "router-secret")
+    monkeypatch.setenv(
+        "AGENT_GATEWAY_IDENTITY_KEYS",
+        json.dumps({"k1": base64.b64encode(_ENVELOPE_KEY).decode()}),
+    )
     stub = _EchoChildWS()
     stub.start_and_wait()
     mgr, _ = make_manager(tmp_path)
@@ -279,10 +318,7 @@ def test_ws_rejects_missing_or_invalid_tenant_header(ws_router):
     from starlette.websockets import WebSocketDisconnect
 
     client, stub, _ = ws_router
-    for headers in (
-        {"X-Wheelbase-User-Id": "user-aaaa"},
-        {"X-Wheelbase-User-Id": "user-aaaa", "X-Wheelbase-Tenant-Id": "../evil"},
-    ):
+    for headers in (_auth_headers(tenant_id=""), _auth_headers(tenant_id="../evil")):
         with pytest.raises(WebSocketDisconnect) as exc:
             with client.websocket_connect("/api/ws?token=router-secret", headers=headers):
                 pass
@@ -292,10 +328,7 @@ def test_ws_rejects_missing_or_invalid_tenant_header(ws_router):
 
 def test_ws_proxies_with_composite_key(ws_router):
     client, stub, mgr = ws_router
-    headers = {
-        "X-Wheelbase-User-Id": "user-aaaa",
-        "X-Wheelbase-Tenant-Id": "tenant-one",
-    }
+    headers = _auth_headers()
     with client.websocket_connect("/api/ws?token=router-secret", headers=headers) as ws:
         ws.send_text("hi")
         assert ws.receive_text() == "echo:hi"
@@ -304,7 +337,9 @@ def test_ws_proxies_with_composite_key(ws_router):
     upgrade = stub.upgrades[0]
     assert f"token={child.token}" in upgrade["path"]
     lowered = {key.lower(): value for key, value in upgrade["headers"].items()}
-    assert lowered["x-wheelbase-tenant-id"] == "tenant-one"
+    assert "x-wheelbase-identity-envelope" in lowered
+    assert "x-wheelbase-user-id" not in lowered
+    assert "x-wheelbase-tenant-id" not in lowered
 
 
 # --- (e) boot reconcile discovers nested profiles, skips garbage -----------
@@ -388,6 +423,7 @@ def test_main_invokes_tenant_migration_once_before_reconcile(
     import tui_gateway.profile_router as pr
 
     monkeypatch.setenv("HERMES_DASHBOARD_SESSION_TOKEN", "tok")
+    monkeypatch.setenv("AGENT_GATEWAY_IDENTITY_KEYS", json.dumps({"k1": base64.b64encode(_ENVELOPE_KEY).decode()}))
     monkeypatch.setenv("SUPABASE_URL", "https://example.supabase.co")
     monkeypatch.setenv("SUPABASE_SERVICE_ROLE_KEY", "svc-key")
     monkeypatch.setattr(pr, "profiles_root", lambda: tmp_path / "flat")
@@ -411,6 +447,7 @@ def test_main_logs_migration_summary(tmp_path, monkeypatch, stub_tenant_migratio
     import tui_gateway.profile_router as pr
 
     monkeypatch.setenv("HERMES_DASHBOARD_SESSION_TOKEN", "tok")
+    monkeypatch.setenv("AGENT_GATEWAY_IDENTITY_KEYS", json.dumps({"k1": base64.b64encode(_ENVELOPE_KEY).decode()}))
     monkeypatch.setattr(pr, "profiles_root", lambda: tmp_path / "flat")
     monkeypatch.setattr(pr, "hermes_home_root", lambda: tmp_path)
 
