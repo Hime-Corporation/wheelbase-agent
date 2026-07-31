@@ -749,6 +749,12 @@ def _(rid, params: dict) -> dict:
                     wb_cleanup()
                 except Exception:
                     logger.exception("wheelbase injection cleanup failed (background)")
+            try:
+                from tui_gateway.wheelbase_inject import clear_ephemeral_task_state
+
+                clear_ephemeral_task_state(task_id)
+            except Exception:
+                logger.exception("ephemeral task cleanup failed (background)")
             _clear_session_context(session_tokens)
 
     threading.Thread(target=run, daemon=True).start()
@@ -885,11 +891,11 @@ def _(rid, params: dict) -> dict:
                 except Exception:
                     logger.exception("wheelbase injection cleanup failed (preview)")
             try:
-                from tools.terminal_tool import clear_task_env_overrides
+                from tui_gateway.wheelbase_inject import clear_ephemeral_task_state
 
-                clear_task_env_overrides(task_id)
+                clear_ephemeral_task_state(task_id)
             except Exception:
-                pass
+                logger.exception("ephemeral task cleanup failed (preview)")
             _clear_session_context(session_tokens)
 
     threading.Thread(target=run, daemon=True).start()

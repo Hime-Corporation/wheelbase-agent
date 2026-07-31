@@ -769,3 +769,143 @@ def test_prompt_background_fail_closed_on_injection_error(monkeypatch):
         assert not agent_constructed, "agent ran despite failed injection (UNSCOPED EXECUTION)"
     finally:
         server._sessions.pop(sid, None)
+
+
+@pytest.mark.parametrize("method", ["prompt.background", "preview.restart"])
+@pytest.mark.parametrize("outcome", ["success", "error", "cancelled"])
+def test_ephemeral_tasks_clear_only_their_per_task_registries(
+    method, outcome, tmp_path, _bound, monkeypatch
+):
+    import asyncio
+    import sys
+    import types
+
+    from tools import browser_tool, terminal_tool
+    from tui_gateway.wheelbase_inject import apply_session_injection
+
+    monkeypatch.setenv("TERMINAL_ENV", "docker")
+    monkeypatch.setattr(server, "get_hermes_home", lambda: str(tmp_path))
+    monkeypatch.setattr(server, "_emit", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(server, "_background_agent_kwargs", lambda *_args: {})
+    monkeypatch.setattr(server, "_ephemeral_preview_agent_kwargs", lambda *_args: {})
+    monkeypatch.setattr(server, "_preview_restart_callbacks", lambda *_args: {})
+    parent_wb = WheelbaseIdentity(
+        user_id=IDENT_A.user_id,
+        tenant_id=IDENT_A.tenant_id,
+        dealership_id=IDENT_A.dealership_id,
+        jwt=IDENT_A.jwt,
+        client="desktop",
+        device_id="device-parent",
+        cdp_url="wss://cdp/parent",
+        shell_relay_url="wss://shell/parent",
+    )
+    sibling_wb = WheelbaseIdentity(
+        user_id=IDENT_B.user_id,
+        tenant_id=IDENT_B.tenant_id,
+        dealership_id=IDENT_B.dealership_id,
+        jwt=IDENT_B.jwt,
+        client="desktop",
+        device_id="device-sibling",
+        cdp_url="wss://cdp/sibling",
+        shell_relay_url="wss://shell/sibling",
+    )
+    _bound(parent_wb)
+
+    parent_task = f"parent-{method}-{outcome}"
+    sibling_task = f"sibling-{method}-{outcome}"
+    sibling_cleanup = apply_session_injection(
+        sibling_task, sibling_wb, tmp_path, connection_id="connection-sibling"
+    )
+    sibling_cleanup()
+    parent_cleanup = apply_session_injection(
+        parent_task, parent_wb, tmp_path, connection_id="connection-parent"
+    )
+    parent_identity = wb_runtime.get_task_identity(parent_task)
+    sibling_identity = wb_runtime.get_task_identity(sibling_task)
+    parent_terminal = dict(terminal_tool._task_env_overrides[parent_task])
+    sibling_terminal = dict(terminal_tool._task_env_overrides[sibling_task])
+
+    fake_run_agent = types.ModuleType("run_agent")
+
+    class _FakeAgent:
+        def __init__(self, **_kwargs):
+            pass
+
+        def run_conversation(self, **_kwargs):
+            if outcome == "error":
+                raise RuntimeError("ephemeral failure")
+            if outcome == "cancelled":
+                raise asyncio.CancelledError()
+            return {"final_response": "done"}
+
+    fake_run_agent.AIAgent = _FakeAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+
+    escaped = []
+
+    class _InlineThread:
+        def __init__(self, *, target, **_kwargs):
+            self._target = target
+
+        def start(self):
+            try:
+                self._target()
+            except BaseException as exc:
+                escaped.append(exc)
+
+    monkeypatch.setattr(server.threading, "Thread", _InlineThread)
+
+    sid = f"session-{method}-{outcome}"
+    server._sessions[sid] = {
+        "agent": object(),
+        "session_key": parent_task,
+        "wheelbase_identity": parent_wb,
+        "cwd": str(tmp_path),
+        "history": [],
+        "history_lock": threading.Lock(),
+    }
+    ephemeral_task = ""
+    try:
+        params = {"session_id": sid}
+        if method == "prompt.background":
+            params["text"] = "do it"
+        else:
+            params["url"] = "http://127.0.0.1:3000"
+        response = server.handle_request(
+            {"id": "ephemeral", "method": method, "params": params}
+        )
+        ephemeral_task = response["result"]["task_id"]
+
+        assert wb_runtime.get_task_identity(ephemeral_task) is None
+        assert ephemeral_task not in browser_tool._task_cdp_urls
+        assert ephemeral_task not in terminal_tool._task_env_overrides
+        assert ephemeral_task not in terminal_tool._session_cwd
+
+        activation_token = wb_runtime.activate_task(ephemeral_task)
+        try:
+            assert wb_runtime.current_identity() is None
+        finally:
+            wb_runtime.reset_identity(activation_token)
+
+        assert wb_runtime.get_task_identity(parent_task) == parent_identity
+        assert wb_runtime.get_task_identity(sibling_task) == sibling_identity
+        assert browser_tool._task_cdp_urls[parent_task] == parent_wb.cdp_url
+        assert browser_tool._task_cdp_urls[sibling_task] == sibling_wb.cdp_url
+        assert terminal_tool._task_env_overrides[parent_task] == parent_terminal
+        assert terminal_tool._task_env_overrides[sibling_task] == sibling_terminal
+        assert wb_runtime.current_identity() == parent_identity
+
+        if outcome == "cancelled":
+            assert len(escaped) == 1
+            assert isinstance(escaped[0], asyncio.CancelledError)
+        else:
+            assert escaped == []
+    finally:
+        server._sessions.pop(sid, None)
+        parent_cleanup()
+        for task_id in (ephemeral_task, parent_task, sibling_task):
+            if not task_id:
+                continue
+            wb_runtime.clear_task(task_id)
+            browser_tool.register_task_cdp_url(task_id, "")
+            terminal_tool.clear_task_env_overrides(task_id)

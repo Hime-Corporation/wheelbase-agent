@@ -127,6 +127,42 @@ def _require_sandboxed_env(shell_relay_url: str = "") -> str:
     )
 
 
+def clear_ephemeral_task_state(task_id: str) -> None:
+    """Forget every task-keyed registration owned by one ephemeral worker.
+
+    Background and preview task IDs are never resumed. Their terminal,
+    browser, and SDK registrations must therefore disappear when the worker
+    exits, without disturbing the durable parent session or sibling tasks.
+    Each registry cleanup is idempotent and attempted independently so one
+    cleanup failure cannot leave the other capability pointers reachable.
+    """
+    if not task_id:
+        return
+
+    try:
+        from wheelbase_sdk import runtime as wb_runtime
+
+        wb_runtime.clear_task(task_id)
+    except ImportError:
+        pass
+    except Exception:
+        logger.exception("failed to clear ephemeral Wheelbase runtime task")
+
+    try:
+        from tools.browser_tool import register_task_cdp_url
+
+        register_task_cdp_url(task_id, "")
+    except Exception:
+        logger.exception("failed to clear ephemeral browser task")
+
+    try:
+        from tools.terminal_tool import clear_task_env_overrides
+
+        clear_task_env_overrides(task_id)
+    except Exception:
+        logger.exception("failed to clear ephemeral terminal task")
+
+
 def apply_session_injection(
     task_id: str,
     identity: WheelbaseIdentity,
