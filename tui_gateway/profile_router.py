@@ -7,7 +7,9 @@ routes each authenticated Wheelbase user to a private child dashboard bound to
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import hmac
+import json
 import logging
 import os
 import secrets
@@ -24,6 +26,7 @@ from fastapi import FastAPI, Request, WebSocket
 from fastapi.responses import JSONResponse, Response
 from starlette.websockets import WebSocketDisconnect
 
+from tui_gateway.fixture_trace import emit_fixture_trace
 from tui_gateway.wheelbase_identity import (
     HEADER_ENVELOPE,
     identity_from_headers,
@@ -61,6 +64,10 @@ PROFILE_PLUGINS = (
 # keeps session_search.
 PROFILE_DISABLED_TOOLSETS = ("session_search",)
 PORT_RANGE = (9400, 9899)
+
+
+def _trace_scope_fingerprint(tenant_id: str, user_id: str) -> str:
+    return hashlib.sha256(f"{tenant_id}\0{user_id}".encode()).hexdigest()[:12]
 
 DEFAULT_SOUL = """\
 # Wheelbase Dealership Agent
@@ -605,13 +612,27 @@ def build_app(manager: ChildManager) -> FastAPI:
             await ws.close(code=4003)
             return
         user_id, tenant_id = identity.user_id, identity.tenant_id
+        scope_fp = _trace_scope_fingerprint(tenant_id, user_id)
 
+        ensure_started = time.monotonic()
+        emit_fixture_trace("router_child_ensure_start", scope_fp=scope_fp)
         try:
             child = await asyncio.to_thread(manager.ensure_child, tenant_id, user_id)
         except Exception:
+            emit_fixture_trace(
+                "router_child_ensure_error",
+                scope_fp=scope_fp,
+                duration_ms=int((time.monotonic() - ensure_started) * 1000),
+            )
             logger.exception("failed to ensure child for WS user=%s", user_id)
             await ws.close(code=1011)
             return
+        emit_fixture_trace(
+            "router_child_ensure_complete",
+            scope_fp=scope_fp,
+            duration_ms=int((time.monotonic() - ensure_started) * 1000),
+            child_pid=getattr(child.proc, "pid", None),
+        )
 
         import websockets
 
@@ -623,16 +644,40 @@ def build_app(manager: ChildManager) -> FastAPI:
                 max_size=None,
             )
         except Exception:
+            emit_fixture_trace("router_upstream_connect_error", scope_fp=scope_fp)
             logger.exception("upstream WS dial failed user=%s port=%s", user_id, child.port)
             await ws.close(code=1011)
             return
+        emit_fixture_trace("router_upstream_connect_complete", scope_fp=scope_fp)
 
         await ws.accept()
+        pending_methods: dict[object, tuple[str, float]] = {}
 
         async def client_to_child() -> None:
             try:
                 while True:
                     msg = await ws.receive_text()
+                    try:
+                        frame = json.loads(msg)
+                    except (TypeError, ValueError):
+                        frame = None
+                    if isinstance(frame, dict):
+                        method = str(frame.get("method") or "unknown")[:64]
+                        raw_request_id = frame.get("id")
+                        request_id = (
+                            raw_request_id
+                            if isinstance(raw_request_id, (str, int, float))
+                            and not isinstance(raw_request_id, bool)
+                            else None
+                        )
+                        if request_id is not None:
+                            pending_methods[request_id] = (method, time.monotonic())
+                        emit_fixture_trace(
+                            "router_request_forward",
+                            scope_fp=scope_fp,
+                            method=method,
+                            has_id=request_id is not None,
+                        )
                     await upstream.send(msg)
             except WebSocketDisconnect:
                 logger.debug("client_to_child: client disconnected")
@@ -640,6 +685,37 @@ def build_app(manager: ChildManager) -> FastAPI:
         async def child_to_client() -> None:
             try:
                 async for msg in upstream:
+                    try:
+                        frame = json.loads(msg)
+                    except (TypeError, ValueError):
+                        frame = None
+                    if isinstance(frame, dict):
+                        raw_request_id = frame.get("id")
+                        request_id = (
+                            raw_request_id
+                            if isinstance(raw_request_id, (str, int, float))
+                            and not isinstance(raw_request_id, bool)
+                            else None
+                        )
+                        pending = pending_methods.pop(request_id, None)
+                        method = pending[0] if pending is not None else str(
+                            frame.get("method") or "unsolicited"
+                        )[:64]
+                        emit_fixture_trace(
+                            "router_response_forward",
+                            scope_fp=scope_fp,
+                            method=method,
+                            duration_ms=(
+                                int((time.monotonic() - pending[1]) * 1000)
+                                if pending is not None
+                                else None
+                            ),
+                            outcome=(
+                                "error"
+                                if "error" in frame
+                                else "result" if "result" in frame else "event"
+                            ),
+                        )
                     if isinstance(msg, str):
                         await ws.send_text(msg)
                     else:

@@ -258,6 +258,7 @@ def test_executable_gateway_fixture_contract(tmp_path):
     repo = Path(__file__).resolve().parents[2]
     script = repo / "scripts" / "wheelbase_gateway_fixture.py"
     ready_file = tmp_path / "ready.json"
+    trace_file = tmp_path / "fixture-trace.jsonl"
     hermes_home = tmp_path / "hermes-home"
     key = b"f" * 32
     router_token = "fixture-router-secret"
@@ -282,6 +283,7 @@ def test_executable_gateway_fixture_contract(tmp_path):
             "WHEELBASE_GATEWAY_FIXTURE_IDENTITY_KEYS_JSON": json.dumps(
                 {"fixture-key": base64.b64encode(key).decode()}
             ),
+            "WHEELBASE_GATEWAY_FIXTURE_TRACE_FILE": str(trace_file),
         },
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -301,6 +303,14 @@ def test_executable_gateway_fixture_contract(tmp_path):
         assert ready["version"] == 1
         assert ready["base_url"].startswith("http://127.0.0.1:")
         asyncio.run(_rpc_flow(ready["base_url"], router_token, key, hermes_home))
+        trace = [json.loads(line) for line in trace_file.read_text().splitlines()]
+        assert any(
+            row.get("event") == "router_request_forward"
+            and row.get("method") == "wheelbase.runtime.probe"
+            for row in trace
+        )
+        assert any(row.get("event") == "probe_start" for row in trace)
+        assert any(row.get("event") == "probe_complete" for row in trace)
     finally:
         process.terminate()
         assert process.wait(timeout=10) == 0

@@ -455,6 +455,11 @@ def _(rid, params: dict) -> dict:
     been cleared, the real shell/browser routing policy is exercised with no
     application command or fallback execution.
     """
+    import time as _trace_time
+
+    from tui_gateway.fixture_trace import emit_fixture_trace
+
+    trace_started = _trace_time.monotonic()
     ident = _transport_identity()
     if ident is None:
         return _err(rid, 4030, "connection identity required")
@@ -493,6 +498,15 @@ def _(rid, params: dict) -> dict:
             return _err(rid, 4004, "invalid relay_status_v2 schema")
         if cdp_challenge != "not_applicable" or shell_challenge != "not_applicable":
             return _err(rid, 4004, "invalid relay_status_v2 schema")
+
+    emit_fixture_trace(
+        "probe_start",
+        client=client,
+        cdp_challenge=cdp_challenge,
+        shell_challenge=shell_challenge,
+        cdp_capability=bool(ident.cdp_url),
+        shell_capability=bool(ident.shell_relay_url),
+    )
 
     result = _wheelbase_runtime_fingerprints(ident)
     result["version"] = 2
@@ -535,6 +549,12 @@ def _(rid, params: dict) -> dict:
     ]
     if not lost_surfaces:
         result["desktop_policies"] = policies
+        emit_fixture_trace(
+            "probe_complete",
+            client=client,
+            duration_ms=int((_trace_time.monotonic() - trace_started) * 1000),
+            lost_surface_count=0,
+        )
         return _ok(rid, result)
 
     task_id = f"wheelbase-runtime-probe-{uuid.uuid4().hex}"
@@ -558,6 +578,7 @@ def _(rid, params: dict) -> dict:
         )
 
         if "cdp" in lost_surfaces:
+            emit_fixture_trace("probe_policy_start", client=client, surface="cdp")
             policies["cdp"]["attempted"] = True
             from tools import browser_tool
 
@@ -566,8 +587,15 @@ def _(rid, params: dict) -> dict:
             policies["cdp"]["error_code"] = str(
                 parsed.get("error_code") or "diagnostic_unexpected_result"
             )
+            emit_fixture_trace(
+                "probe_policy_complete",
+                client=client,
+                surface="cdp",
+                error_code=policies["cdp"]["error_code"],
+            )
 
         if "shell" in lost_surfaces:
+            emit_fixture_trace("probe_policy_start", client=client, surface="shell")
             policies["shell"]["attempted"] = True
             fallback_count = 0
 
@@ -591,7 +619,15 @@ def _(rid, params: dict) -> dict:
                 parsed.get("error_code") or "diagnostic_unexpected_result"
             )
             policies["shell"]["fallback_invocations"] = fallback_count
+            emit_fixture_trace(
+                "probe_policy_complete",
+                client=client,
+                surface="shell",
+                error_code=policies["shell"]["error_code"],
+                fallback_invocations=fallback_count,
+            )
     except Exception:
+        emit_fixture_trace("probe_error", client=client)
         logger.exception("wheelbase.runtime.probe failed")
         for surface in lost_surfaces:
             if not policies[surface]["error_code"]:
@@ -610,6 +646,12 @@ def _(rid, params: dict) -> dict:
                 pass
 
     result["desktop_policies"] = policies
+    emit_fixture_trace(
+        "probe_complete",
+        client=client,
+        duration_ms=int((_trace_time.monotonic() - trace_started) * 1000),
+        lost_surface_count=len(lost_surfaces),
+    )
     return _ok(rid, result)
 
 
