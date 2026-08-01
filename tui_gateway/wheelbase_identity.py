@@ -1,9 +1,10 @@
 """Per-connection Wheelbase identity for the multi-user cloud gateway.
 
-The Go backend chat broker injects identity headers on the /api/ws upgrade.
-The gateway trusts them because it is reachable only on the private network
-and the upgrade is dashboard-token authenticated. Single-user desktop/dev
-connections carry no headers and get identity=None (legacy behavior).
+The authenticated Go chat broker injects one signed identity envelope on the
+``/api/ws`` upgrade. The gateway verifies its signature, issuer, audience,
+purpose, lifetime, and replay nonce and rejects independent identity headers.
+Single-user desktop/dev connections carry no envelope and retain the legacy
+``identity=None`` behavior.
 """
 from __future__ import annotations
 

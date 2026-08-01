@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
-"""Run a production profile router with deterministic RPC fixture children.
+"""Run the production profile router and dashboard children for contract tests.
 
 This is an integration-test executable, not a development gateway. It accepts
 only loopback listeners, writes a mode-0600 readiness file, never logs identity
-envelopes or tokens, and keeps production routing/profile isolation intact.
+envelopes or tokens, and keeps production routing, dashboard RPC handlers, and
+profile persistence intact. Deterministic prompt responses use Hermes' existing
+loopback OpenAI-compatible inference; session, history, title, runtime probe,
+signed-envelope, and profile selection behavior remain production code.
 
 Secrets are inherited through ``WHEELBASE_GATEWAY_FIXTURE_ROUTER_TOKEN`` and
 ``WHEELBASE_GATEWAY_FIXTURE_IDENTITY_KEYS_JSON`` so they never appear in the
@@ -14,243 +17,167 @@ actual loopback ``base_url`` selected for ``--port 0``.
 from __future__ import annotations
 
 import argparse
-import asyncio
-import base64
-import hashlib
 import json
 import os
 import signal
 import socket
+import subprocess
 import threading
 import time
-import uuid
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlsplit
+from typing import Any
 
-from tui_gateway.profile_router import ChildManager, build_app
+from tui_gateway.profile_router import ChildManager, _default_spawn, build_app
 from tui_gateway.wheelbase_identity import load_identity_envelope_keys
 
 
-def _decode_envelope(raw: str) -> dict[str, object]:
-    """Decode the already router-verified envelope forwarded to the child."""
-    parts = raw.split(".")
-    if len(parts) != 3:
-        raise ValueError("invalid forwarded envelope")
-    payload = json.loads(
-        base64.urlsafe_b64decode(parts[1] + "=" * (-len(parts[1]) % 4))
+def _completion_text(messages: Any) -> str:
+    """Return deterministic inference derived from the production request."""
+    rows = messages if isinstance(messages, list) else []
+    system = "\n".join(
+        str(row.get("content") or "")
+        for row in rows
+        if isinstance(row, dict) and row.get("role") == "system"
     )
-    bundle = payload.get("bundle") if isinstance(payload, dict) else None
-    if not isinstance(bundle, dict):
-        raise ValueError("invalid forwarded envelope")
-    return bundle
+    user = next(
+        (
+            str(row.get("content") or "")
+            for row in reversed(rows)
+            if isinstance(row, dict) and row.get("role") == "user"
+        ),
+        "",
+    )
+    if "Return ONLY the title text" in system:
+        conversation = user.partition("User:")[2].partition("\n\nAssistant:")[0]
+        words = [word.strip(".,:;!?()[]{}\"'") for word in conversation.split()]
+        words = [word for word in words if word][:5]
+        return " ".join(word.capitalize() for word in words)
+    return f"Completed production turn for: {user[:120]}"
 
 
-def _fingerprint(*parts: str) -> str:
-    return hashlib.sha256("\0".join(parts).encode()).hexdigest()[:12]
+class _InferenceHandler(BaseHTTPRequestHandler):
+    server_version = "WheelbaseFixtureInference/1"
 
+    def log_message(self, _format: str, *_args: object) -> None:
+        return
 
-class _FixtureChild:
-    def __init__(
-        self,
-        tenant_id: str,
-        user_id: str,
-        port: int,
-        token: str,
-        profile: Path,
-    ):
-        self.tenant_id = tenant_id
-        self.user_id = user_id
-        self.port = port
-        self.token = token
-        self.profile = profile
-        self.sessions: dict[str, dict[str, object]] = {}
-        self._loop: asyncio.AbstractEventLoop | None = None
-        self._server = None
-        self._started = threading.Event()
-        self._stopped = False
-        self._thread = threading.Thread(target=self._run, daemon=True)
-        self._thread.start()
-        if not self._started.wait(10):
-            raise RuntimeError("fixture child did not start")
+    def _json(self, status: int, payload: object) -> None:
+        raw = json.dumps(payload, separators=(",", ":")).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
 
-    def _run(self) -> None:
-        async def serve() -> None:
-            import websockets
-
-            async def handler(ws) -> None:
-                request = getattr(ws, "request", None)
-                path = getattr(request, "path", "")
-                query = parse_qs(urlsplit(path).query)
-                if query.get("token") != [self.token]:
-                    await ws.close(code=4003, reason="unauthorized")
-                    return
-                headers = getattr(request, "headers", {}) or {}
-                envelope = headers.get("X-Wheelbase-Identity-Envelope", "")
-                try:
-                    identity = _decode_envelope(str(envelope))
-                except (ValueError, json.JSONDecodeError, TypeError):
-                    await ws.close(code=4003, reason="invalid")
-                    return
-                if (
-                    str(identity.get("tenant_id") or "") != self.tenant_id
-                    or str(identity.get("user_id") or "") != self.user_id
-                ):
-                    await ws.close(code=4003, reason="scope_mismatch")
-                    return
-                async for raw in ws:
-                    if not isinstance(raw, str):
-                        continue
-                    try:
-                        frame = json.loads(raw)
-                    except ValueError:
-                        continue
-                    if not isinstance(frame, dict):
-                        continue
-                    method = frame.get("method")
-                    params = frame.get("params") if isinstance(frame.get("params"), dict) else {}
-                    request_id = frame.get("id")
-                    if method == "identity.update":
-                        try:
-                            identity = _decode_envelope(str(params.get("identity_envelope") or ""))
-                        except (ValueError, json.JSONDecodeError, TypeError):
-                            await ws.close(code=4003, reason="invalid")
-                        continue
-                    response, events = self._rpc(identity, request_id, str(method or ""), params)
-                    await ws.send(json.dumps(response, separators=(",", ":")))
-                    for event in events:
-                        await ws.send(json.dumps(event, separators=(",", ":")))
-
-            self._server = await websockets.serve(
-                handler,
-                "127.0.0.1",
-                self.port,
-                max_size=None,
+    def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler contract
+        if self.path.rstrip("/") == "/v1/models":
+            self._json(
+                200,
+                {"object": "list", "data": [{"id": "wheelbase-fixture-model"}]},
             )
-            self._started.set()
-            await self._server.wait_closed()
-
-        self._loop = asyncio.new_event_loop()
-        try:
-            self._loop.run_until_complete(serve())
-        finally:
-            self._loop.close()
-
-    @staticmethod
-    def _ok(request_id, result: object) -> dict[str, object]:
-        return {"jsonrpc": "2.0", "id": request_id, "result": result}
-
-    @staticmethod
-    def _error(request_id, code: int, message: str) -> dict[str, object]:
-        return {
-            "jsonrpc": "2.0",
-            "id": request_id,
-            "error": {"code": code, "message": message},
-        }
-
-    @staticmethod
-    def _event(kind: str, session_id: str, payload: dict[str, object]) -> dict[str, object]:
-        return {
-            "jsonrpc": "2.0",
-            "method": "event",
-            "params": {"type": kind, "session_id": session_id, "payload": payload},
-        }
-
-    def _rpc(
-        self,
-        identity: dict[str, object],
-        request_id: object,
-        method: str,
-        params: dict[str, object],
-    ) -> tuple[dict[str, object], list[dict[str, object]]]:
-        if "profile" in params:
-            return self._error(request_id, -32602, "profile override not permitted"), []
-        if method == "wheelbase.runtime.probe":
-            client = str(identity.get("client") or "")
-            available = bool(identity.get("cdp_url") or identity.get("shell_relay_url"))
-            if client == "mobile":
-                attempted, error_code = False, "desktop_identity_required"
-            elif available:
-                attempted, error_code = False, "desktop_available"
-            else:
-                attempted, error_code = True, "desktop_unavailable"
-            result = {
-                "instance_fingerprint": _fingerprint(self.tenant_id, self.user_id, "instance"),
-                "profile_fingerprint": _fingerprint(str(self.profile), "profile"),
-                "profile_scope_match": (
-                    identity.get("tenant_id") == self.tenant_id
-                    and identity.get("user_id") == self.user_id
-                ),
-                "desktop_probe": {
-                    "attempted": attempted,
-                    "error_code": error_code,
-                    "fallback_invocations": 0,
-                },
-            }
-            return self._ok(request_id, result), []
-        if method == "session.list":
-            rows = [
-                {"id": session_id, "title": session["title"]}
-                for session_id, session in self.sessions.items()
-            ]
-            return self._ok(request_id, {"sessions": rows}), []
-        if method == "session.create":
-            session_id = str(uuid.uuid4())
-            self.sessions[session_id] = {"title": "", "messages": [], "closed": False}
-            return self._ok(
-                request_id,
-                {"session_id": session_id, "stored_session_id": session_id},
-            ), []
-        session_id = str(params.get("session_id") or "")
-        session = self.sessions.get(session_id)
-        if method in {"session.resume", "session.history", "session.title"}:
-            if session is None:
-                return self._error(request_id, 4007, "session unavailable"), []
-            if method == "session.title":
-                return self._ok(request_id, {"session_id": session_id, "title": session["title"]}), []
-            return self._ok(
-                request_id,
-                {"session_id": session_id, "messages": list(session["messages"])},
-            ), []
-        if method == "prompt.submit":
-            if session is None:
-                return self._error(request_id, 4007, "session unavailable"), []
-            prompt = str(params.get("text") or "")
-            title = "Contract smoke acknowledgement"
-            session["title"] = title
-            session["messages"] = [
-                {"role": "user", "content": prompt},
-                {"role": "assistant", "content": "Acknowledged."},
-            ]
-            events = [
-                self._event("message.complete", session_id, {"session_id": session_id}),
-                self._event(
-                    "session.title",
-                    session_id,
-                    {"session_id": session_id, "title": title},
-                ),
-            ]
-            return self._ok(request_id, {"ok": True, "session_id": session_id}), events
-        if method == "session.close":
-            if session is None:
-                return self._error(request_id, 4007, "session unavailable"), []
-            session["closed"] = True
-            return self._ok(request_id, {"closed": session_id}), []
-        if method == "session.delete":
-            if session is None:
-                return self._error(request_id, 4007, "session unavailable"), []
-            self.sessions.pop(session_id, None)
-            return self._ok(request_id, {"deleted": session_id}), []
-        return self._error(request_id, -32601, "method not found"), []
-
-    def poll(self):
-        return 0 if self._stopped else None
-
-    def terminate(self) -> None:
-        if self._stopped:
             return
-        self._stopped = True
-        if self._loop is not None and self._server is not None:
-            self._loop.call_soon_threadsafe(self._server.close)
+        self._json(404, {"error": {"message": "not found"}})
+
+    def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler contract
+        if self.path.rstrip("/") != "/v1/chat/completions":
+            self._json(404, {"error": {"message": "not found"}})
+            return
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            if length < 1 or length > 2_000_000:
+                raise ValueError("invalid request length")
+            request = json.loads(self.rfile.read(length))
+            if not isinstance(request, dict):
+                raise ValueError("invalid request")
+        except (ValueError, TypeError, json.JSONDecodeError):
+            self._json(400, {"error": {"message": "invalid request"}})
+            return
+
+        model = str(request.get("model") or "wheelbase-fixture-model")
+        content = _completion_text(request.get("messages"))
+        created = int(time.time())
+        if request.get("stream") is True:
+            chunks = [
+                {
+                    "id": "chatcmpl-wheelbase-fixture",
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": model,
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {"role": "assistant", "content": content},
+                            "finish_reason": None,
+                        }
+                    ],
+                },
+                {
+                    "id": "chatcmpl-wheelbase-fixture",
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": model,
+                    "choices": [
+                        {"index": 0, "delta": {}, "finish_reason": "stop"}
+                    ],
+                    "usage": {
+                        "prompt_tokens": 8,
+                        "completion_tokens": 8,
+                        "total_tokens": 16,
+                    },
+                },
+            ]
+            body = "".join(
+                f"data: {json.dumps(chunk, separators=(',', ':'))}\n\n"
+                for chunk in chunks
+            ) + "data: [DONE]\n\n"
+            raw = body.encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+            return
+
+        self._json(
+            200,
+            {
+                "id": "chatcmpl-wheelbase-fixture",
+                "object": "chat.completion",
+                "created": created,
+                "model": model,
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": content},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 8,
+                    "completion_tokens": 8,
+                    "total_tokens": 16,
+                },
+            },
+        )
+
+
+class _InferenceServer:
+    def __init__(self) -> None:
+        self._server = ThreadingHTTPServer(("127.0.0.1", 0), _InferenceHandler)
+        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+
+    @property
+    def base_url(self) -> str:
+        return f"http://127.0.0.1:{self._server.server_port}/v1"
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._server.shutdown()
+        self._server.server_close()
         self._thread.join(timeout=5)
 
 
@@ -300,26 +227,30 @@ def main() -> int:
     os.environ["AGENT_GATEWAY_IDENTITY_KEYS"] = identity_keys_json
     load_identity_envelope_keys()
 
-    children: list[_FixtureChild] = []
+    inference = _InferenceServer()
+    inference.start()
 
-    def spawn(user_id: str, port: int, env: dict[str, str]):
-        profile = Path(env["HERMES_HOME"])
-        tenant_id = profile.parents[1].name
-        child = _FixtureChild(
-            tenant_id,
-            user_id,
-            port,
-            env["HERMES_DASHBOARD_SESSION_TOKEN"],
-            profile,
+    def spawn_production_child(user_id: str, port: int, env: dict[str, str]):
+        """Configure the supported custom-provider boundary, then spawn normally."""
+        import yaml
+
+        config_path = Path(env["HERMES_HOME"]) / "config.yaml"
+        config = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+        config["model"] = {
+            "default": "wheelbase-fixture-model",
+            "provider": "custom",
+            "base_url": inference.base_url,
+            "api_key": "fixture-local-no-secret",
+            "api_mode": "chat_completions",
+        }
+        config_path.write_text(
+            yaml.safe_dump(config, sort_keys=False), encoding="utf-8"
         )
-        children.append(child)
-        return child
+        return _default_spawn(user_id, port, env)
 
     manager = ChildManager(
         profiles_root=args.hermes_home,
-        spawn=spawn,
-        wait_ready=lambda _port, _token: None,
-        seed_skills=lambda _path: None,
+        spawn=spawn_production_child,
     )
 
     def allocate_child_port() -> int:
@@ -343,6 +274,7 @@ def main() -> int:
             app,
             log_level="warning",
             access_log=False,
+            timeout_graceful_shutdown=5,
         )
     )
     thread = threading.Thread(target=server.run, kwargs={"sockets": [listener]})
@@ -362,8 +294,37 @@ def main() -> int:
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
     thread.join()
+    # ChildManager intentionally has no public global-shutdown operation: the
+    # long-running production router supervises children forever. This bounded
+    # executable owns the manager, so reap the real dashboard processes it
+    # launched before removing readiness and exiting.
+    with manager._lock:
+        children = list(manager._children.values())
     for child in children:
-        child.terminate()
+        proc = child.proc
+        if proc is not None and proc.poll() is None:
+            proc.terminate()
+    shutdown_deadline = time.monotonic() + 4
+    for child in children:
+        proc = child.proc
+        if proc is None:
+            continue
+        try:
+            proc.wait(timeout=max(0.05, shutdown_deadline - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            pass
+    for child in children:
+        proc = child.proc
+        if proc is not None and proc.poll() is None:
+            proc.kill()
+    for child in children:
+        proc = child.proc
+        if proc is not None:
+            try:
+                proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                pass
+    inference.stop()
     try:
         args.ready_file.unlink()
     except FileNotFoundError:

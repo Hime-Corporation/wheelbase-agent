@@ -6,6 +6,7 @@ import hashlib
 import hmac
 import json
 import os
+import sqlite3
 import stat
 import subprocess
 import sys
@@ -27,7 +28,7 @@ def _envelope(key: bytes, *, user: str, tenant: str, client: str, device: str = 
         "kind": "agent_gateway_identity",
         "ver": 2,
         "iat": now,
-        "exp": now + 20,
+        "exp": now + 30,
         "nonce": str(uuid.uuid4()),
         "bundle": {
             "user_id": user,
@@ -52,19 +53,51 @@ def _envelope(key: bytes, *, user: str, tenant: str, client: str, device: str = 
     return f"{signing}.{_b64url(hmac.new(key, signing.encode(), hashlib.sha256).digest())}"
 
 
-async def _rpc_flow(base_url: str, router_token: str, key: bytes) -> None:
+def _relay_status(*, client: str, device_id: str = "", available: bool = True) -> dict:
+    if client == "mobile":
+        return {
+            "version": 2,
+            "client": "mobile",
+            "cdp_relay_challenge": "not_applicable",
+            "shell_relay_challenge": "not_applicable",
+        }
+    challenge = "passed" if available else "failed"
+    return {
+        "version": 2,
+        "client": "desktop",
+        "device_id": device_id,
+        "cdp_relay_challenge": challenge,
+        "shell_relay_challenge": challenge,
+    }
+
+
+async def _rpc_flow(
+    base_url: str,
+    router_token: str,
+    key: bytes,
+    hermes_home: Path,
+) -> None:
     import websockets
 
     device_a = str(uuid.uuid4())
-    envelopes = {
-        "a": _envelope(key, user="user-a", tenant="tenant-a", client="desktop", device=device_a),
-        "mobile": _envelope(key, user="user-a", tenant="tenant-a", client="mobile"),
-        "b": _envelope(key, user="user-b", tenant="tenant-a", client="desktop", device=str(uuid.uuid4())),
-    }
+    device_b = str(uuid.uuid4())
     ws_url = base_url.replace("http://", "ws://") + f"/api/ws?token={router_token}"
+    async def connect(*, user: str, client: str, device: str = ""):
+        # Mint immediately before each potentially slow production-child boot;
+        # signed envelopes intentionally have a bounded 30-second lifetime.
+        envelope = _envelope(
+            key, user=user, tenant="tenant-a", client=client, device=device
+        )
+        return await websockets.connect(
+            ws_url,
+            additional_headers={"X-Wheelbase-Identity-Envelope": envelope},
+            open_timeout=60,
+        )
+
     sockets = {
-        name: await websockets.connect(ws_url, additional_headers={"X-Wheelbase-Identity-Envelope": envelope})
-        for name, envelope in envelopes.items()
+        "a": await connect(user="user-a", client="desktop", device=device_a),
+        "mobile": await connect(user="user-a", client="mobile"),
+        "b": await connect(user="user-b", client="desktop", device=device_b),
     }
     next_id = 0
 
@@ -81,24 +114,106 @@ async def _rpc_flow(base_url: str, router_token: str, key: bytes) -> None:
             events.append(frame)
 
     try:
-        probe_a, _ = await request("a", "wheelbase.runtime.probe")
-        probe_mobile, _ = await request("mobile", "wheelbase.runtime.probe")
-        probe_b, _ = await request("b", "wheelbase.runtime.probe")
-        assert probe_a["result"]["desktop_probe"]["error_code"] == "desktop_available"
-        assert probe_mobile["result"]["desktop_probe"]["error_code"] == "desktop_identity_required"
+        probe_a, _ = await request(
+            "a",
+            "wheelbase.runtime.probe",
+            {"relay_status_v2": _relay_status(client="desktop", device_id=device_a)},
+        )
+        probe_mobile, _ = await request(
+            "mobile",
+            "wheelbase.runtime.probe",
+            {"relay_status_v2": _relay_status(client="mobile")},
+        )
+        probe_b, _ = await request(
+            "b",
+            "wheelbase.runtime.probe",
+            {
+                "relay_status_v2": _relay_status(
+                    client="desktop",
+                    device_id=device_b,
+                )
+            },
+        )
+        assert probe_a["result"]["version"] == 2
+        assert probe_a["result"]["relay_challenge"] == {
+            "client": "desktop",
+            "scope_match": True,
+            "cdp_relay_challenge": "passed",
+            "shell_relay_challenge": "passed",
+        }
+        assert probe_a["result"]["desktop_policies"] == {
+            surface: {
+                "attempted": False,
+                "error_code": "challenge_passed",
+                "fallback_invocations": 0,
+            }
+            for surface in ("cdp", "shell")
+        }
+        assert probe_mobile["result"]["desktop_policies"] == {
+            surface: {
+                "attempted": False,
+                "error_code": "desktop_identity_required",
+                "fallback_invocations": 0,
+            }
+            for surface in ("cdp", "shell")
+        }
         assert probe_a["result"]["instance_fingerprint"] == probe_mobile["result"]["instance_fingerprint"]
         assert probe_a["result"]["instance_fingerprint"] != probe_b["result"]["instance_fingerprint"]
 
         created, _ = await request("a", "session.create")
         session_id = created["result"]["session_id"]
-        submitted, events = await request("a", "prompt.submit", {"session_id": session_id, "text": "hello"})
-        assert submitted["result"]["ok"] is True
+        submitted, events = await request(
+            "a",
+            "prompt.submit",
+            {"session_id": session_id, "text": "production persistence check"},
+        )
+        assert submitted["result"]["status"] == "streaming"
         event_types = {frame.get("params", {}).get("type") for frame in events}
-        while not {"message.complete", "session.title"} <= event_types:
+        generated_title = next(
+            (
+                str(frame.get("params", {}).get("payload", {}).get("title") or "")
+                for frame in events
+                if frame.get("params", {}).get("type") == "session.title"
+            ),
+            "",
+        )
+        while "message.complete" not in event_types:
             frame = json.loads(await asyncio.wait_for(sockets["a"].recv(), 5))
             event_types.add(frame.get("params", {}).get("type"))
+            if frame.get("params", {}).get("type") == "session.title":
+                generated_title = str(
+                    frame.get("params", {}).get("payload", {}).get("title") or ""
+                )
+        while not generated_title:
+            frame = json.loads(await asyncio.wait_for(sockets["a"].recv(), 10))
+            if frame.get("params", {}).get("type") == "session.title":
+                generated_title = str(
+                    frame.get("params", {}).get("payload", {}).get("title") or ""
+                )
+        assert 3 <= len(generated_title.split()) <= 7
+
+        profile_dir = hermes_home / "tenants" / "tenant-a" / "profiles" / "wb-user-a"
+        state_db = profile_dir / "state.db"
+        assert state_db.is_file()
+        with sqlite3.connect(state_db) as db:
+            row = db.execute(
+                "SELECT user_id, title FROM sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+        assert row == ("user-a", generated_title)
+
         resumed, _ = await request("mobile", "session.resume", {"session_id": session_id})
         assert resumed["result"]["session_id"] == session_id
+        history, _ = await request(
+            "mobile", "session.history", {"session_id": session_id}
+        )
+        assert history["result"]["count"] >= 2
+        roles = [message["role"] for message in history["result"]["messages"]]
+        assert "user" in roles and "assistant" in roles
+        read_title, _ = await request(
+            "mobile", "session.title", {"session_id": session_id}
+        )
+        assert read_title["result"]["title"] == generated_title
         foreign, _ = await request("b", "session.resume", {"session_id": session_id})
         assert foreign["error"]["code"] == 4007
         override, _ = await request("a", "session.list", {"profile": "../../forbidden"})
@@ -114,12 +229,25 @@ async def _rpc_flow(base_url: str, router_token: str, key: bytes) -> None:
             relay=False,
         )
         await sockets["a"].send(json.dumps({"method": "identity.update", "params": {"identity_envelope": update}}))
-        unavailable, _ = await request("a", "wheelbase.runtime.probe")
-        assert unavailable["result"]["desktop_probe"] == {
-            "attempted": True,
-            "error_code": "desktop_unavailable",
-            "fallback_invocations": 0,
+        unavailable, _ = await request(
+            "a",
+            "wheelbase.runtime.probe",
+            {
+                "relay_status_v2": _relay_status(
+                    client="desktop", device_id=device_a, available=False
+                )
+            },
+        )
+        assert unavailable["result"]["desktop_policies"] == {
+            surface: {
+                "attempted": True,
+                "error_code": "desktop_unavailable",
+                "fallback_invocations": 0,
+            }
+            for surface in ("cdp", "shell")
         }
+        closed, _ = await request("a", "session.close", {"session_id": session_id})
+        assert closed["result"]["closed"] is True
         deleted, _ = await request("a", "session.delete", {"session_id": session_id})
         assert deleted["result"]["deleted"] == session_id
     finally:
@@ -172,7 +300,7 @@ def test_executable_gateway_fixture_contract(tmp_path):
         assert set(ready) == {"version", "base_url"}
         assert ready["version"] == 1
         assert ready["base_url"].startswith("http://127.0.0.1:")
-        asyncio.run(_rpc_flow(ready["base_url"], router_token, key))
+        asyncio.run(_rpc_flow(ready["base_url"], router_token, key, hermes_home))
     finally:
         process.terminate()
         assert process.wait(timeout=10) == 0
