@@ -7616,13 +7616,14 @@ def _enqueue_prompt(
     sent it even if the session transport is rebound meanwhile.
     """
     image_paths = list(image_paths or [])
+    queued = {"text": text, "transport": transport}
     # wheelbase fork: pin the submitting identity alongside the transport so a
-    # drained turn is attributed to the user who queued it.
-    queued = {
-        "text": text,
-        "transport": transport,
-        "wheelbase_identity": getattr(transport, "wheelbase_identity", None),
-    }
+    # drained turn is attributed to the user who queued it. Set only when the
+    # transport actually carries one, so an unidentified (single-user/local)
+    # envelope stays byte-identical to upstream's.
+    _identity = getattr(transport, "wheelbase_identity", None)
+    if _identity is not None:
+        queued["wheelbase_identity"] = _identity
     if image_paths:
         queued["image_paths"] = image_paths
     existing = session.get("queued_prompt")

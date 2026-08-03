@@ -290,7 +290,7 @@ def test_queued_prompt_carries_requesting_device_identity(monkeypatch):
     }
     observed = {}
 
-    def run_queued(_rid, _sid, queued_session, text):
+    def run_queued(_rid, _sid, queued_session, text, **_kwargs):
         observed["identity"] = queued_session["wheelbase_identity"]
         observed["text"] = text
 

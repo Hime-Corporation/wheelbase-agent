@@ -77,7 +77,8 @@ def test_expired_cloud_session_is_replaced_without_reusing_dead_cdp(monkeypatch)
         "expires_at": "2999-01-01T00:05:00Z",
     }
     monkeypatch.setattr(browser_tool, "_get_cloud_provider", lambda: provider)
-    monkeypatch.setattr(browser_tool, "_get_cdp_override", lambda: "")
+    # wheelbase fork: _get_cdp_override takes a task_id (upstream's is zero-arg).
+    monkeypatch.setattr(browser_tool, "_get_cdp_override", lambda *_a, **_kw: "")
     monkeypatch.setattr(browser_tool, "_stop_cdp_supervisor", Mock())
     monkeypatch.setattr(browser_tool, "_maybe_stop_recording", Mock())
     monkeypatch.setattr(browser_tool, "_run_browser_command", Mock())

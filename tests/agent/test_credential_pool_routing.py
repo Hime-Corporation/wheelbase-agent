@@ -371,6 +371,17 @@ class TestFailureAttribution:
 
     def _make_pool(self, tmp_path, monkeypatch, entries):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+        # Sandboxing HERMES_HOME alone is not hermetic: load_pool seeds itself
+        # from externally-discovered singletons, which read the real
+        # ~/.claude/.credentials.json. On a developer machine that has one, the
+        # pool silently grows a second entry and defeats the single-entry
+        # rotation guard under test. Block discovery outright.
+        monkeypatch.setattr(
+            "agent.anthropic_adapter.read_claude_code_credentials", lambda: None
+        )
+        monkeypatch.setattr(
+            "agent.anthropic_adapter.read_hermes_oauth_credentials", lambda: None
+        )
         hermes_home = tmp_path / "hermes"
         hermes_home.mkdir(parents=True, exist_ok=True)
         (hermes_home / "auth.json").write_text(
