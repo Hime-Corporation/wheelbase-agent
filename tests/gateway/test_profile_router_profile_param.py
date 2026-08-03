@@ -223,7 +223,18 @@ def test_other_params_survive_profile_stripping(router_client):
     assert "foo=bar" in forwarded_path
 
 
-def test_unsigned_identity_headers_are_rejected_before_profile_routing(router_client):
+def test_trusted_identity_headers_are_accepted_on_the_rest_path(router_client):
+    """wheelbase fork: the REST path accepts the backend's trusted headers.
+
+    Upstream rejects unsigned identity headers everywhere. We cannot: this path
+    is server-to-server — the Go backend proxies /v1/agent/platform/* and is
+    already authenticated by the shared X-Hermes-Session-Token asserted below.
+    It has no agent session there, so it cannot mint an envelope without forging
+    session_jti_hash / credential_revision / client / device_id, which is the
+    one thing an envelope exists to prevent. See the divergence note above
+    ``_trusted_rest_identity`` in profile_router.py. The WebSocket path, which
+    clients reach directly, still requires a real envelope — covered below.
+    """
     client, stub, _ = router_client
     response = client.get(
         "/api/cron/list?limit=5",
@@ -233,6 +244,40 @@ def test_unsigned_identity_headers_are_rejected_before_profile_routing(router_cl
             "X-Wheelbase-Tenant-Id": "tenant-1111",
         },
     )
+    # The recording stub answers 201; what matters is that the router did not
+    # reject the request and forwarded it, so assert on reaching the child.
+    assert response.status_code != 403
+    assert stub.requests, "request should have reached the child"
+
+
+def test_rest_path_still_rejects_unexpected_wheelbase_headers(router_client):
+    """The relaxation is limited to user/tenant/dealership — nothing else.
+
+    A caller must not be able to smuggle in a shell-relay or CDP URL on the
+    unsigned path; those carry real capability and only ever arrive inside a
+    verified envelope.
+    """
+    client, stub, _ = router_client
+    response = client.get(
+        "/api/cron/list?limit=5",
+        headers={
+            "X-Hermes-Session-Token": "router-secret",
+            "X-Wheelbase-User-Id": "user-aaaa",
+            "X-Wheelbase-Tenant-Id": "tenant-1111",
+            "X-Wheelbase-Shell-Relay-Url": "wss://attacker/relay",
+        },
+    )
     assert response.status_code == 403
-    assert response.json() == {"error": "invalid identity envelope"}
+    assert not stub.requests
+
+
+def test_rest_path_rejects_missing_identity(router_client):
+    """No envelope and no trusted headers is still a 403, not an anonymous pass."""
+    client, stub, _ = router_client
+    response = client.get(
+        "/api/cron/list?limit=5",
+        headers={"X-Hermes-Session-Token": "router-secret"},
+    )
+    assert response.status_code == 403
+    assert response.json() == {"error": "identity required"}
     assert not stub.requests

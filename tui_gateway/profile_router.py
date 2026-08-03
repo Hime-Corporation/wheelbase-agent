@@ -28,7 +28,11 @@ from starlette.websockets import WebSocketDisconnect
 
 from tui_gateway.fixture_trace import emit_fixture_trace
 from tui_gateway.wheelbase_identity import (
+    HEADER_DEALERSHIP,
     HEADER_ENVELOPE,
+    HEADER_TENANT,
+    HEADER_USER,
+    WheelbaseIdentity,
     identity_from_headers,
     is_valid_user_id,
     load_identity_envelope_keys,
@@ -494,6 +498,76 @@ def _identity_headers(headers: Any) -> list[tuple[str, str]]:
     return envelopes
 
 
+# ── wheelbase fork divergence ────────────────────────────────────────────────
+# Upstream demands a signed identity envelope on every request. That works for
+# the WebSocket path, which clients reach directly and where the Go backend has
+# a real agent session to sign from.
+#
+# It cannot work on the REST path. `/v1/agent/platform/*` is server-to-server:
+# the Go backend proxies it and is already authenticated here by the shared
+# `X-Hermes-Session-Token` that `rest_proxy` checks before anything else. It has
+# no agent session on that path, and an envelope bundle requires
+# `session_jti_hash`, `credential_revision`, `client` and `device_id`, which only
+# exist for one. Minting a plausible-looking envelope there would mean forging
+# the very fields the envelope exists to attest.
+#
+# So on the REST path only, an envelope stays authoritative when present, and we
+# otherwise fall back to the trusted `X-Wheelbase-User-Id` / `-Tenant-Id` headers
+# the backend has always sent. That is the same trust boundary this path ran on
+# before the envelope work landed. The WebSocket path below is untouched and
+# still requires a real envelope.
+_REST_TRUSTED_HEADERS = frozenset({HEADER_USER, HEADER_TENANT, HEADER_DEALERSHIP})
+
+
+def _trusted_rest_identity(headers: Any) -> Optional[WheelbaseIdentity]:
+    """Identity for the backend-proxied REST path. Envelope wins if present."""
+    lowered = {str(k).lower() for k, _v in headers.items()}
+    if HEADER_ENVELOPE in lowered:
+        return identity_from_headers(headers)
+    # Only the trusted trio may ride unsigned. Anything else in the
+    # x-wheelbase-* namespace carries real capability (shell relay, CDP URL,
+    # raw JWT) and must arrive inside a verified envelope or not at all.
+    unexpected = sorted(n for n in lowered if n.startswith("x-wheelbase-") and n not in _REST_TRUSTED_HEADERS)
+    if unexpected:
+        raise ValueError(f"independent Wheelbase identity headers are forbidden: {unexpected[0]}")
+    user_id = _one_rest_header(headers, HEADER_USER)
+    tenant_id = _one_rest_header(headers, HEADER_TENANT)
+    if not is_valid_user_id(user_id) or not is_valid_tenant_id(tenant_id):
+        return None
+    dealership_id = _one_rest_header(headers, HEADER_DEALERSHIP)
+    if dealership_id and not is_valid_tenant_id(dealership_id):
+        raise ValueError("invalid dealership identifier")
+    return WheelbaseIdentity(
+        user_id=user_id,
+        tenant_id=tenant_id,
+        dealership_id=dealership_id,
+        credential_source="backend_proxy",
+    )
+
+
+def _one_rest_header(headers: Any, name: str) -> str:
+    values = [value for key, value in headers.items() if str(key).lower() == name]
+    if len(values) > 1:
+        raise ValueError(f"duplicate {name}")
+    return str(values[0]).strip() if values else ""
+
+
+def _rest_identity_headers(headers: Any) -> list[tuple[str, str]]:
+    """Forward identity to the child: the envelope, or the trusted trio."""
+    wheelbase = [(key, value) for key, value in headers.items() if key.lower().startswith("x-wheelbase-")]
+    envelopes = [(key, value) for key, value in wheelbase if key.lower() == HEADER_ENVELOPE]
+    if envelopes:
+        if len(wheelbase) != len(envelopes):
+            raise ValueError("independent Wheelbase identity headers are forbidden")
+        if len(envelopes) != 1:
+            raise ValueError("exactly one identity envelope is required")
+        return [("X-Wheelbase-Identity-Envelope", envelopes[0][1])]
+    unexpected = [key for key, _v in wheelbase if key.lower() not in _REST_TRUSTED_HEADERS]
+    if unexpected:
+        raise ValueError("independent Wheelbase identity headers are forbidden")
+    return [(key, value) for key, value in wheelbase]
+
+
 def _rest_proxy_headers(headers: Any, child_token: str) -> dict[str, str]:
     forwarded: dict[str, str] = {}
     for key, value in headers.items():
@@ -501,7 +575,7 @@ def _rest_proxy_headers(headers: Any, child_token: str) -> dict[str, str]:
         if lower in _HOP_REQUEST_HEADERS or lower.startswith("x-wheelbase-"):
             continue
         forwarded[key] = value
-    for key, value in _identity_headers(headers):
+    for key, value in _rest_identity_headers(headers):
         forwarded[key] = value
     forwarded["X-Hermes-Session-Token"] = child_token
     return forwarded
@@ -554,11 +628,11 @@ def build_app(manager: ChildManager) -> FastAPI:
         if not _token_ok(request.headers.get("X-Hermes-Session-Token", "")):
             return JSONResponse({"error": "unauthorized"}, status_code=403)
         try:
-            identity = identity_from_headers(request.headers)
+            identity = _trusted_rest_identity(request.headers)
         except ValueError:
             return JSONResponse({"error": "invalid identity envelope"}, status_code=403)
         if identity is None:
-            return JSONResponse({"error": "identity envelope required"}, status_code=403)
+            return JSONResponse({"error": "identity required"}, status_code=403)
         user_id, tenant_id = identity.user_id, identity.tenant_id
 
         try:
@@ -574,7 +648,13 @@ def build_app(manager: ChildManager) -> FastAPI:
             logger.exception("failed to ensure child for REST user=%s", user_id)
             return JSONResponse({"error": "child unavailable"}, status_code=502)
 
-        headers = _rest_proxy_headers(request.headers, child.token)
+        try:
+            headers = _rest_proxy_headers(request.headers, child.token)
+        except ValueError:
+            # Defence in depth: _trusted_rest_identity already rejected these
+            # above, so reaching here means the two guards disagree. Fail the
+            # request rather than forwarding anything unvetted to the child.
+            return JSONResponse({"error": "invalid identity headers"}, status_code=403)
         url = f"http://127.0.0.1:{child.port}/api/{path}"
         body = await request.body()
         import httpx
