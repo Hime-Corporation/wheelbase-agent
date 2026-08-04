@@ -64,6 +64,67 @@ def _pending_reaction_notes(session: dict) -> str:
     return "\n".join(notes)
 
 
+# ── prompt.submit idempotency ─────────────────────────────────────────────
+#
+# The wire protocol has no dedup token of its own: the JSON-RPC envelope ``id``
+# is a per-process correlation counter this handler never reads, and upstream's
+# desktop sends only session_id/text/interrupted/queued/truncate_*. So a client
+# that re-issues a submit — a queue-drain effect firing on a stale entry, or a
+# bounded auto-drain retry after a lost ACK — used to get a second REAL turn
+# stored against the session, which the model then answered as a follow-up
+# ("Hello again!"). Clients that supply ``idempotency_key`` (wheelbase-app sends
+# the composer queue item's id, so a re-send of the same item repeats the key
+# while a newly typed message gets a fresh one) get the original acknowledgement
+# replayed instead.
+#
+# Only ACCEPTED submits are remembered, so a retry after a failed submit still
+# runs. The record lives on the session dict and dies with it; the TTL and cap
+# keep a long-lived session's ledger bounded.
+_PROMPT_IDEMPOTENCY_TTL_SECS = 15 * 60
+_PROMPT_IDEMPOTENCY_MAX_KEYS = 64
+
+
+def _prompt_idempotency_replay(session: dict, key: str) -> dict | None:
+    """The result payload already acknowledged for ``key``, or None."""
+    if not key:
+        return None
+    now = time.time()
+    with session["history_lock"]:
+        seen = session.get("_prompt_idempotency")
+        if not isinstance(seen, dict):
+            return None
+        for stale in [
+            k
+            for k, entry in seen.items()
+            if now - float((entry or {}).get("at") or 0) > _PROMPT_IDEMPOTENCY_TTL_SECS
+        ]:
+            seen.pop(stale, None)
+        entry = seen.get(key)
+        if not isinstance(entry, dict):
+            return None
+        return dict(entry.get("result") or {})
+
+
+def _remember_prompt_idempotency(session: dict, key: str, response: dict | None) -> None:
+    """Record the ACK a submit returned so an identical re-send replays it."""
+    if not key or not isinstance(response, dict):
+        return
+    result = response.get("result")
+    if not isinstance(result, dict):
+        # Errors are never recorded: a client retrying a failed submit must be
+        # able to actually run the turn.
+        return
+    with session["history_lock"]:
+        seen = session.get("_prompt_idempotency")
+        if not isinstance(seen, dict):
+            seen = {}
+            session["_prompt_idempotency"] = seen
+        seen.pop(key, None)  # re-insert so the cap evicts oldest-first
+        seen[key] = {"at": time.time(), "result": dict(result)}
+        while len(seen) > _PROMPT_IDEMPOTENCY_MAX_KEYS:
+            seen.pop(next(iter(seen)))
+
+
 @method("prompt.submit")
 def _(rid, params: dict) -> dict:
     from hermes_cli.input_sanitize import sanitize_user_prompt_text
@@ -113,6 +174,20 @@ def _(rid, params: dict) -> dict:
         return err
     if (limit_message := _ensure_active_session_slot(sid, session)) is not None:
         return _err(rid, 4090, limit_message)
+    # Duplicate-submission guard — see _prompt_idempotency_replay above. Placed
+    # before anything mutates session state so a replay is a pure read.
+    idempotency_key = str(params.get("idempotency_key") or "").strip()
+    if idempotency_key:
+        replayed = _prompt_idempotency_replay(session, idempotency_key)
+        if replayed is not None:
+            logger.info(
+                "prompt.submit: duplicate idempotency_key %s on session %s — "
+                "replaying the original acknowledgement instead of running a "
+                "second turn",
+                idempotency_key,
+                sid,
+            )
+            return _ok(rid, replayed)
     if truncate_user_ordinal is not None and isinstance(text, str):
         # A rewind/regenerate replays a turn from what the transcript shows. A
         # skill turn shows its invocation, so re-expand it here — otherwise
@@ -143,6 +218,7 @@ def _(rid, params: dict) -> dict:
             queued=bool(params.get("queued")),
         )
         if busy_response is not None:
+            _remember_prompt_idempotency(session, idempotency_key, busy_response)
             return busy_response
         # The old turn finished between the two lock acquisitions. Retry the
         # claim so this prompt starts normally instead of being stranded in a
@@ -256,6 +332,7 @@ def _(rid, params: dict) -> dict:
     if turn_isolation:
         isolated_response = _submit_prompt_to_compute_host(rid, sid, session, text)
         if not isolated_response.get("error"):
+            _remember_prompt_idempotency(session, idempotency_key, isolated_response)
             return isolated_response
         logger.warning(
             "compute-host dispatch failed for session %s; falling back inline: %s",
@@ -339,8 +416,13 @@ def _(rid, params: dict) -> dict:
     # Keep a handle so session.interrupt can tell a live turn from a stuck
     # `running` flag (a turn that died without clearing it) and recover the latter.
     session["_run_thread"] = run_thread
+    response = _ok(rid, {"status": "streaming"})
+    # Recorded before the thread starts: the turn is already accepted (running
+    # is set under history_lock above), so a duplicate that lands while the turn
+    # is still spinning up must replay this ACK rather than queue a second turn.
+    _remember_prompt_idempotency(session, idempotency_key, response)
     run_thread.start()
-    return _ok(rid, {"status": "streaming"})
+    return response
 
 
 @method("clipboard.paste")
@@ -1003,10 +1085,24 @@ def register(server) -> None:
     # Module-level helpers aren't @method handlers, so install() doesn't see
     # them — but server.py's run path calls this one (run_message enrichment,
     # beside the speech-interrupted note). Rebind and publish it the same way.
-    server._pending_reaction_notes = types.FunctionType(
-        _pending_reaction_notes.__code__,
-        vars(server),
-        _pending_reaction_notes.__name__,
-        _pending_reaction_notes.__defaults__,
-        _pending_reaction_notes.__closure__,
-    )
+    # The rebound helpers resolve these through server's globals, so publish
+    # them alongside (a rebind swaps __globals__ wholesale — nothing from this
+    # module's namespace comes with them).
+    server._PROMPT_IDEMPOTENCY_TTL_SECS = _PROMPT_IDEMPOTENCY_TTL_SECS
+    server._PROMPT_IDEMPOTENCY_MAX_KEYS = _PROMPT_IDEMPOTENCY_MAX_KEYS
+    for _helper in (
+        _pending_reaction_notes,
+        _prompt_idempotency_replay,
+        _remember_prompt_idempotency,
+    ):
+        setattr(
+            server,
+            _helper.__name__,
+            types.FunctionType(
+                _helper.__code__,
+                vars(server),
+                _helper.__name__,
+                _helper.__defaults__,
+                _helper.__closure__,
+            ),
+        )
