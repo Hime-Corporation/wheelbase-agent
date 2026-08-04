@@ -361,6 +361,23 @@ def setup_logging(
             log_filter=_ComponentFilter(COMPONENT_PREFIXES["gui"]),
         )
 
+    # --- stderr (WARNING+) — the only handler a container operator can see ---
+    #
+    # Every handler above writes to a rotating file inside HERMES_HOME. In a
+    # container that means `docker logs` shows NOTHING from Python logging: the
+    # records land on a volume nobody reads, and the only visible output is
+    # whatever uvicorn happens to print. During the 2026-08-03 exec-relay
+    # outage this made the single most useful diagnostic — the desktop-exec
+    # plugin's own warnings about the shell relay — completely unobtainable
+    # from production without shelling into the container and hunting for log
+    # files, and the per-user child dashboards (which is where that plugin
+    # actually runs) were dark the entire time.
+    #
+    # WARNING+ only, so this cannot flood a busy gateway with INFO chatter;
+    # HERMES_LOG_STDERR_LEVEL raises or lowers it, and setting it to "OFF"
+    # restores the old file-only behaviour.
+    _add_stderr_handler(root, RedactingFormatter(_LOG_FORMAT))
+
     if _logging_initialized and not force:
         return log_dir
 
@@ -757,6 +774,53 @@ def _add_rotating_handler(
     # Route through the async queue instead of ``logger.addHandler(handler)`` so
     # the rotation-lock wait never runs on the caller's (often event-loop) thread.
     _register_queued_handler(handler)
+
+
+_STDERR_HANDLER_ATTR = "_hermes_stderr_console"
+
+
+def _stderr_handler_level() -> Optional[int]:
+    """Resolve the stderr console level, or ``None`` to disable the handler."""
+    raw = (os.environ.get("HERMES_LOG_STDERR_LEVEL") or "").strip().upper()
+    if raw in ("OFF", "NONE", "DISABLED", "0", "FALSE"):
+        return None
+    if raw:
+        resolved = getattr(logging, raw, None)
+        if isinstance(resolved, int):
+            return resolved
+    return logging.WARNING
+
+
+def _add_stderr_handler(logger: logging.Logger, formatter: logging.Formatter) -> None:
+    """Attach one stderr ``StreamHandler`` so containerized runs are not silent.
+
+    Idempotent, and deliberately separate from the verbose-console handler
+    added by ``enable_verbose_console_logging()``: that one is DEBUG-level and
+    opt-in per run, whereas this one always carries WARNING+ so an operator
+    reading ``docker logs`` sees failures without any flag being set.
+    """
+    level = _stderr_handler_level()
+    if level is None:
+        return
+    for existing in logger.handlers:
+        if getattr(existing, _STDERR_HANDLER_ATTR, False):
+            return
+    # Do not double up with the verbose console handler, which is strictly
+    # more permissive and writes to the same stream.
+    for existing in logger.handlers:
+        if getattr(existing, "_hermes_verbose", False):
+            return
+
+    handler = logging.StreamHandler(_safe_stderr())
+    handler.setLevel(level)
+    handler.setFormatter(formatter)
+    setattr(handler, _STDERR_HANDLER_ATTR, True)
+    logger.addHandler(handler)
+    # The root level gates records before any handler sees them; make sure a
+    # WARNING can actually reach this handler even if the file handlers were
+    # configured at a higher threshold.
+    if logger.level == logging.NOTSET or logger.level > level:
+        logger.setLevel(level)
 
 
 def _read_logging_config():
