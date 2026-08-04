@@ -5169,43 +5169,6 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         return cleaned
 
-    def _is_compression_ancestor(
-        self, conn, *, ancestor_id: str, descendant_id: str
-    ) -> bool:
-        """Return True if *ancestor_id* is a compression predecessor of
-        *descendant_id* (walking parent links up the continuation chain).
-
-        The continuation edge is the canonical one shared with
-        :func:`_ephemeral_child_sql` / :meth:`set_session_archived`
-        (``_COMPRESSION_CHILD_SQL``): a parent → child edge counts only when the
-        parent ended with ``end_reason = 'compression'`` and the child started
-        at or after the parent's ``ended_at``, which distinguishes continuations
-        from delegate subagents / branch children that also carry a
-        ``parent_session_id``. Expressed as a single recursive CTE rather than a
-        per-hop Python walk so the edge definition lives in exactly one place.
-        """
-        if not ancestor_id or not descendant_id or ancestor_id == descendant_id:
-            return False
-        # Walk parent links up from the descendant, following only compression
-        # continuation edges, and check whether ancestor_id is reached.
-        edge = _COMPRESSION_CHILD_SQL.format(a="child")
-        row = conn.execute(
-            f"""
-            WITH RECURSIVE ancestors(id) AS (
-                SELECT ?
-                UNION
-                SELECT parent.id
-                FROM ancestors a
-                JOIN sessions child ON child.id = a.id
-                JOIN sessions parent ON parent.id = child.parent_session_id
-                WHERE {edge}
-            )
-            SELECT 1 FROM ancestors WHERE id = ? AND id != ? LIMIT 1
-            """,
-            (descendant_id, ancestor_id, descendant_id),
-        ).fetchone()
-        return row is not None
-
     def _set_session_title(
         self,
         session_id: str,
@@ -5224,37 +5187,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 if current is None or current["title"] is not None:
                     return 0
 
-            if title:
-                # Check uniqueness (allow the same session to keep its own title)
-                cursor = conn.execute(
-                    "SELECT id FROM sessions WHERE title = ? AND id != ?",
-                    (title, session_id),
-                )
-                conflict = cursor.fetchone()
-                if conflict:
-                    conflict_id = conflict["id"]
-                    # A compression continuation is the live, projected-forward
-                    # head of its conversation; its compressed predecessors are
-                    # ended and hidden from the session list (list_sessions_rich
-                    # projects roots → tip). When the title that "conflicts" is
-                    # held by such a hidden ancestor, the user has no way to free
-                    # it — renaming the visible tip back to the base name would
-                    # dead-end with "already in use by <session they can't see>".
-                    # Treat this as a transfer: move the title off the ancestor
-                    # onto the continuation. Uniqueness is preserved (still only
-                    # one session carries the exact title) and the parent-link
-                    # lineage is untouched.
-                    if self._is_compression_ancestor(
-                        conn, ancestor_id=conflict_id, descendant_id=session_id
-                    ):
-                        conn.execute(
-                            "UPDATE sessions SET title = NULL WHERE id = ?",
-                            (conflict_id,),
-                        )
-                    else:
-                        raise ValueError(
-                            f"Title '{title}' is already in use by session {conflict_id}"
-                        )
+            # No uniqueness check: titles are not unique (schema v26). They are
+            # LLM-generated from the first exchange, so two conversations about
+            # the same topic legitimately share one. Enforcing uniqueness here
+            # used to raise ValueError for the caller to de-collide (" #N"
+            # suffixes), and to silently steal the title off a compression
+            # ancestor to let the visible tip be renamed back to its base name;
+            # both mangled user-visible titles. Duplicates are now stored as-is.
             predicate = " AND title IS NULL" if only_if_empty else ""
             cursor = conn.execute(
                 f"UPDATE sessions SET title = ? WHERE id = ?{predicate}",
@@ -5269,8 +5208,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         """Set or update a session's title.
 
         Returns True if session was found and title was set.
-        Raises ValueError if title is already in use by another session,
-        or if the title fails validation (too long, invalid characters).
+        Raises ValueError if the title fails validation (too long, invalid
+        characters). Titles are NOT unique — another session may already carry
+        the same one (schema v26), which is normal for LLM-generated titles.
         Empty/whitespace-only strings are normalized to None (clearing the title).
         """
         return self._set_session_title(session_id, title, only_if_empty=False)
@@ -5279,8 +5219,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         """Set an auto-generated title only when the current title is NULL.
 
         The predicate and write run in one transaction so a concurrent manual
-        rename cannot be overwritten. Validation and uniqueness behavior match
-        :meth:`set_session_title`.
+        rename cannot be overwritten. Validation matches
+        :meth:`set_session_title` (titles are not unique).
         """
         return self._set_session_title(session_id, title, only_if_empty=True)
 
@@ -5396,14 +5336,21 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         return rowcount > 0
 
     def get_session_by_title(self, title: str) -> Optional[Dict[str, Any]]:
-        """Look up a session by exact title. Returns session dict or None."""
+        """Look up a session by exact title. Returns session dict or None.
+
+        Titles are not unique (schema v26), so this returns the MOST RECENTLY
+        STARTED match — the one a user naming a title almost always means.
+        Without an explicit order SQLite's choice among duplicates is an
+        implementation detail that can change between opens.
+        """
         with self._read_ctx() as conn:
             cursor = conn.execute(
                 "SELECT s.*, "
                 "COALESCE(sp.prompt, s.system_prompt) AS _system_prompt_resolved "
                 "FROM sessions s "
                 "LEFT JOIN system_prompts sp ON sp.hash = s.system_prompt_hash "
-                "WHERE s.title = ?",
+                "WHERE s.title = ? "
+                "ORDER BY s.started_at DESC, s.rowid DESC",
                 (title,),
             )
             row = cursor.fetchone()

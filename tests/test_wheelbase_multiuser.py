@@ -148,6 +148,119 @@ def test_resume_denies_foreign_and_legacy_rows(db, _bound, monkeypatch):
         assert resp["error"]["message"] == "session unavailable"
 
 
+def _make_compression_chain(db, *, root, tip, root_user, tip_user):
+    """root --(compression)--> tip, with a message on each side of the split."""
+    base = int(time.time()) - 10_000
+    db.create_session(root, source="tui", user_id=root_user)
+    db.append_message(root, role="user", content="pre-compression turn", timestamp=base + 10)
+    db.end_session(root, "compression")
+    db.create_session(tip, source="tui", user_id=tip_user, parent_session_id=root)
+    db.append_message(
+        tip, role="assistant", content="post-compression reply", timestamp=base + 110
+    )
+    conn = db._conn
+    conn.execute(
+        "UPDATE sessions SET started_at = ?, ended_at = ? WHERE id = ?",
+        (base, base + 50, root),
+    )
+    conn.execute("UPDATE sessions SET started_at = ? WHERE id = ?", (base + 100, tip))
+    # create_session() backfills a child's user_id from its parent, so stamp
+    # the requested owner (including a legacy NULL) explicitly.
+    conn.execute("UPDATE sessions SET user_id = ? WHERE id = ?", (tip_user, tip))
+    conn.commit()
+
+
+def _stub_resume_stack(monkeypatch, db):
+    """Neutralize agent construction so session.resume returns its payload."""
+    import types as _types
+
+    monkeypatch.setattr(server, "_sessions", {})
+    monkeypatch.setattr(server, "_get_db", lambda: db)
+    monkeypatch.setattr(server, "_enable_gateway_prompts", lambda: None)
+    monkeypatch.setattr(server, "_set_session_context", lambda target: [])
+    monkeypatch.setattr(server, "_clear_session_context", lambda tokens: None)
+    monkeypatch.setattr(
+        server,
+        "_make_agent",
+        lambda sid, key, session_id=None, session_db=None, **kwargs: _types.SimpleNamespace(
+            model="test", provider="test"
+        ),
+    )
+    monkeypatch.setattr(
+        server,
+        "_session_info",
+        lambda agent, *a: {"model": "test", "tools": {}, "skills": {}},
+    )
+    monkeypatch.setattr(
+        server, "_init_session", lambda sid, key, agent, history, cols=80, **_kw: None
+    )
+
+
+def test_resume_follows_compression_tip_owned_by_the_same_user(db, _bound, monkeypatch):
+    """Tip resolution is restored — within one owner's own lineage."""
+    _make_compression_chain(
+        db, root="root-a", tip="tip-a", root_user=IDENT_A.user_id, tip_user=IDENT_A.user_id
+    )
+    _stub_resume_stack(monkeypatch, db)
+    _bound(IDENT_A)
+
+    resp = server.handle_request(
+        {
+            "id": 1,
+            "method": "session.resume",
+            "params": {"session_id": "root-a", "eager_build": True},
+        }
+    )
+    assert resp["result"]["session_key"] == "tip-a"
+    texts = [m.get("text") for m in resp["result"]["messages"]]
+    assert "post-compression reply" in texts
+
+
+def test_resume_never_substitutes_a_tip_owned_by_another_user(db, _bound, monkeypatch):
+    """A continuation owned by someone else is ignored, not served.
+
+    Guards the scoping ed656ebf9 closed: restoring compression-tip resolution
+    must not let one user reach another user's row (nor a legacy NULL-owner
+    row) by resuming an id whose lineage crosses the ownership boundary.
+    """
+    _make_compression_chain(
+        db, root="root-x", tip="tip-x", root_user=IDENT_A.user_id, tip_user=IDENT_B.user_id
+    )
+    _make_compression_chain(
+        db, root="root-y", tip="tip-y", root_user=IDENT_A.user_id, tip_user=None
+    )
+    _stub_resume_stack(monkeypatch, db)
+    _bound(IDENT_A)
+
+    for root in ("root-x", "root-y"):
+        resp = server.handle_request(
+            {
+                "id": 1,
+                "method": "session.resume",
+                "params": {"session_id": root, "eager_build": True},
+            }
+        )
+        assert resp["result"]["session_key"] == root
+        texts = [m.get("text") for m in resp["result"]["messages"]]
+        assert "post-compression reply" not in texts
+        assert "pre-compression turn" in texts
+
+
+def test_resume_gates_the_requested_row_before_resolving_the_tip(db, _bound, monkeypatch):
+    """Owning the tip does not grant resume of a foreign parent id."""
+    _make_compression_chain(
+        db, root="root-b", tip="tip-b", root_user=IDENT_B.user_id, tip_user=IDENT_A.user_id
+    )
+    _stub_resume_stack(monkeypatch, db)
+    _bound(IDENT_A)
+
+    resp = server.handle_request(
+        {"id": 1, "method": "session.resume", "params": {"session_id": "root-b"}}
+    )
+    assert resp["error"]["code"] == 4007
+    assert resp["error"]["message"] == "session unavailable"
+
+
 def test_ensure_session_db_row_persists_user_id(db, monkeypatch):
     monkeypatch.setattr(server, "_get_db", lambda: db)
     monkeypatch.setattr(server, "_resolve_model", lambda: "test-model")

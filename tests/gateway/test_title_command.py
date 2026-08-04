@@ -59,8 +59,13 @@ class TestHandleTitleCommand:
 
 
     @pytest.mark.asyncio
-    async def test_title_conflict(self, tmp_path):
-        """Setting a title already used by another session returns error."""
+    async def test_title_already_used_by_another_session_is_accepted(self, tmp_path):
+        """Titles are not unique — reusing one succeeds instead of erroring.
+
+        Two conversations about the same topic legitimately carry the same
+        LLM-generated title; the old unique index turned that into a user-
+        facing "already in use" refusal (schema v26 removed it).
+        """
         from hermes_state import SessionDB
         db = SessionDB(db_path=tmp_path / "state.db")
         db.create_session("other_session", "telegram")
@@ -70,8 +75,10 @@ class TestHandleTitleCommand:
         runner = _make_runner(session_db=db)
         event = _make_event(text="/title Taken Title")
         result = await runner._handle_title_command(event)
-        assert "already in use" in result
-        assert "⚠️" in result
+        assert "⚠️" not in result
+        assert db.get_session_title("test_session_123") == "Taken Title"
+        # The other session keeps its own title — nothing is stolen or cleared.
+        assert db.get_session_title("other_session") == "Taken Title"
         db.close()
 
 

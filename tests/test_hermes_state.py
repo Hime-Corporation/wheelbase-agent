@@ -1268,55 +1268,145 @@ class TestSessionTitle:
 
 
 
-class TestSessionTitleIndexRepair:
+class TestSessionTitleUniqueIndexMigration:
+    """v26: drop the UNIQUE title index from a populated legacy store.
+
+    The constraint was wrong — LLM-generated titles are not naturally unique —
+    and every write path had to de-collide around it (" #N" suffixes, stealing
+    the title off a compression ancestor, or NULLing the older duplicate on
+    open). Migrating a real, populated database must remove the constraint
+    while touching no row data.
+    """
+
     @staticmethod
-    def _seed_legacy_database(tmp_path, *, duplicate_titles):
+    def _index_names(conn):
+        return {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'index' "
+                "AND tbl_name = 'sessions'"
+            ).fetchall()
+        }
+
+    @staticmethod
+    def _seed_v25_database(tmp_path, *, duplicate_titles=False):
+        """A populated store as it existed at v25: unique index, real rows."""
         db_path = tmp_path / "legacy_titles.db"
         session_db = SessionDB(db_path=db_path)
         session_db.create_session("older", "cli")
         session_db.append_message("older", role="user", content="keep older message")
+        session_db.set_session_title("older", "Dealership Assistance Inquiry")
         session_db.create_session("newer", "cli")
         session_db.append_message(
             "newer", role="assistant", content="keep newer message"
         )
+        session_db.set_session_title("newer", "Dealership Assistance Inquiry #2")
         session_db.create_session("unique", "cli")
         session_db.set_session_title("unique", "unique-title")
         session_db.close()
 
         with sqlite3.connect(db_path) as conn:
-            conn.execute("DROP INDEX idx_sessions_title_unique")
+            # Re-create the pre-v26 world: the unique index plus a v25 stamp.
+            conn.execute("DROP INDEX IF EXISTS idx_sessions_title")
             if duplicate_titles:
+                # An even older store, written before the index was enforced.
                 conn.execute(
-                    "UPDATE sessions SET title = 'shared-title' "
+                    "UPDATE sessions SET title = 'Dealership Assistance Inquiry' "
                     "WHERE id IN ('older', 'newer')"
                 )
+            else:
+                conn.execute(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_title_unique "
+                    "ON sessions(title) WHERE title IS NOT NULL"
+                )
+            conn.execute("UPDATE schema_version SET version = 25")
 
         return db_path
 
-    def test_duplicate_titles_are_repaired_without_deleting_sessions(self, tmp_path):
-        db_path = self._seed_legacy_database(tmp_path, duplicate_titles=True)
+    def test_migration_drops_unique_index_and_preserves_every_title(self, tmp_path):
+        db_path = self._seed_v25_database(tmp_path)
 
         reopened = SessionDB(db_path=db_path)
         try:
             conn = reopened._conn
             assert conn is not None
+            indexes = self._index_names(conn)
+            assert "idx_sessions_title_unique" not in indexes
+            assert "idx_sessions_title" in indexes
+            assert conn.execute(
+                "SELECT version FROM schema_version"
+            ).fetchone()[0] == SCHEMA_VERSION
+
             rows = {
-                row["id"]: row
-                for row in conn.execute(
-                    "SELECT id, title FROM sessions ORDER BY rowid"
-                ).fetchall()
+                row["id"]: row["title"]
+                for row in conn.execute("SELECT id, title FROM sessions").fetchall()
             }
-            assert set(rows) == {"older", "newer", "unique"}
-            assert rows["older"]["title"] is None
-            assert rows["newer"]["title"] == "shared-title"
-            assert rows["unique"]["title"] == "unique-title"
+            assert rows == {
+                "older": "Dealership Assistance Inquiry",
+                "newer": "Dealership Assistance Inquiry #2",
+                "unique": "unique-title",
+            }
             assert reopened.get_messages("older")[0]["content"] == "keep older message"
             assert reopened.get_messages("newer")[0]["content"] == "keep newer message"
-            index = conn.execute(
-                "SELECT sql FROM sqlite_master "
-                "WHERE type = 'index' AND name = 'idx_sessions_title_unique'"
-            ).fetchone()
-            assert index is not None
+
+            # The whole point: a duplicate title is now storable.
+            assert reopened.set_session_title(
+                "newer", "Dealership Assistance Inquiry"
+            ) is True
+            assert (
+                reopened.get_session_title("older") == "Dealership Assistance Inquiry"
+            )
+        finally:
+            reopened.close()
+
+    def test_migration_is_idempotent_across_reopens(self, tmp_path):
+        db_path = self._seed_v25_database(tmp_path)
+        for _ in range(3):
+            db = SessionDB(db_path=db_path)
+            try:
+                indexes = self._index_names(db._conn)
+                assert "idx_sessions_title_unique" not in indexes
+                assert "idx_sessions_title" in indexes
+                assert db.get_session_title("unique") == "unique-title"
+            finally:
+                db.close()
+
+    def test_pre_existing_duplicate_titles_are_no_longer_nulled(self, tmp_path):
+        """The old open-time "repair" cleared the older row's title. It's gone."""
+        db_path = self._seed_v25_database(tmp_path, duplicate_titles=True)
+
+        reopened = SessionDB(db_path=db_path)
+        try:
+            titles = {
+                row["id"]: row["title"]
+                for row in reopened._conn.execute(
+                    "SELECT id, title FROM sessions"
+                ).fetchall()
+            }
+            assert titles["older"] == "Dealership Assistance Inquiry"
+            assert titles["newer"] == "Dealership Assistance Inquiry"
+        finally:
+            reopened.close()
+
+    def test_unique_index_recreated_by_an_older_binary_is_dropped_again(self, tmp_path):
+        """A rolled-back deploy must not leave the constraint behind at v26."""
+        db_path = tmp_path / "resurrected.db"
+        db = SessionDB(db_path=db_path)
+        db.create_session("s1", "cli")
+        db.close()
+
+        with sqlite3.connect(db_path) as conn:
+            # Exactly what a pre-v26 binary does on open, with v26 still stamped.
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_title_unique "
+                "ON sessions(title) WHERE title IS NOT NULL"
+            )
+
+        reopened = SessionDB(db_path=db_path)
+        try:
+            assert "idx_sessions_title_unique" not in self._index_names(
+                reopened._conn
+            )
         finally:
             reopened.close()
 
@@ -1324,14 +1414,14 @@ class TestSessionTitleIndexRepair:
 
 
 class TestSessionTitleLineage:
-    """Renaming a compression continuation back to its base title must succeed
-    by transferring the title off the ended, hidden predecessor.
+    """Renaming a compression continuation back to its base title must succeed.
 
     After a context compaction the original session is ended and projected
     behind its live tip in the session list (list_sessions_rich), so the user
-    cannot see or free it. Without lineage-aware handling, renaming the visible
-    tip back to the base name dead-ends with "already in use by <session they
-    can't find>".
+    cannot see or free it. Under the old unique index this rename dead-ended
+    with "already in use by <session they can't find>" unless the title was
+    silently stolen off the hidden ancestor. Since v26 both rows simply keep
+    the title.
     """
 
     def _make_compression_chain(self, db, t0, *, root="root", tip="tip"):
@@ -1345,7 +1435,7 @@ class TestSessionTitleLineage:
         db._conn.execute("UPDATE sessions SET started_at=? WHERE id=?", (t0 + 200, tip))
         db._conn.commit()
 
-    def test_rename_continuation_back_to_base_transfers_title(self, db):
+    def test_rename_continuation_back_to_base_keeps_the_ancestor_intact(self, db):
         import time as _time
         self._make_compression_chain(db, _time.time() - 3600)
         db.set_session_title("root", "fingerprint-scanner")
@@ -1354,18 +1444,18 @@ class TestSessionTitleLineage:
         # User renames the visible tip back to the base name — must succeed.
         assert db.set_session_title("tip", "fingerprint-scanner") is True
         assert db.get_session("tip")["title"] == "fingerprint-scanner"
-        # Title transferred off the hidden ancestor — no duplicate titles.
-        assert db.get_session("root")["title"] is None
+        # The hidden ancestor is NOT rewritten to free the name any more.
+        assert db.get_session("root")["title"] == "fingerprint-scanner"
 
 
-    def test_unrelated_session_still_conflicts(self, db):
+    def test_unrelated_session_may_reuse_a_title(self, db):
         db.create_session("a", "cli")
         db.create_session("b", "cli")
         db.set_session_title("a", "shared")
-        with pytest.raises(ValueError, match="already in use"):
-            db.set_session_title("b", "shared")
-        # The unrelated holder keeps its title.
+        assert db.set_session_title("b", "shared") is True
+        # Both holders keep their title.
         assert db.get_session("a")["title"] == "shared"
+        assert db.get_session("b")["title"] == "shared"
 
 
 
@@ -1480,15 +1570,26 @@ class TestSchemaInit:
 
 
 class TestTitleUniqueness:
-    """Tests for unique title enforcement and title-based lookups."""
+    """Titles are NOT unique (schema v26); lookups stay deterministic."""
 
-    def test_duplicate_title_raises(self, db):
-        """Setting a title already used by another session raises ValueError."""
+    def test_duplicate_titles_are_allowed(self, db):
+        """Two sessions may carry the same title — both keep it."""
         db.create_session("s1", "cli")
         db.create_session("s2", "cli")
         db.set_session_title("s1", "my project")
-        with pytest.raises(ValueError, match="already in use"):
-            db.set_session_title("s2", "my project")
+        assert db.set_session_title("s2", "my project") is True
+        assert db.get_session("s1")["title"] == "my project"
+        assert db.get_session("s2")["title"] == "my project"
+
+    def test_lookup_by_duplicate_title_returns_the_most_recent(self, db):
+        db.create_session("s1", "cli")
+        db.create_session("s2", "cli")
+        db.set_session_title("s1", "my project")
+        db.set_session_title("s2", "my project")
+        db._conn.execute("UPDATE sessions SET started_at = ? WHERE id = ?", (100, "s1"))
+        db._conn.execute("UPDATE sessions SET started_at = ? WHERE id = ?", (200, "s2"))
+        db._conn.commit()
+        assert db.get_session_by_title("my project")["id"] == "s2"
 
 
     def test_null_titles_not_unique(self, db):

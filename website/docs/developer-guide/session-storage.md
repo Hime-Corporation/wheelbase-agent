@@ -79,7 +79,7 @@ CREATE TABLE IF NOT EXISTS sessions (
 CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
 CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at DESC);
-CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_title_unique
+CREATE INDEX IF NOT EXISTS idx_sessions_title
     ON sessions(title) WHERE title IS NOT NULL;
 ```
 
@@ -141,7 +141,7 @@ indexed columns — see `SCHEMA_SQL` in `hermes_state.py` for the exact SQL.
 
 ## Schema Version and Migrations
 
-Current schema version: **23**
+Current schema version: **26**
 
 The `schema_version` table stores a single integer. Simple column additions are handled declaratively by `_reconcile_columns()` (which diffs live columns against `SCHEMA_SQL` and ADDs any missing ones). The version-gated chain is reserved for data migrations and index/FTS changes that can't be expressed declaratively:
 
@@ -163,6 +163,8 @@ The `schema_version` table stores a single integer. Simple column additions are 
 | 20 | Per-model usage attribution — seed `session_model_usage` rows from historical per-session aggregate totals |
 | 22 | Task-dimension usage attribution — rebuild `session_model_usage` so the `task` column participates in the PRIMARY KEY |
 | 23 | FTS storage redesign — external-content FTS tables replacing the v11 inline-mode copies (opt-in transition for existing DBs) |
+| 25 | De-duplicate per-session system prompt snapshots into the shared content-addressed `system_prompts` table |
+| 26 | Drop the unique index on `title` (v4) — LLM-generated titles are not naturally unique; replaced by the plain lookup index `idx_sessions_title` |
 
 Versions not listed above were declarative column additions handled by `_reconcile_columns()` (version bump only, no data migration).
 

@@ -891,6 +891,28 @@ class SessionSchemaMixin:
                 # one large prompt copy per session.
                 self._dedupe_legacy_system_prompts(cursor)
 
+            if current_version < 26:
+                # v26: session titles are NOT unique. Titles are LLM-generated
+                # from the first exchange, so two conversations about the same
+                # topic legitimately produce the same string. The old UNIQUE
+                # index (idx_sessions_title_unique) turned that into a hard
+                # error on every title write path and forced the callers to
+                # de-collide — appending " #N", stealing the title off a
+                # compression ancestor, or (on open, when the index could not
+                # be rebuilt) NULLing the older row's title outright. Users saw
+                # mangled and vanished titles. Drop the constraint and keep a
+                # plain lookup index in its place.
+                #
+                # Idempotent and safe on a populated store: index-only DDL, no
+                # row rewrite, and no data is lost by relaxing a constraint.
+                # The DDL is repeated unconditionally below so a rolled-back
+                # binary that re-created the unique index cannot leave the
+                # failure mode in place on a DB already stamped v26.
+                try:
+                    cursor.execute("DROP INDEX IF EXISTS idx_sessions_title_unique")
+                except sqlite3.Error:
+                    logger.exception("Could not drop the unique session-title index")
+
             # The FTS storage layout is versioned independently of the main
             # schema (see the v23 note above). Stamp the current layout so the
             # main version can always advance: a fresh/optimized DB is at
@@ -932,41 +954,21 @@ class SessionSchemaMixin:
                     (SCHEMA_VERSION,),
                 )
 
-        # Unique title index — always ensure it exists. Older databases may
-        # contain duplicate aliases from before the constraint was enforced;
-        # preserve every session while letting the newest one retain the alias.
-        title_index_sql = (
-            "CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_title_unique "
-            "ON sessions(title) WHERE title IS NOT NULL"
-        )
+        # Session-title index (v26) — a plain, NON-unique lookup index, always
+        # ensured. Duplicate titles are legitimate (see the v26 note above), so
+        # the old UNIQUE index is dropped here as well as in the version-gated
+        # step: an older binary that reopened this DB would have re-created the
+        # unique index while schema_version still reads 26, and every title
+        # write would start failing again. Both statements are idempotent and
+        # index-only. Failure must never abort opening the database.
         try:
-            cursor.execute(title_index_sql)
-        except sqlite3.IntegrityError:
-            # The index is an optimization — its creation must never abort
-            # opening the database, so the repair itself is also guarded.
-            try:
-                cursor.execute(
-                    """UPDATE sessions AS older
-                       SET title = NULL
-                       WHERE title IS NOT NULL
-                         AND EXISTS (
-                             SELECT 1 FROM sessions AS newer
-                             WHERE newer.title = older.title
-                               AND newer.rowid > older.rowid
-                         )"""
-                )
-                logger.warning(
-                    "Cleared %d duplicate session title(s) while restoring the unique index",
-                    cursor.rowcount,
-                )
-                cursor.execute(title_index_sql)
-            except sqlite3.Error:
-                logger.exception(
-                    "Could not repair duplicate session titles; "
-                    "unique title index not created"
-                )
-        except sqlite3.OperationalError:
-            pass  # Index already exists
+            cursor.execute("DROP INDEX IF EXISTS idx_sessions_title_unique")
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_sessions_title "
+                "ON sessions(title) WHERE title IS NOT NULL"
+            )
+        except sqlite3.Error:
+            logger.exception("Could not reconcile the session-title index")
 
         if fts5_available:
             # FTS5 setup. Run the DDL even when the virtual table exists so

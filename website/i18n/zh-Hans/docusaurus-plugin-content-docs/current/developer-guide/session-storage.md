@@ -64,7 +64,7 @@ CREATE TABLE IF NOT EXISTS sessions (
 CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
 CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at DESC);
-CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_title_unique
+CREATE INDEX IF NOT EXISTS idx_sessions_title
     ON sessions(title) WHERE title IS NOT NULL;
 ```
 

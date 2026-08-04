@@ -192,11 +192,12 @@ def _persist_session_title(session_db, session_id, title):
     The write goes through ``set_auto_title_if_empty`` (predicate + write in
     one transaction) so a manual ``/title`` set while LLM generation was in
     flight is never overwritten — a plain ``set_session_title`` fallback keeps
-    older stores working. ``set_session_title`` raises ValueError when the
-    title would collide with another session (the unique-title index). Rather
-    than swallow it and leave the session untitled (#50537), append a #N
-    suffix via get_next_title_in_lineage() when the store supports lineage
-    dedup; otherwise re-raise so the caller can decide.
+    older stores working. Duplicate titles are legal since schema v26, so the
+    ValueError path below is only a safety net for a store that still enforces
+    uniqueness (a legacy/read-only DB where the v26 index drop could not be
+    applied): rather than swallow the error and leave the session untitled
+    (#50537), append a #N suffix via get_next_title_in_lineage() when the store
+    supports lineage dedup; otherwise re-raise so the caller can decide.
 
     Returns the title actually persisted, or None when a concurrent manual
     title won the race (nothing was written).

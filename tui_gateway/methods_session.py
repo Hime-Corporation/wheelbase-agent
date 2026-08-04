@@ -751,11 +751,52 @@ def _(rid, params: dict) -> dict:
     # Ownership gate (cloud gateway): an identified connection may only
     # resume rows it owns. Legacy rows (NULL user_id) are also denied to
     # identified users. Respond exactly like a missing session so other
-    # users' session ids are not enumerable. The requested durable row is
-    # always checked directly; public resume never substitutes a continuation.
+    # users' session ids are not enumerable. The REQUESTED durable row is
+    # always gated directly, before any lineage resolution — a caller can
+    # never reach a row it does not own by handing us an id whose
+    # continuation it happens to own.
     resume_ident = _transport_identity()
     if resume_ident is not None and (found.get("user_id") or "") != resume_ident.user_id:
         return _err(rid, 4007, "session unavailable")
+
+    # Follow the compression-continuation chain to the live tip so a resume on
+    # a rotated-out parent id binds to the descendant that actually holds the
+    # post-compression turns. Auto-compression ends the session and forks a
+    # continuation child; without this, resuming the original id (the id
+    # wheelbase-app persisted when the chat was created, which it keeps
+    # forever) reloads the parent transcript and every turn generated after
+    # compression is missing — the "I came back and the reply isn't there"
+    # bug. The REST transcript route (hermes_cli/web_routers/sessions.py
+    # ::get_session_messages) resolves the same way, so dropping it here also
+    # made the two surfaces disagree about what the same id contains.
+    # Resolving here re-anchors the fast path below too, so a still-live
+    # rotated session is reused (by its new key) instead of rebuilding a
+    # duplicate agent on the stale parent. Skipped for lazy watch windows,
+    # which intentionally attach to the exact child branch they were opened
+    # on.
+    #
+    # Scoping (this is what ed656ebf9 was protecting and it is preserved):
+    # the requested row is ownership-gated ABOVE, and the resolved tip must
+    # carry the SAME owner, so resolution can only ever move within one
+    # identity's own lineage. A tip owned by another user, or a legacy
+    # NULL-owner row, is ignored and the requested row is served as-is —
+    # resume never substitutes a continuation across an ownership boundary.
+    # (Rows carry user_id only; tenant separation is structural — an
+    # identified connection is served from that tenant/user's own profile
+    # state.db, so a foreign tenant's rows are not in this database at all.)
+    if found and not is_truthy_value(params.get("lazy", False)):
+        try:
+            tip = db.resolve_resume_session_id(target)
+        except Exception:
+            tip = target
+        if tip and tip != target:
+            tip_row = db.get_session(tip)
+            if tip_row is not None and (
+                resume_ident is None
+                or (tip_row.get("user_id") or "") == resume_ident.user_id
+            ):
+                target = tip
+                found = tip_row
 
     profile_resume_cwd = str(found.get("cwd") or "").strip() or _profile_configured_cwd(
         profile_home

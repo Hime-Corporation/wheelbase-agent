@@ -2722,8 +2722,18 @@ def test_lazy_child_watch_resume_serves_candidate_inclusive_display(monkeypatch,
     assert texts == ["child prompt", "child substantive answer", "child terse reply"]
 
 
-def test_session_resume_keeps_requested_compression_parent_exact(monkeypatch, tmp_path):
-    """Public resume never silently substitutes a continuation durable ID."""
+def test_session_resume_follows_compression_tip(monkeypatch, tmp_path):
+    """Resuming a rotated-out parent id must load the continuation's messages.
+
+    Regression for the desktop "I came back and the reply isn't there" report:
+    auto-compression ends the live session and forks a continuation child, so a
+    resume on the parent id (the durable id wheelbase-app persisted at create
+    time and keeps forever) reloads the pre-compression transcript and drops
+    every response generated after compression. session.resume must follow the
+    compression tip via resolve_resume_session_id — the same resolution the
+    REST transcript route performs, so both surfaces agree about what one id
+    contains.
+    """
     from hermes_state import SessionDB
 
     db = SessionDB(db_path=tmp_path / "state.db")
@@ -2776,12 +2786,14 @@ def test_session_resume_keeps_requested_compression_parent_exact(monkeypatch, tm
     finally:
         db.close()
 
-    assert resp["result"]["session_key"] == "parent_root"
-    assert resp["result"]["resumed"] == "parent_root"
-    assert captured["agent_session_id"] == "parent_root"
+    # The agent must bind to the continuation tip, and the returned transcript
+    # must include the post-compression reply (which lives only in the tip).
+    # ``resumed`` reports the row actually bound (pre-ed656ebf9 behavior).
+    assert resp["result"]["session_key"] == "cont_tip"
+    assert resp["result"]["resumed"] == "cont_tip"
+    assert captured["agent_session_id"] == "cont_tip"
     texts = [m.get("text") for m in resp["result"]["messages"]]
-    assert "pre-compression turn" in texts
-    assert "post-compression reply" not in texts
+    assert "post-compression reply" in texts
 
 
 def test_later_resume_does_not_steal_inflight_session_events(monkeypatch):
