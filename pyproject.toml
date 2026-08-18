@@ -430,6 +430,7 @@ py-modules = [
   "cli",
   "hermes_bootstrap",
   "hermes_constants",
+  "hermes_message_cursor",
   "hermes_state",
   "hermes_state_common",
   "hermes_state_portability",

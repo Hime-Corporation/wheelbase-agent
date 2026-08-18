@@ -10102,6 +10102,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         offset: int = 0,
         latest: bool = False,
         after_id: Optional[int] = None,
+        before_id: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
         """Load messages for a session in insertion order.
 
@@ -10133,11 +10134,44 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         ``after_id`` enables keyset pagination (``id > after_id``): O(1)
         page seeks on huge transcripts where OFFSET degrades to O(n) per
         page. Ascending order only (incompatible with ``latest``/``offset``).
+
+        ``before_id`` is the same keyset trick pointed the other way
+        (``id < before_id``): the page of history immediately OLDER than a
+        cursor, which is what a transcript UI asks for when the user scrolls
+        up. It selects DESC so the page is the NEWEST rows below the bound —
+        not the head of the transcript — then reverses, so the return value is
+        chronological ascending like every other read here. Exclusive: the
+        cursor row itself is never returned, so consecutive pages never
+        overlap. Incompatible with ``latest``/``offset`` (both would fight the
+        DESC anchor) and with ``after_id`` (the limit would have no unambiguous
+        end to anchor to). Unlike OFFSET paging, a concurrent append to the
+        tail cannot shift or skip rows in an older page: the bound is a row id,
+        not a position.
+
+        ``before_id`` IS supported alongside ``include_compacted`` (``after_id``
+        is not). Compacted rows are precisely what keeps older turns reachable
+        once the active window has been summarised away, so refusing the
+        combination would make the cursor useless on exactly the long sessions
+        it exists for. The dedupe below needs the full row set either way, so
+        the bound is applied in Python after deduping rather than in SQL.
+        One wrinkle is handled explicitly: ``archive_and_compact`` re-sequences
+        the concurrent-append tail onto fresh ids, so a cursor minted before a
+        compaction can name a row that has since been superseded by a clone
+        with a HIGHER id. Slicing naively on ``id < before_id`` would then skip
+        every message between the two, so the cursor id is first resolved
+        forward to its surviving representative and the slice runs against
+        that. A ``before_id`` that names no row in this session at all is not
+        an error — it is just an ordering bound (see ``hermes_message_cursor``
+        for why the HTTP layer refuses to turn it into an existence oracle).
         """
         if after_id is not None and (latest or offset):
             raise ValueError("after_id is incompatible with latest/offset paging")
         if after_id is not None and include_compacted:
             raise ValueError("after_id is incompatible with include_compacted (deduped display reads use offset paging)")
+        if before_id is not None and (latest or offset):
+            raise ValueError("before_id is incompatible with latest/offset paging")
+        if before_id is not None and after_id is not None:
+            raise ValueError("before_id is incompatible with after_id (a two-sided keyset range has no unambiguous limit anchor)")
         if include_inactive:
             # Audit / debug reads: every row, including soft-deleted.
             active_clause = ""
@@ -10148,14 +10182,25 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             active_clause = " AND (active = 1 OR compacted = 1)"
         else:
             active_clause = " AND active = 1"
-        keyset_clause = " AND id > ?" if after_id is not None else ""
+        if after_id is not None:
+            keyset_clause = " AND id > ?"
+        elif before_id is not None:
+            keyset_clause = " AND id < ?"
+        else:
+            keyset_clause = ""
+        # ``before_id`` wants the newest rows UNDER the bound, so it scans DESC
+        # and the page is flipped back to chronological order below — the same
+        # move ``latest`` makes, driven by a keyset bound instead of an OFFSET.
+        descending = bool(latest) or before_id is not None
         sql = (
             "SELECT * FROM messages WHERE session_id = ?"
-            f"{active_clause}{keyset_clause} ORDER BY id {'DESC' if latest else 'ASC'}"
+            f"{active_clause}{keyset_clause} ORDER BY id {'DESC' if descending else 'ASC'}"
         )
         params: list = [session_id]
         if after_id is not None:
             params.append(after_id)
+        elif before_id is not None:
+            params.append(before_id)
         if include_compacted:
             # Compaction epochs copy the protected tail into each new
             # generation, so the same logical message can exist as several
@@ -10173,6 +10218,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 )
                 all_rows = cursor.fetchall()
             seen: dict = {}
+            # Raw id -> dedupe key, so a ``before_id`` cursor pointing at a row
+            # that a later compaction superseded can be resolved forward to
+            # whichever row now represents that same logical message.
+            key_by_id: dict = {}
             for row in all_rows:
                 # Tool fields participate in the dedupe key: compaction copies
                 # them verbatim, so identical tool messages across generations
@@ -10186,17 +10235,38 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     row["tool_calls"],
                     row["tool_name"],
                 )
+                key_by_id[row["id"]] = key
                 cur = seen.get(key)
                 if cur is None or (row["active"], row["id"]) > (cur["active"], cur["id"]):
                     seen[key] = row
             rows = sorted(seen.values(), key=lambda r: r["id"])
-            if latest:
-                rows = rows[::-1]
-            rows = rows[offset:]
-            if limit is not None:
-                rows = rows[:limit]
-            if latest:
-                rows = rows[::-1]
+            if before_id is not None:
+                # Resolve the cursor forward before slicing. If the cursor row
+                # was archived and re-inserted with a fresh id by
+                # ``archive_and_compact``'s tail re-sequencing, the dedupe above
+                # elected the clone; anchoring on the ORIGINAL id would drop
+                # every logical message between the two on the floor. A cursor
+                # naming a row this session never had (or one hidden by the
+                # active filter) falls through to the literal bound, which is
+                # still monotonic and therefore still safe.
+                anchor = before_id
+                superseded_key = key_by_id.get(before_id)
+                if superseded_key is not None:
+                    anchor = seen[superseded_key]["id"]
+                rows = [row for row in rows if row["id"] < anchor]
+                if limit is not None:
+                    # Newest ``limit`` rows under the bound — the tail of the
+                    # ascending list, not its head. ``rows[-0:]`` is the whole
+                    # list, hence the explicit zero case.
+                    rows = rows[-limit:] if limit else []
+            else:
+                if latest:
+                    rows = rows[::-1]
+                rows = rows[offset:]
+                if limit is not None:
+                    rows = rows[:limit]
+                if latest:
+                    rows = rows[::-1]
         else:
             if limit is not None or offset:
                 # SQLite's OFFSET requires LIMIT; -1 means "no limit".
@@ -10205,7 +10275,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             with self._read_ctx() as conn:
                 cursor = conn.execute(sql, params)
                 rows = cursor.fetchall()
-            if latest:
+            if descending:
                 rows.reverse()
         result = []
         for row in rows:

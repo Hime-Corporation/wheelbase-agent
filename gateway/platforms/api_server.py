@@ -95,6 +95,12 @@ from gateway.platforms.base import (
 from agent.redact import redact_sensitive_text
 from agent.interrupt_compat import request_hard_interrupt
 from gateway.readiness import collect_runtime_readiness
+from hermes_message_cursor import (
+    MESSAGE_CURSOR_VERSION,
+    InvalidMessageCursor,
+    decode_message_cursor,
+    encode_message_cursor,
+)
 
 from agent.secret_scope import UnscopedSecretError as _UnscopedSecretError
 from agent.secret_scope import get_secret as _scoped_get_secret
@@ -3616,10 +3622,37 @@ class APIServerAdapter(BasePlatformAdapter):
         return web.json_response({"object": "hermes.session.deleted", "id": session_id, "deleted": bool(deleted)})
 
     async def _handle_session_messages(self, request: "web.Request") -> "web.Response":
-        """GET /api/sessions/{session_id}/messages."""
+        """GET /api/sessions/{session_id}/messages.
+
+        ``before`` is the opaque backward cursor (see
+        :mod:`hermes_message_cursor`): the page strictly OLDER than the cursor
+        row, exclusive, still chronological ascending, ignoring ``order`` and
+        forbidding ``offset``. The ``cursor_version`` / ``has_more`` /
+        ``next_cursor`` / ``oldest_message_id`` fields are additive — ``data``
+        and ``pagination`` are untouched for existing clients, and
+        ``cursor_version`` is what lets a client tell this build apart from one
+        that predates the cursor contract.
+        """
         auth_err = self._check_auth(request)
         if auth_err:
             return auth_err
+        # Decode the cursor BEFORE the session lookup: a malformed cursor has
+        # to answer 400 identically whether or not the session exists, or the
+        # error becomes an existence oracle.
+        before_id: Optional[int] = None
+        raw_before = request.query.get("before")
+        if raw_before is not None:
+            try:
+                before_id = decode_message_cursor(raw_before)
+            except InvalidMessageCursor as exc:
+                # ``invalid_cursor`` rather than the route's generic
+                # ``invalid_pagination``: the desktop client maps that exact
+                # spelling onto its typed cursor error instead of falling back
+                # on the bare 400. Same envelope, narrower code.
+                return web.json_response(
+                    _openai_error(str(exc), code="invalid_cursor"),
+                    status=400,
+                )
         session_id = request.match_info["session_id"]
         _, err = await self._get_existing_session_or_404(session_id)
         if err:
@@ -3629,6 +3662,9 @@ class APIServerAdapter(BasePlatformAdapter):
         raw_limit = request.query.get("limit")
         raw_offset = request.query.get("offset", "0")
         order = request.query.get("order")
+        include_compacted = str(
+            request.query.get("include_compacted", "")
+        ).strip().lower() in ("1", "true", "yes", "on")
         if order not in (None, "oldest", "latest"):
             return web.json_response(
                 _openai_error(
@@ -3651,17 +3687,47 @@ class APIServerAdapter(BasePlatformAdapter):
                 ),
                 status=400,
             )
+        if before_id is not None and offset:
+            return web.json_response(
+                _openai_error(
+                    "before cannot be combined with offset",
+                    code="invalid_pagination",
+                ),
+                status=400,
+            )
 
         default_page = requested_limit is None
         latest_page = order == "latest" or (order is None and default_page)
         limit = 500 if default_page else min(requested_limit, 500)
+        # A cursor read anchors on the cursor, not on ``order``; get_messages
+        # rejects ``latest`` and ``before_id`` together outright.
+        if before_id is not None:
+            latest_page = False
+        # Over-fetch one row on the newest-anchored paths so ``has_more`` costs
+        # nothing extra; the surplus row is always the oldest of the page, so
+        # dropping index 0 restores exactly the page the caller asked for.
+        overfetch = limit > 0 and (before_id is not None or latest_page)
         messages = await asyncio.to_thread(
             db.get_messages,
             resolved_id,
-            limit=limit,
+            limit=limit + 1 if overfetch else limit,
             offset=offset,
             latest=latest_page,
+            include_compacted=include_compacted,
+            before_id=before_id,
         )
+        if overfetch and len(messages) > limit:
+            older_exists = True
+            messages = messages[1:]
+        else:
+            # Ascending offset paging: older rows exist exactly when the caller
+            # skipped some.
+            older_exists = (not overfetch) and bool(messages) and offset > 0
+        oldest_id = messages[0].get("id") if messages else None
+        # Computed from one condition so ``has_more: true`` can never ship with
+        # a null ``next_cursor`` — the client treats that pair as a broken
+        # server and stops paging.
+        has_more = bool(older_exists) and oldest_id is not None
         return web.json_response({
             "object": "list",
             "session_id": resolved_id,
@@ -3669,9 +3735,13 @@ class APIServerAdapter(BasePlatformAdapter):
             "pagination": {
                 "limit": limit,
                 "offset": offset,
-                "order": order or ("latest" if default_page else "oldest"),
+                "order": order or ("latest" if (default_page or before_id is not None) else "oldest"),
                 "returned": len(messages),
             },
+            "cursor_version": MESSAGE_CURSOR_VERSION,
+            "has_more": has_more,
+            "next_cursor": encode_message_cursor(oldest_id) if has_more else None,
+            "oldest_message_id": str(oldest_id) if oldest_id is not None else None,
         })
 
     async def _handle_fork_session(self, request: "web.Request") -> "web.Response":

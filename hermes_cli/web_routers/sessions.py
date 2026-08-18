@@ -23,6 +23,12 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.responses import StreamingResponse
 
 from hermes_cli.web_deps import late
+from hermes_message_cursor import (
+    MESSAGE_CURSOR_VERSION,
+    InvalidMessageCursor,
+    decode_message_cursor,
+    encode_message_cursor,
+)
 from hermes_cli.web_models import (
     BulkDeleteSessions,
     SessionImport,
@@ -606,12 +612,43 @@ async def get_session_messages(
     offset: int = Query(0, ge=0),
     order: Optional[str] = Query(None),
     include_compacted: bool = Query(False),
+    before: Optional[str] = Query(None),
 ):
+    """Page a session's transcript, newest-first by default.
+
+    ``before`` is the opaque backward cursor (see
+    :mod:`hermes_message_cursor`). When present the response is the page of
+    history strictly OLDER than the cursor — exclusive, so consecutive pages
+    never overlap — still returned in chronological ascending order, and
+    ``order``/``offset`` no longer apply (the cursor is the anchor).
+
+    The four ``cursor_*``/``has_more``/``next_cursor``/``oldest_message_id``
+    fields are purely ADDITIVE. ``messages`` and ``pagination`` keep byte-for-
+    byte the shape they had before the cursor existed, because the dashboard
+    and the desktop's ``getHermesSessionMessages`` both still read them.
+    ``cursor_version`` is the capability marker a client probes for: its
+    absence means it is talking to a gateway that predates this contract.
+    """
     if order not in (None, "oldest", "latest"):
         raise HTTPException(
             status_code=400,
             detail="order must be one of: oldest, latest",
         )
+
+    # Decode BEFORE any session lookup. A malformed cursor must answer
+    # identically whether or not the session exists, or the 400/404 split
+    # becomes an existence oracle for anyone who can guess a session id.
+    before_id: Optional[int] = None
+    if before is not None:
+        try:
+            before_id = decode_message_cursor(before)
+        except InvalidMessageCursor as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        if offset:
+            raise HTTPException(
+                status_code=400,
+                detail="before cannot be combined with offset",
+            )
 
     def _read():
         db = _open_session_db_for_profile(profile, read_only=True)
@@ -628,29 +665,60 @@ async def get_session_messages(
             default_page = limit is None
             latest_page = order == "latest" or (order is None and default_page)
             _limit = 500 if default_page else min(limit, 500)
-            return sid, _limit, db.get_messages(
+            # A cursor read is always newest-anchored below the bound, so it
+            # supersedes ``order`` — and ``get_messages`` rejects the two
+            # together outright.
+            if before_id is not None:
+                latest_page = False
+            # Over-fetch exactly one row on the two newest-anchored paths so
+            # ``has_more`` is answered by the query that already ran instead of
+            # a second scan (which, under ``include_compacted``, means a second
+            # full-session dedupe). The surplus row is always the OLDEST of the
+            # returned page on these paths, so dropping index 0 leaves the page
+            # a caller would have received without the over-fetch.
+            overfetch = _limit > 0 and (before_id is not None or latest_page)
+            rows = db.get_messages(
                 sid,
-                limit=_limit,
+                limit=_limit + 1 if overfetch else _limit,
                 offset=offset,
                 latest=latest_page,
                 include_compacted=include_compacted,
+                before_id=before_id,
             )
+            if overfetch and len(rows) > _limit:
+                return sid, _limit, rows[1:], True
+            # Ascending offset paging needs no probe at all: the page starts at
+            # index ``offset`` of the full ascending set, so older rows exist
+            # precisely when the caller skipped some.
+            return sid, _limit, rows, (not overfetch) and bool(rows) and offset > 0
         finally:
             db.close()
 
     result = await asyncio.to_thread(_read)
     if result is None:
         raise HTTPException(status_code=404, detail="Session not found")
-    sid, _limit, messages = result
+    sid, _limit, messages, older_exists = result
+    oldest_id = messages[0].get("id") if messages else None
+    # An empty page has no anchor to hand back, so it always reports
+    # ``has_more: false``. Emitting ``has_more: true`` with a null cursor is a
+    # contract violation the client treats as a broken server, so the two
+    # fields are computed from the same condition and can never disagree.
+    has_more = bool(older_exists) and oldest_id is not None
     return {
         "session_id": sid,
         "messages": messages,
         "pagination": {
             "limit": _limit,
             "offset": offset,
-            "order": order or ("latest" if limit is None else "oldest"),
+            # ``before`` is inherently latest-anchored; without this it would
+            # report "oldest" whenever an explicit limit accompanied a cursor.
+            "order": order or ("latest" if (limit is None or before is not None) else "oldest"),
             "returned": len(messages),
         },
+        "cursor_version": MESSAGE_CURSOR_VERSION,
+        "has_more": has_more,
+        "next_cursor": encode_message_cursor(oldest_id) if has_more else None,
+        "oldest_message_id": str(oldest_id) if oldest_id is not None else None,
     }
 
 

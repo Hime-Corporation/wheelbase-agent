@@ -4343,6 +4343,145 @@ class TestGetMessagesPagination:
         with pytest.raises(ValueError):
             db.get_messages("s1", limit=4, after_id=0, offset=2)
 
+    def test_before_id_keyset_pages_backward_and_stays_chronological(self, db):
+        """The mirror of ``after_id``: each page is the NEWEST rows under the
+        bound, exclusive of the cursor row, still oldest-first inside the page.
+        """
+        self._seed(db)
+        newest = db.get_messages("s1", limit=4, latest=True)
+        assert [m["content"] for m in newest] == ["msg-6", "msg-7", "msg-8", "msg-9"]
+
+        older = db.get_messages("s1", limit=4, before_id=newest[0]["id"])
+        assert [m["content"] for m in older] == ["msg-2", "msg-3", "msg-4", "msg-5"]
+
+        oldest = db.get_messages("s1", limit=4, before_id=older[0]["id"])
+        assert [m["content"] for m in oldest] == ["msg-0", "msg-1"]
+
+        # Exhausted: nothing older than the very first row.
+        assert db.get_messages("s1", limit=4, before_id=oldest[0]["id"]) == []
+
+    def test_before_id_rejects_latest_offset_and_after_id(self, db):
+        self._seed(db)
+        with pytest.raises(ValueError):
+            db.get_messages("s1", limit=4, before_id=5, latest=True)
+        with pytest.raises(ValueError):
+            db.get_messages("s1", limit=4, before_id=5, offset=2)
+        with pytest.raises(ValueError):
+            db.get_messages("s1", limit=4, before_id=5, after_id=1)
+
+    def test_before_id_page_is_unaffected_by_a_concurrent_tail_append(self, db):
+        """The property OFFSET paging does not have.
+
+        Read an older page, append new rows at the tail, read the same older
+        page again: byte-identical. With ``offset``, the second read would slide
+        by exactly the number of appended rows.
+        """
+        self._seed(db)
+        newest = db.get_messages("s1", limit=4, latest=True)
+        cursor_id = newest[0]["id"]
+
+        before_append = db.get_messages("s1", limit=4, before_id=cursor_id)
+        db.append_messages_batch(
+            "s1",
+            [{"role": "user", "content": f"late-{i}"} for i in range(3)],
+        )
+        after_append = db.get_messages("s1", limit=4, before_id=cursor_id)
+
+        assert [m["id"] for m in after_append] == [m["id"] for m in before_append]
+        assert [m["content"] for m in after_append] == [
+            "msg-2", "msg-3", "msg-4", "msg-5",
+        ]
+        # Contrast: the equivalent OFFSET read HAS shifted.
+        assert [
+            m["content"]
+            for m in db.get_messages("s1", limit=4, offset=4, latest=True)
+        ] == ["msg-5", "msg-6", "msg-7", "msg-8"]
+
+    def test_before_id_pages_deduped_display_history_with_include_compacted(self, db):
+        """``before_id`` is allowed alongside ``include_compacted`` (unlike
+        ``after_id``) and pages the deduped display set, not the raw rows."""
+        db.create_session(session_id="c1", source="cli")
+        db.append_messages_batch(
+            "c1",
+            [{"role": "user", "content": f"old-{i}"} for i in range(4)],
+        )
+        db.archive_and_compact(
+            "c1",
+            [
+                {"role": "assistant", "content": "summary"},
+                {"role": "user", "content": "live-0"},
+                {"role": "assistant", "content": "live-1"},
+            ],
+        )
+        display = db.get_messages("c1", include_compacted=True)
+        assert [m["content"] for m in display] == [
+            "old-0", "old-1", "old-2", "old-3", "summary", "live-0", "live-1",
+        ]
+
+        newest = db.get_messages("c1", include_compacted=True, limit=3, latest=True)
+        assert [m["content"] for m in newest] == ["summary", "live-0", "live-1"]
+
+        older = db.get_messages(
+            "c1", include_compacted=True, limit=3, before_id=newest[0]["id"]
+        )
+        assert [m["content"] for m in older] == ["old-1", "old-2", "old-3"]
+
+        oldest = db.get_messages(
+            "c1", include_compacted=True, limit=3, before_id=older[0]["id"]
+        )
+        assert [m["content"] for m in oldest] == ["old-0"]
+        assert db.get_messages(
+            "c1", include_compacted=True, limit=3, before_id=oldest[0]["id"]
+        ) == []
+
+    def test_before_id_resolves_a_cursor_whose_row_compaction_re_sequenced(self, db):
+        """``archive_and_compact(watermark=...)`` re-inserts the concurrent tail
+        under fresh ids. A cursor minted against an ORIGINAL tail id must still
+        resolve to the right boundary instead of skipping the messages that
+        were carried forward."""
+        db.create_session(session_id="c2", source="cli")
+        db.append_messages_batch(
+            "c2",
+            [{"role": "user", "content": f"old-{i}"} for i in range(3)],
+        )
+        watermark = db.get_active_message_watermark("c2")
+        db.append_messages_batch(
+            "c2",
+            [{"role": "user", "content": f"tail-{i}"} for i in range(3)],
+        )
+        tail_rows = [
+            m for m in db.get_messages("c2") if m["content"].startswith("tail-")
+        ]
+        # Cursor points at the LAST tail row, taken before the compaction.
+        stale_cursor_id = tail_rows[-1]["id"]
+
+        db.archive_and_compact(
+            "c2",
+            [{"role": "assistant", "content": "summary"}],
+            watermark=watermark,
+        )
+        # tail-0..2 now live under fresh ids ABOVE the stale cursor.
+        assert all(
+            m["id"] > stale_cursor_id
+            for m in db.get_messages("c2")
+            if m["content"].startswith("tail-")
+        )
+
+        older = db.get_messages("c2", include_compacted=True, before_id=stale_cursor_id)
+        contents = [m["content"] for m in older]
+        # tail-0 and tail-1 are older than the cursor row and must not vanish.
+        assert "tail-0" in contents and "tail-1" in contents
+        assert "tail-2" not in contents  # the cursor row itself: exclusive
+        assert contents == ["old-0", "old-1", "old-2", "summary", "tail-0", "tail-1"]
+
+    def test_before_id_with_an_unknown_id_is_a_plain_ordering_bound(self, db):
+        """A cursor naming no row in this session is not an error — the HTTP
+        layer relies on that so a foreign cursor cannot become an existence
+        oracle."""
+        self._seed(db)
+        assert db.get_messages("s1", before_id=10**15) == db.get_messages("s1")
+        assert db.get_messages("s1", before_id=0) == []
+
     def test_resume_safety_counts_active_rows_across_lineage(self, db):
         db.create_session(session_id="root", source="cli")
         db.append_messages_batch(
