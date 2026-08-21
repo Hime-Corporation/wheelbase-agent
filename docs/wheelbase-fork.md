@@ -338,7 +338,7 @@ per dealership tenant, built from **`Dockerfile.gateway`** (not the root
 
 Image specifics that exist for Wheelbase reasons:
 
-* `python:3.11-slim` + `git`, `curl`, `docker.io` CLI, `gh`, Node 22, bun 1.3.13
+* `python:3.11-slim` + `git`, `curl`, `docker.io` CLI, `gh`, Node 22, bun 1.4.0
   (pinned to the umbrella's `packageManager`), `ripgrep`/`jq`/`build-essential`
   — so the **unsandboxed Telegram process** (`TERMINAL_ENV=local`) has a usable
   shell baseline.
