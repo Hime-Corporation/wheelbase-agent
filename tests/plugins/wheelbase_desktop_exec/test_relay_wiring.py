@@ -148,3 +148,18 @@ def test_idempotent_second_invocation_no_double_execute(monkeypatch):
     assert out1 == out2
     exec_sends = [f for f in ft.sent if f["type"] == "exec"]
     assert len(exec_sends) == 1  # second call served from cache, not re-executed
+
+
+# "/workspace" is a cloud-sandbox path. The desktop jail root is the user's
+# ~/Wheelbase, and exec-sidecar/jail.ts rejects every absolute path outside it
+# ("path escapes workspace: /workspace"), so that default failed every relayed
+# shell command while file ops, which send jail-relative paths, kept working.
+def test_relay_cwd_defaults_to_the_desktop_jail_root():
+    assert plug._relay_cwd({}) == "."
+    assert plug._relay_cwd({"shell_relay_url": "wss://relay"}) == "."
+
+
+def test_relay_cwd_prefers_an_explicit_identity_cwd():
+    assert plug._relay_cwd({"cwd": "/Users/x/Wheelbase/proj"}) == "/Users/x/Wheelbase/proj"
+    assert plug._relay_cwd({"workspace_root": "/Users/x/Wheelbase"}) == "/Users/x/Wheelbase"
+    assert plug._relay_cwd({"cwd": "a", "workspace_root": "b"}) == "a"

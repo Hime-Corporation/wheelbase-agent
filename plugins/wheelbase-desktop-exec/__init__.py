@@ -489,11 +489,25 @@ def _relay(tool_name, args, relay_url, identity, next_call, *,
     return result
 
 
+# "/workspace" is a CLOUD sandbox path. On the desktop relay the jail root is
+# the user's ~/Wheelbase, and exec-sidecar/jail.ts rejects any absolute path
+# outside it ("path escapes workspace: /workspace") — so that default turned
+# every relayed shell command into a failure while file ops, which pass
+# jail-relative paths, kept working.
+#
+# "." is the only meaningful default here: the sidecar's Dispatcher overrides
+# workspace_root with the trusted EXEC_WORKSPACE_ROOT the desktop supervisor
+# handed it and resolves cwd against that, so "." IS the desktop's jail root and
+# the gateway never has to know the path.
+def _relay_cwd(identity: dict) -> str:
+    return identity.get("cwd") or identity.get("workspace_root") or "."
+
+
 def _relay_command(tool_name, args, transport, identity) -> str:
     from .relay_env import DesktopRelayEnvironment, DESKTOP_UNAVAILABLE_EXIT_CODE
     env = DesktopRelayEnvironment(
         transport=transport,
-        cwd=identity.get("cwd") or identity.get("workspace_root") or "/workspace",
+        cwd=_relay_cwd(identity),
         timeout=int(args.get("timeout") or 120),
         workspace_root=identity.get("workspace_root") or "",
     )
@@ -554,7 +568,7 @@ def _relay_file_ops(tool_name, args, transport, identity, *, task_id="") -> str:
 
     env = DesktopRelayEnvironment(
         transport=transport,
-        cwd=identity.get("cwd") or identity.get("workspace_root") or "/workspace",
+        cwd=_relay_cwd(identity),
         timeout=int(args.get("timeout") or 120),
         workspace_root=identity.get("workspace_root") or "",
     )
@@ -720,7 +734,7 @@ def _relay_execute_code(args, relay_url, identity, next_call, *, task_id, tool_c
         from .relay_env import DesktopRelayEnvironment
         env = DesktopRelayEnvironment(
             transport=transport,
-            cwd=identity.get("cwd") or identity.get("workspace_root") or "/workspace",
+            cwd=_relay_cwd(identity),
             timeout=int(args.get("timeout") or 120),
             workspace_root=identity.get("workspace_root") or "",
         )
