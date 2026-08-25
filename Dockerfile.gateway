@@ -4,7 +4,8 @@
 #   HERMES_DASHBOARD_SESSION_TOKEN  shared with backend (HERMES_GATEWAY_TOKEN)
 #   OPENROUTER_API_KEY              central Wheelbase key (spec §9)
 #   SUPABASE_URL / SUPABASE_ANON_KEY / WHEELBASE_GO_API_ORIGIN
-#   WHEELBASE_INTERNAL_API          http://backend:8091 (usage sink + CDP relay base)
+#   WHEELBASE_INTERNAL_API          vestigial, nothing reads it (relay URLs come
+#                                   from the backend's identity envelope)
 #   WHEELBASE_GATEWAY_TOKEN         same shared token (usage sink auth)
 #   TERMINAL_ENV=docker             per-user sandboxes (spec §7)
 #   DOCKER_HOST                     scoped daemon (rootless DinD / dedicated host —

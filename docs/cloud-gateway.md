@@ -167,7 +167,7 @@ receives a new cwd. Docker workdirs are created through container startup.
 | `SUPABASE_URL` | yes | Supabase project URL inherited by children. |
 | `SUPABASE_ANON_KEY` | yes | Supabase anon key inherited by children. |
 | `WHEELBASE_GO_API_ORIGIN` | yes | Public URL of the Wheelbase Go API backend. |
-| `WHEELBASE_INTERNAL_API` | yes | Backend internal API, for usage reporting and CDP relay. |
+| `WHEELBASE_INTERNAL_API` | no | Vestigial. No shipped gateway code reads it: the CDP and exec relay URLs arrive per session in the backend's signed identity envelope (`cdp_url` / `shell_relay_url`), already carrying a host and a capability token. Setting it does nothing, and trusting the row above cost an afternoon of looking for a broken gateway setting while the empty host was on the backend. |
 | `WHEELBASE_GATEWAY_TOKEN` | yes | Token sent as `X-Gateway-Token` to backend internal endpoints. |
 | `TERMINAL_ENV` | yes | Use a sandboxed backend such as `daytona` or `docker` for identified sessions. |
 | `DOCKER_HOST` | docker only | Scoped Docker daemon. Never mount the host `/var/run/docker.sock`. |
