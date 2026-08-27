@@ -14,7 +14,7 @@ from tui_gateway import server
 
 def test_cron_manage_profile_reads_that_profiles_store(tmp_path, monkeypatch):
     # A temp profile home with one job in its cron store.
-    profile_home = tmp_path / "profiles" / "botA"
+    profile_home = tmp_path / "profiles" / "bota"
     cron_dir = profile_home / "cron"
     cron_dir.mkdir(parents=True)
     (cron_dir / "jobs.json").write_text(
@@ -22,8 +22,8 @@ def test_cron_manage_profile_reads_that_profiles_store(tmp_path, monkeypatch):
             {
                 "jobs": [
                     {
-                        "id": "job-botA",
-                        "name": "botA-only-job",
+                        "id": "job-bota",
+                        "name": "bota-only-job",
                         "prompt": "scoped hello",
                         "enabled": True,
                     }
@@ -42,17 +42,17 @@ def test_cron_manage_profile_reads_that_profiles_store(tmp_path, monkeypatch):
         {
             "id": "1",
             "method": "cron.manage",
-            "params": {"action": "list", "profile": "botA"},
+            "params": {"action": "list", "profile": "bota"},
         }
     )
 
     assert "result" in resp, resp
-    assert resp["result"]["scoped"] == "botA"
+    assert resp["result"]["scoped"] == "bota"
     names = [j.get("name") for j in resp["result"]["jobs"]]
-    assert "botA-only-job" in names
+    assert "bota-only-job" in names
 
     # The override must not leak: an unscoped call after this one resolves the
-    # launch profile again, which does not contain botA's job.
+    # launch profile again, which does not contain bota's job.
     from hermes_constants import get_hermes_home_override
 
     assert get_hermes_home_override() is None

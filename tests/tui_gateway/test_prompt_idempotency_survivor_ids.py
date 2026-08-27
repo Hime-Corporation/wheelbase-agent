@@ -195,7 +195,14 @@ def test_all_three_truncation_forms_re_expand_skill_invocation(monkeypatch):
             sess["running"] = False
 
     class _FakeDB:
-        def replace_messages(self, key, messages, active_only=False, archive_dropped=False):
+        def replace_messages(
+            self,
+            key,
+            messages,
+            active_only=False,
+            archive_dropped=False,
+            reject_active_turn_lease=False,
+        ):
             pass
 
     monkeypatch.setattr(server, "_expand_skill_invocation_for_replay", _fake_expand)
@@ -317,7 +324,14 @@ def test_truncation_on_a_profile_owned_session_never_touches_process_global_db(
     written = []
 
     class _ProfileDB:
-        def replace_messages(self, key, messages, active_only=False, archive_dropped=False):
+        def replace_messages(
+            self,
+            key,
+            messages,
+            active_only=False,
+            archive_dropped=False,
+            reject_active_turn_lease=False,
+        ):
             written.append((key, list(messages), active_only, archive_dropped))
 
     class _GlobalDB:

@@ -12,7 +12,7 @@ from tui_gateway import server
 
 def test_plugins_manage_profile_reads_that_profiles_dir(tmp_path, monkeypatch):
     # A temp profile home with one user plugin in its plugins dir.
-    profile_home = tmp_path / "profiles" / "botA"
+    profile_home = tmp_path / "profiles" / "bota"
     plugin_dir = profile_home / "plugins" / "bota-only-plugin"
     plugin_dir.mkdir(parents=True)
     (plugin_dir / "plugin.yaml").write_text(
@@ -29,7 +29,7 @@ def test_plugins_manage_profile_reads_that_profiles_dir(tmp_path, monkeypatch):
         {
             "id": "1",
             "method": "plugins.manage",
-            "params": {"action": "list", "profile": "botA"},
+            "params": {"action": "list", "profile": "bota"},
         }
     )
 
