@@ -74,6 +74,18 @@ jobs:
             echo "Dokploy is behind Cloudflare Access; all four are required."
             exit 1
           fi
+          # Present is not the same as usable. `gh secret set --body -` sets the
+          # literal string "-" rather than reading stdin, which set every one of
+          # these to "-" on the first attempt: non-empty, so the check above
+          # passed, and curl then reported the URL as an unknown option because
+          # it began with a dash. Assert the one secret whose shape we know.
+          case "$DOKPLOY_URL" in
+            https://*|http://*) ;;
+            *) echo "DOKPLOY_URL is not a URL. Re-set it with:"
+               echo "  printf %s 'https://...' | gh secret set DOKPLOY_URL --repo <repo>"
+               echo "(note: no --body flag, the value goes on stdin)"
+               exit 1 ;;
+          esac
 
       - name: Deploy and wait
         run: |
