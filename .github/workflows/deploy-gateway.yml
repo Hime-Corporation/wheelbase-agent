@@ -1,0 +1,113 @@
+name: Deploy Agent Gateway
+
+# Deploys the Hermes agent gateway to Dokploy on pushes to `wheelbase`.
+#
+# ── Why this is a workflow and not Dokploy's autoDeploy ─────────────────────
+# The Dokploy application already has `autoDeploy: true`. It has never fired,
+# here or for any other service, because that flag only does something when a
+# webhook posts to Dokploy — and Dokploy sits behind Cloudflare Access, so a
+# GitHub webhook cannot authenticate to it. Every `/api/deploy/*` path answers
+# 302 to `cloudflareaccess.com`. A workflow can, because it can send a service
+# token.
+#
+# ── What the path filter can and cannot promise ─────────────────────────────
+# `Dockerfile.gateway` ends in `COPY . .`, so strictly speaking EVERY file in
+# the repo lands in the image and no filter is exact. The exclusions below are
+# about behaviour, not bytes: a README or a docs page changes the image without
+# changing what the gateway does, and this is a fork that takes large upstream
+# merges, so deploying on literally every push would mean rebuilding the
+# gateway for other people's documentation. If you need bit-identical image
+# provenance rather than behavioural equivalence, delete `paths-ignore` and
+# accept the extra deploys.
+#
+# ── No CI gate here ─────────────────────────────────────────────────────────
+# Nothing in .github/workflows triggers on the `wheelbase` branch, so there is
+# no run to wait for. If branch CI is ever added, copy the "Wait for CI on this
+# commit" step from wheelbase-backend's deploy.yml.
+#
+# Required secrets:
+#   DOKPLOY_URL              — https://dokploy.wheelbase.io
+#   DOKPLOY_API_KEY          — Dokploy API key
+#   CF_ACCESS_CLIENT_ID      — Cloudflare Access service token id
+#   CF_ACCESS_CLIENT_SECRET  — Cloudflare Access service token secret
+
+on:
+  push:
+    branches: [wheelbase]
+    paths-ignore:
+      - "**/*.md"
+      - "docs/**"
+      - "contributors/**"
+      - "assets/**"
+      - "datagen-config-examples/**"
+      - ".github/**"
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-agent-gateway
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Agent Gateway
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    permissions:
+      contents: read
+    env:
+      APP_ID: 7U8zobdgpwkiJCMd16zw_
+      LABEL: Agent Gateway
+      DOKPLOY_URL: ${{ secrets.DOKPLOY_URL }}
+      DOKPLOY_API_KEY: ${{ secrets.DOKPLOY_API_KEY }}
+      CF_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
+      CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
+    steps:
+      - name: Check required secrets
+        run: |
+          set -euo pipefail
+          missing=""
+          for name in DOKPLOY_URL DOKPLOY_API_KEY CF_ACCESS_CLIENT_ID CF_ACCESS_CLIENT_SECRET; do
+            [ -n "${!name:-}" ] || missing="$missing $name"
+          done
+          if [ -n "$missing" ]; then
+            echo "Missing secret(s):$missing"
+            echo "Dokploy is behind Cloudflare Access; all four are required."
+            exit 1
+          fi
+
+      - name: Deploy and wait
+        run: |
+          set -euo pipefail
+
+          cf=(-H "CF-Access-Client-Id: $CF_ACCESS_CLIENT_ID"
+              -H "CF-Access-Client-Secret: $CF_ACCESS_CLIENT_SECRET")
+          auth=(-H "x-api-key: $DOKPLOY_API_KEY")
+
+          # Anchor before triggering: the newest deployment record is the
+          # PREVIOUS one for the first few seconds, which reads as instant success.
+          started=$(date -u +"%Y-%m-%dT%H:%M:%S.000Z")
+
+          echo "Triggering $LABEL ($APP_ID)"
+          curl -fsS -X POST "$DOKPLOY_URL/api/trpc/application.deploy" \
+            "${auth[@]}" "${cf[@]}" -H "Content-Type: application/json" \
+            -d "{\"json\":{\"applicationId\":\"$APP_ID\"}}" > /dev/null
+
+          input=$(printf '{"json":{"applicationId":"%s"}}' "$APP_ID" | jq -sRr @uri)
+          deadline=$(( $(date +%s) + 2100 ))
+          while :; do
+            body=$(curl -fsS "$DOKPLOY_URL/api/trpc/deployment.all?input=$input" \
+              "${auth[@]}" "${cf[@]}" 2>/dev/null || echo '{}')
+            read -r id dep_status <<<"$(
+              jq -r --arg t "$started" '
+                [.result.data.json[]? | select(.createdAt >= $t)] | first
+                | "\(.deploymentId // "-") \(.status // "-")"' <<<"$body"
+            )"
+            case "$dep_status" in
+              done)  echo "$LABEL deployed ($id)"; exit 0 ;;
+              error|failed) echo "$LABEL FAILED ($id)"; exit 1 ;;
+              -)     echo "waiting for a deployment record..." ;;
+              *)     echo "$id -> $dep_status" ;;
+            esac
+            [ "$(date +%s)" -lt "$deadline" ] || { echo "Timed out waiting for $LABEL."; exit 1; }
+            sleep 15
+          done
