@@ -396,10 +396,14 @@ def _post_process_relayed_result(tool_name, args, result, *,
     # 2. transform_tool_result canonicalization seam (model_tools.py:1201).
     #    First valid string return wins; non-string returns ignored; fail-open.
     try:
-        from hermes_cli.plugins import has_hook, invoke_hook
+        # Use the lifecycle facade, which includes first-party observers and
+        # the active plugin manager on current Hermes runtimes.
+        from hermes_cli.lifecycle import has_hook, invoke_hook
         from model_tools import _tool_result_observer_fields
         if has_hook("transform_tool_result"):
-            status, error_type, error_message = _tool_result_observer_fields(result)
+            status, error_type, error_message = _tool_result_observer_fields(
+                tool_name, result
+            )
             hook_results = invoke_hook(
                 "transform_tool_result",
                 tool_name=tool_name,

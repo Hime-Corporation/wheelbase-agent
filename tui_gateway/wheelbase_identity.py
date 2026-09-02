@@ -154,9 +154,13 @@ def _decode_segment(segment: str) -> bytes:
     if not segment or "=" in segment:
         raise ValueError("invalid identity envelope encoding")
     try:
-        return base64.urlsafe_b64decode(segment + "=" * (-len(segment) % 4))
-    except (ValueError, binascii.Error) as exc:
+        decoded = base64.urlsafe_b64decode(segment + "=" * (-len(segment) % 4))
+        canonical = base64.urlsafe_b64encode(decoded).rstrip(b"=").decode("ascii")
+    except (ValueError, UnicodeError, binascii.Error) as exc:
         raise ValueError("invalid identity envelope encoding") from exc
+    if canonical != segment:
+        raise ValueError("invalid identity envelope encoding")
+    return decoded
 
 
 def load_identity_envelope_keys() -> dict[str, bytes]:
