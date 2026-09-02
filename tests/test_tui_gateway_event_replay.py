@@ -150,5 +150,36 @@ def test_truncation_detection_semantics():
     assert not event_replay.is_truncated("s1", oldest - 1)
     # Client saw seq 5, buffer starts later → truncated.
     assert event_replay.is_truncated("s1", 5)
-    # Unknown session: nothing evicted, nothing truncated.
+    # Unknown session: nothing evicted when last_seen=0, but truncated when last_seen > 0
     assert not event_replay.is_truncated("nope", 0)
+    assert event_replay.is_truncated("nope", 5)
+
+
+def test_emit_session_event_stamps_when_transport_present():
+    from tui_gateway import server
+
+    written = []
+
+    class DummyTransport:
+        def write(self, frame):
+            written.append(frame)
+            return True
+
+    server._sessions["runtime-test-1"] = {
+        "session_key": "durable-key-1",
+        "transport": DummyTransport(),
+    }
+    try:
+        ok = server._emit_session_event("message.delta", "runtime-test-1", {"text": "hello"})
+        assert ok is True
+        assert len(written) == 1
+        frame = written[0]
+        assert frame["params"]["seq"] == 1
+        assert frame["params"]["session_id"] == "durable-key-1"
+        # Verify it was recorded in event_replay
+        assert event_replay.latest_seq("durable-key-1") == 1
+        replayed = event_replay.events_since("durable-key-1", 0)
+        assert len(replayed) == 1
+        assert replayed[0]["seq"] == 1
+    finally:
+        server._sessions.pop("runtime-test-1", None)

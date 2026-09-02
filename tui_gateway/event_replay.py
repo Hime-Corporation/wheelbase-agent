@@ -61,6 +61,8 @@ def _stamp_event(obj: dict) -> None:
         # Session-less global events (skin.changed etc.) are re-fetchable via
         # their own RPCs; no replay contract for them.
         return
+    if "seq" in params:
+        return
     with _replay_lock:
         seq = _replay_next_seq.get(sid, 0) + 1
         _replay_next_seq[sid] = seq
@@ -98,7 +100,7 @@ def is_truncated(sid: str, last_seen: int) -> bool:
     with _replay_lock:
         buf = _replay_buffers.get(sid or "")
         if not buf:
-            return False
+            return last_seen > 0
         return last_seen + 1 < buf[0][0]
 
 

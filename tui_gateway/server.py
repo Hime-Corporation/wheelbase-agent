@@ -2805,6 +2805,9 @@ def _emit_session_event(event: str, runtime_sid: str, payload: dict | None = Non
     if outward_payload is not None and "session_id" in outward_payload:
         outward_payload["session_id"] = durable_id
     frame = _event_frame(event, durable_id, outward_payload)
+    from tui_gateway.event_replay import _stamp_event
+
+    _stamp_event(frame)
     if (transport := session.get("transport")) is not None:
         return transport.write(frame)
     return write_json(frame)

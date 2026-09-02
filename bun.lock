@@ -31,14 +31,13 @@
         "@tauri-apps/plugin-shell": "2.3.5",
         "@vscode/codicons": "0.0.45",
         "class-variance-authority": "0.7.1",
-        "clsx": "2.1.1",
+        "cn": "0.2.4",
         "katex": "0.16.47",
         "lucide-react": "0.577.0",
         "nanostores": "1.4.0",
         "radix-ui": "1.6.7",
         "react": "19.2.7",
         "react-dom": "19.2.7",
-        "tailwind-merge": "3.6.0",
         "tailwindcss": "4.3.3",
         "tw-shimmer": "0.4.12",
       },
@@ -1195,6 +1194,8 @@
     "ci-info": ["ci-info@4.4.0", "", {}, "sha512-77PSwercCZU2Fc4sX94eF8k8Pxte6JAwL4/ICZLFjJLqegs7kCuAsqqj/70NQF6TvDpgFjkubQB2FW2ZZddvQg=="],
 
     "class-variance-authority": ["class-variance-authority@0.7.1", "", { "dependencies": { "clsx": "^2.1.1" } }, "sha512-Ka+9Trutv7G8M6WT6SeiRWz792K5qEqIGEGzXKhAE6xOWAY6pPH8U+9IY3oCMv6kqTmLsv7Xh/2w2RigkePMsg=="],
+
+    "cn": ["cn@0.2.4", "", { "bin": { "cn": "bin/cn.mjs" } }, "sha512-SzQvoh5FwizWtQg9+JueKdjWhlfCZMdu5DqNHm9q1wUlRVmKb9WXlepR9bTTbPwzEOyX1ujJ6lcCppmn3bNUCg=="],
 
     "cli-boxes": ["cli-boxes@3.0.0", "", {}, "sha512-/lzGpEWL/8PfI0BmBOPRwp0c/wFNX1RdUML3jK/RcSBA9T8mZDdQpqYBKtCFTOfQbwPqWEOpjqW+Fnayc0969g=="],
 

@@ -1,5 +1,4 @@
 import { useStore } from '@nanostores/react'
-import clsx from 'clsx'
 import { Check, ChevronRight, FileText, X } from 'lucide-react'
 import { useEffect, useRef, useState } from 'react'
 
@@ -7,6 +6,7 @@ import { BrandMark } from '../components/brand-mark'
 import { Button } from '../components/button'
 import { Loader } from '../components/loader'
 import { formatDuration, formatElapsed } from '../lib/format'
+import { cn } from '../lib/utils'
 import {
   $mode,
   $progress,
@@ -77,7 +77,7 @@ export default function ProgressScreen({ bootstrap }: ProgressProps) {
               the "Live output" header share a baseline. */}
           <div className="mb-4">
             <div className="mb-1 flex items-center justify-between text-xs text-muted-foreground">
-              <span className={clsx(bootstrap.status === 'running' && 'shimmer')}>
+              <span className={cn(bootstrap.status === 'running' && 'shimmer')}>
                 {progress.done} of {progress.total} steps complete
               </span>
               <span className="tabular-nums">{pct}%</span>
@@ -108,7 +108,7 @@ export default function ProgressScreen({ bootstrap }: ProgressProps) {
 
               return (
                 <li
-                  className={clsx(
+                  className={cn(
                     'flex items-center gap-2.5 px-3 py-1.5 text-sm',
                     rec.state === 'running'
                       ? 'font-medium text-foreground'
@@ -135,7 +135,7 @@ export default function ProgressScreen({ bootstrap }: ProgressProps) {
             <div className="flex-1 overflow-y-auto px-3 py-2 font-mono text-[10.5px] leading-relaxed">
               {bootstrap.logs.map((entry, idx) => (
                 <div
-                  className={clsx(
+                  className={cn(
                     'whitespace-pre-wrap',
                     entry.stream === 'stderr' ? 'text-foreground/45' : 'text-foreground/70'
                   )}
@@ -158,7 +158,7 @@ export default function ProgressScreen({ bootstrap }: ProgressProps) {
         >
           <FileText size={14} />
           {showLogs ? 'Hide details' : 'Show details'}
-          <ChevronRight className={clsx('transition-transform', showLogs && 'rotate-90')} size={12} />
+          <ChevronRight className={cn('transition-transform', showLogs && 'rotate-90')} size={12} />
         </button>
 
         {bootstrap.status === 'running' && (
@@ -189,4 +189,3 @@ function StateIcon({ state }: { state: StageState | null }) {
 
   return null
 }
-
