@@ -9,6 +9,9 @@ from unittest.mock import Mock
 import pytest
 
 import tools.browser_tool as browser_tool
+from tools import browser_tool_session as bt_session
+from tools import browser_tool_cloud as bt_cloud
+from tools import browser_tool_cdp as bt_cdp
 
 
 def _reset_session_state(monkeypatch):
@@ -16,8 +19,8 @@ def _reset_session_state(monkeypatch):
     monkeypatch.setattr(browser_tool, "_active_sessions", {})
     monkeypatch.setattr(browser_tool, "_cached_cloud_provider", None)
     monkeypatch.setattr(browser_tool, "_cloud_provider_resolved", False)
-    monkeypatch.setattr(browser_tool, "_start_browser_cleanup_thread", lambda: None)
-    monkeypatch.setattr(browser_tool, "_update_session_activity", lambda t: None)
+    monkeypatch.setattr("tools.browser_tool_lifecycle._start_browser_cleanup_thread", lambda: None)
+    monkeypatch.setattr("tools.browser_tool_lifecycle._update_session_activity", lambda t: None)
 
 
 class TestCloudProviderRuntimeFallback:
@@ -29,10 +32,10 @@ class TestCloudProviderRuntimeFallback:
 
         provider = Mock()
         provider.create_session.side_effect = RuntimeError("401 Unauthorized")
-        monkeypatch.setattr(browser_tool, "_get_cloud_provider", lambda: provider)
-        monkeypatch.setattr(browser_tool, "_get_cdp_override", lambda *a, **k: None)
+        monkeypatch.setattr(bt_cloud, "_get_cloud_provider", lambda: provider)
+        monkeypatch.setattr(bt_cdp, "_get_cdp_override", lambda *_a, **_k: None)
 
-        session = browser_tool._get_session_info("task-1")
+        session = bt_session._get_session_info("task-1")
 
         assert session["fallback_from_cloud"] is True
         assert "401 Unauthorized" in session["fallback_reason"]
@@ -51,10 +54,10 @@ class TestCloudProviderRuntimeFallback:
             "cdp_url": None,
             "features": {"browser_use": True},
         }
-        monkeypatch.setattr(browser_tool, "_get_cloud_provider", lambda: provider)
-        monkeypatch.setattr(browser_tool, "_get_cdp_override", lambda *a, **k: None)
+        monkeypatch.setattr(bt_cloud, "_get_cloud_provider", lambda: provider)
+        monkeypatch.setattr(bt_cdp, "_get_cdp_override", lambda *_a, **_k: None)
 
-        session = browser_tool._get_session_info("task-2")
+        session = bt_session._get_session_info("task-2")
 
         assert session["session_name"] == "cloud-sess"
         assert "fallback_from_cloud" not in session
@@ -66,24 +69,24 @@ class TestCloudProviderRuntimeFallback:
 
         provider = Mock()
         provider.create_session.side_effect = RuntimeError("cloud boom")
-        monkeypatch.setattr(browser_tool, "_get_cloud_provider", lambda: provider)
-        monkeypatch.setattr(browser_tool, "_get_cdp_override", lambda *a, **k: None)
+        monkeypatch.setattr(bt_cloud, "_get_cloud_provider", lambda: provider)
+        monkeypatch.setattr(bt_cdp, "_get_cdp_override", lambda *_a, **_k: None)
         monkeypatch.setattr(
-            browser_tool, "_create_local_session",
+            bt_session, "_create_local_session",
             Mock(side_effect=OSError("no chromium")),
         )
 
         with pytest.raises(RuntimeError, match="cloud boom.*local.*no chromium"):
-            browser_tool._get_session_info("task-3")
+            bt_session._get_session_info("task-3")
 
     def test_no_provider_uses_local_directly(self, monkeypatch):
         """When no cloud provider is configured, local mode is used with no fallback markers."""
         _reset_session_state(monkeypatch)
 
-        monkeypatch.setattr(browser_tool, "_get_cloud_provider", lambda: None)
-        monkeypatch.setattr(browser_tool, "_get_cdp_override", lambda *a, **k: None)
+        monkeypatch.setattr(bt_cloud, "_get_cloud_provider", lambda: None)
+        monkeypatch.setattr(bt_cdp, "_get_cdp_override", lambda *_a, **_k: None)
 
-        session = browser_tool._get_session_info("task-4")
+        session = bt_session._get_session_info("task-4")
 
         assert session["features"]["local"] is True
         assert "fallback_from_cloud" not in session
@@ -93,10 +96,10 @@ class TestCloudProviderRuntimeFallback:
         _reset_session_state(monkeypatch)
 
         provider = Mock()
-        monkeypatch.setattr(browser_tool, "_get_cloud_provider", lambda: provider)
-        monkeypatch.setattr(browser_tool, "_get_cdp_override", lambda *a, **k: "ws://host:9222/devtools/browser/abc")
+        monkeypatch.setattr(bt_cloud, "_get_cloud_provider", lambda: provider)
+        monkeypatch.setattr(bt_cdp, "_get_cdp_override", lambda *_a, **_k: "ws://host:9222/devtools/browser/abc")
 
-        session = browser_tool._get_session_info("task-5")
+        session = bt_session._get_session_info("task-5")
 
         provider.create_session.assert_not_called()
         assert session["cdp_url"] == "ws://host:9222/devtools/browser/abc"
@@ -109,11 +112,11 @@ class TestCloudProviderRuntimeFallback:
             "create_session": Mock(side_effect=ConnectionError("timeout")),
         })
         provider = BrowserUseProviderFake()
-        monkeypatch.setattr(browser_tool, "_get_cloud_provider", lambda: provider)
-        monkeypatch.setattr(browser_tool, "_get_cdp_override", lambda *a, **k: None)
+        monkeypatch.setattr(bt_cloud, "_get_cloud_provider", lambda: provider)
+        monkeypatch.setattr(bt_cdp, "_get_cdp_override", lambda *_a, **_k: None)
 
         with caplog.at_level(logging.WARNING, logger="tools.browser_tool"):
-            session = browser_tool._get_session_info("task-6")
+            session = bt_session._get_session_info("task-6")
 
         assert session["fallback_from_cloud"] is True
         assert any("BrowserUseProvider" in r.message and "timeout" in r.message
@@ -139,15 +142,15 @@ class TestCloudProviderRuntimeFallback:
 
         provider = Mock()
         provider.create_session.side_effect = create_session_flaky
-        monkeypatch.setattr(browser_tool, "_get_cloud_provider", lambda: provider)
-        monkeypatch.setattr(browser_tool, "_get_cdp_override", lambda *a, **k: None)
+        monkeypatch.setattr(bt_cloud, "_get_cloud_provider", lambda: provider)
+        monkeypatch.setattr(bt_cdp, "_get_cdp_override", lambda *_a, **_k: None)
 
         # First call fails → fallback
-        s1 = browser_tool._get_session_info("task-a")
+        s1 = bt_session._get_session_info("task-a")
         assert s1["fallback_from_cloud"] is True
 
         # Second call (different task) → cloud succeeds
-        s2 = browser_tool._get_session_info("task-b")
+        s2 = bt_session._get_session_info("task-b")
         assert "fallback_from_cloud" not in s2
         assert s2["session_name"] == "cloud-ok"
 
@@ -157,10 +160,10 @@ class TestCloudProviderRuntimeFallback:
 
         provider = Mock()
         provider.create_session.return_value = None
-        monkeypatch.setattr(browser_tool, "_get_cloud_provider", lambda: provider)
-        monkeypatch.setattr(browser_tool, "_get_cdp_override", lambda *a, **k: None)
+        monkeypatch.setattr(bt_cloud, "_get_cloud_provider", lambda: provider)
+        monkeypatch.setattr(bt_cdp, "_get_cdp_override", lambda *_a, **_k: None)
 
-        session = browser_tool._get_session_info("task-7")
+        session = bt_session._get_session_info("task-7")
 
         assert session["fallback_from_cloud"] is True
         assert "invalid session" in session["fallback_reason"]

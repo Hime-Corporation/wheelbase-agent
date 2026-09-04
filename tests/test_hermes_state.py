@@ -10,8 +10,21 @@ from unittest import mock
 import pytest
 
 import hermes_state
-from agent.session_activity import ActivityProvenance
-from hermes_state import SCHEMA_SQL, SCHEMA_VERSION, SessionDB
+import hermes_state_wal
+import hermes_state_common
+from agent.session_activity import ActivityProvenance, build_activity_snapshot
+from hermes_state import SessionDB
+from hermes_state_common import FTS_SQL, FTS_STORAGE_VERSION, SCHEMA_SQL, SCHEMA_VERSION
+
+
+def _activity_snapshot(db, session_id):
+    """Durable activity snapshot for *session_id* (what gateway/delegate readers build from the row)."""
+    row = db.get_session(session_id)
+    return build_activity_snapshot(
+        last_activity_at=row.get("last_activity_at"),
+        last_activity_description=row.get("last_activity_description"),
+        last_activity_provenance=row.get("last_activity_provenance"),
+    )
 
 
 class _NoFtsCursor(sqlite3.Cursor):
@@ -890,19 +903,22 @@ class TestFTS5Search:
         ]
         assert all("context" in row and row["context"] for row in default)
 
-    def test_search_projection_skips_context_enrichment_queries(self, db):
+    def test_search_projection_skips_context_enrichment_queries(self, db, monkeypatch):
         db.create_session(session_id="s1", source="cli")
         db.append_message("s1", role="user", content="before")
         db.append_message("s1", role="assistant", content="projectionneedle")
         db.append_message("s1", role="user", content="after")
 
         statements = []
-        read_conn = db._get_read_conn() or db._conn
-        traced_connections = [db._conn]
-        if read_conn is not db._conn:
-            traced_connections.append(read_conn)
-        for conn in traced_connections:
+        db._conn.set_trace_callback(statements.append)
+        original_connect_read_only = db._connect_read_only
+
+        def traced_connect_read_only(*args, **kwargs):
+            conn = original_connect_read_only(*args, **kwargs)
             conn.set_trace_callback(statements.append)
+            return conn
+
+        monkeypatch.setattr(db, "_connect_read_only", traced_connect_read_only)
 
         def context_query_count():
             normalized = (" ".join(sql.upper().split()) for sql in statements)
@@ -927,8 +943,7 @@ class TestFTS5Search:
             assert default[0]["context"]
             assert context_query_count() == 2
         finally:
-            for conn in traced_connections:
-                conn.set_trace_callback(None)
+            db._conn.set_trace_callback(None)
 
     def test_sanitize_fts5_query_strips_dangerous_chars(self):
         """Unit test for _sanitize_fts5_query static method."""
@@ -1825,7 +1840,7 @@ class TestSanitizeTitle:
 class TestSchemaInit:
     def test_wal_mode(self, db):
         """Prefer WAL on fixed SQLite; DELETE on WAL-reset-vulnerable builds (#69784)."""
-        from hermes_state import is_sqlite_wal_reset_vulnerable
+        from hermes_state_wal import is_sqlite_wal_reset_vulnerable
 
         cursor = db._conn.execute("PRAGMA journal_mode")
         mode = cursor.fetchone()[0].lower()
@@ -1880,7 +1895,7 @@ class TestSchemaInit:
         This is the architectural invariant: SCHEMA_SQL declares the
         desired schema, _reconcile_columns ensures it matches reality.
         """
-        from hermes_state import SCHEMA_SQL
+        from hermes_state_common import SCHEMA_SQL
 
         expected = SessionDB._parse_schema_columns(SCHEMA_SQL)
         for table_name, declared_cols in expected.items():
@@ -2470,7 +2485,7 @@ class TestListSessionsRich:
         assert row["last_activity_description"] == "starting API call #1"
         assert row["last_activity_provenance"] == "unknown"
 
-        activity = db.get_session_activity("s1")
+        activity = _activity_snapshot(db, "s1")
         assert activity["last_activity_at"] == heartbeat
         assert activity["last_activity_description"] == "starting API call #1"
         assert "phase" not in activity
@@ -2500,7 +2515,7 @@ class TestListSessionsRich:
         assert row["last_activity_at"] == heartbeat
         assert row["last_activity_description"] == ""
         assert row["last_activity_provenance"] == "unknown"
-        activity = db.get_session_activity("s1")
+        activity = _activity_snapshot(db, "s1")
         assert activity["last_activity_at"] == heartbeat
         assert activity["last_activity_description"] == ""
         assert activity["last_activity_provenance"] == "unknown"
@@ -2543,7 +2558,7 @@ class TestListSessionsRich:
         rows = db.list_gateway_sessions(active_only=True)
         assert len(rows) == 1
         assert rows[0]["last_active"] == heartbeat
-        activity = db.get_session_activity("gw-1")
+        activity = _activity_snapshot(db, "gw-1")
         assert activity["last_activity_description"] == "compressing context"
 
     def test_order_by_last_active_surfaces_recently_touched_older_session_first(self, db):
@@ -3203,7 +3218,7 @@ class TestVacuum:
 
     def test_auto_maintenance_freelist_ratio_exactly_at_threshold_skips(self, db, monkeypatch):
         """Gate is strictly greater-than: 25.0% reclaimable does not VACUUM."""
-        from hermes_state import AUTO_VACUUM_MIN_FREELIST_RATIO
+        from hermes_state_common import AUTO_VACUUM_MIN_FREELIST_RATIO
 
         monkeypatch.setattr(db, "prune_sessions", lambda **_kwargs: 1)
         monkeypatch.setattr(db, "_freelist_ratio", lambda: AUTO_VACUUM_MIN_FREELIST_RATIO)
@@ -3243,7 +3258,7 @@ class TestVacuum:
 
     def test_freelist_ratio_reads_real_pragmas(self, db):
         """Real-DB check: freeing most of the file pushes the ratio past the gate."""
-        from hermes_state import AUTO_VACUUM_MIN_FREELIST_RATIO
+        from hermes_state_common import AUTO_VACUUM_MIN_FREELIST_RATIO
 
         db.create_session(session_id="keep", source="cli")
         db.append_message(session_id="keep", role="user", content="hi")
@@ -3629,7 +3644,7 @@ class TestFTS5ToolCallMigration:
             assert len(session_db.search_messages("LEGACYARG")) == 1, \
                 "v23 optimize must index tool_calls JSON into FTS"
             # schema_version bumped once the FTS layer is v23
-            from hermes_state import SCHEMA_VERSION
+            from hermes_state_common import SCHEMA_VERSION
             row = session_db._conn.execute(
                 "SELECT version FROM schema_version LIMIT 1"
             ).fetchone()
@@ -3735,6 +3750,160 @@ class TestFTSExternalContentMigration:
         finally:
             db.close()
 
+    @pytest.mark.parametrize("with_message", [False, True])
+    def test_v23_rebuild_from_trigram_tool_calls_projection(
+        self, tmp_path, with_message
+    ):
+        """v23 installs built with historical trigram projection should be
+        repaired via optimize-storage: trigram must drop tool_calls while
+        standard messages_fts keeps indexing them."""
+        db_path = tmp_path / "v23-toolcalls.db"
+
+        # Build an external-content DB that is already at schema version 23,
+        # but with the old tool_calls-inclusive trigram projection.
+        conn = sqlite3.connect(str(db_path))
+        conn.executescript(SCHEMA_SQL)
+        conn.executescript(FTS_SQL)
+        conn.executescript(
+            """
+            DROP TRIGGER IF EXISTS messages_fts_trigram_insert;
+            DROP TRIGGER IF EXISTS messages_fts_trigram_delete;
+            DROP TRIGGER IF EXISTS messages_fts_trigram_update;
+            DROP TABLE IF EXISTS messages_fts_trigram;
+            DROP VIEW IF EXISTS messages_fts_trigram_src;
+
+            CREATE VIEW IF NOT EXISTS messages_fts_trigram_src AS
+                SELECT id, role, content, tool_name, tool_calls
+                FROM messages
+                WHERE role <> 'tool';
+
+            CREATE VIRTUAL TABLE messages_fts_trigram USING fts5(
+                content,
+                tool_name,
+                tool_calls,
+                content='messages_fts_trigram_src',
+                content_rowid='id',
+                tokenize='trigram'
+            );
+
+            CREATE TRIGGER messages_fts_trigram_insert AFTER INSERT ON messages
+            WHEN new.role <> 'tool'
+            BEGIN
+                INSERT INTO messages_fts_trigram(rowid, content, tool_name, tool_calls)
+                VALUES (new.id, new.content, new.tool_name, new.tool_calls);
+            END;
+
+            CREATE TRIGGER messages_fts_trigram_delete AFTER DELETE ON messages
+            WHEN old.role <> 'tool'
+            BEGIN
+                INSERT INTO messages_fts_trigram(messages_fts_trigram, rowid, content, tool_name, tool_calls)
+                VALUES ('delete', old.id, old.content, old.tool_name, old.tool_calls);
+            END;
+
+            CREATE TRIGGER messages_fts_trigram_update
+            AFTER UPDATE OF content, tool_name, tool_calls, role ON messages
+            WHEN (old.content IS NOT new.content
+                OR old.tool_name IS NOT new.tool_name
+                OR old.tool_calls IS NOT new.tool_calls
+                OR old.role IS NOT new.role)
+            BEGIN
+                INSERT INTO messages_fts_trigram(messages_fts_trigram, rowid, content, tool_name, tool_calls)
+                SELECT 'delete', old.id, old.content, old.tool_name, old.tool_calls
+                WHERE old.role <> 'tool';
+                INSERT INTO messages_fts_trigram(rowid, content, tool_name, tool_calls)
+                SELECT new.id, new.content, new.tool_name, new.tool_calls
+                WHERE new.role <> 'tool';
+            END;
+            """
+        )
+        # Simulate the historical v23 projection shipped before this fix.
+        conn.execute(
+            "INSERT OR REPLACE INTO state_meta (key, value) VALUES ('fts_storage_version', '1')"
+        )
+        conn.execute(
+            "INSERT OR REPLACE INTO state_meta (key, value) VALUES ('fts_optimize_available', '1')"
+        )
+        conn.commit()
+        conn.close()
+
+        if with_message:
+            conn = sqlite3.connect(str(db_path))
+            conn.execute(
+                "INSERT INTO sessions (id, source, started_at) VALUES (?, ?, ?)",
+                ("s1", "cli", time.time()),
+            )
+            conn.execute(
+                "INSERT INTO messages (session_id, timestamp, role, content, tool_name, tool_calls) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    "s1",
+                    time.time(),
+                    "assistant",
+                    "部署完成 assistant content",
+                    "legacyTool",
+                    '{"name": "legacy", "arguments": "UNIQUE_TOOLCALL_TOKEN_43701"}',
+                ),
+            )
+            conn.commit()
+            assert conn.execute(
+                "SELECT rowid FROM messages_fts_trigram WHERE messages_fts_trigram MATCH 'UNIQUE_TOOLCALL_TOKEN_43701'"
+            ).fetchall()
+            conn.close()
+
+        db = SessionDB(db_path=db_path)
+        try:
+            assert db._conn is not None
+            assert db.fts_optimize_available() is True
+            assert db.get_meta("fts_storage_version") == "1"
+
+            original_ensure = db._ensure_fts_schema
+
+            def interrupt_after_demote(cursor, table_name, ddl):
+                if table_name == "messages_fts_trigram":
+                    raise RuntimeError("injected trigram rebuild interruption")
+                return original_ensure(cursor, table_name, ddl)
+
+            db._ensure_fts_schema = interrupt_after_demote
+            with pytest.raises(RuntimeError, match="injected trigram"):
+                db.optimize_fts_storage(vacuum=False)
+
+            db.close()
+            db = SessionDB(db_path=db_path)
+            assert db._conn is not None
+            assert db.get_meta("fts_rebuild_high_water") is None
+            assert db.get_meta("fts_rebuild_progress") is None
+            assert db._has_fts_trash(db._conn) is True
+            assert db.fts_optimize_available() is True
+            assert db.get_meta("fts_storage_version") == "1"
+            if with_message:
+                assert db._conn.execute(
+                    "SELECT 1 FROM messages_fts_trigram "
+                    "WHERE messages_fts_trigram MATCH '部署完成' LIMIT 1"
+                ).fetchone()
+
+            result = db.optimize_fts_storage(vacuum=False)
+            assert result["ok"] is True
+
+            if with_message:
+                # messages_fts stays in the tool-calls search path.
+                assert len(db.search_messages("UNIQUE_TOOLCALL_TOKEN_43701")) == 1
+                # New trigram schema excludes tool_calls from trigram projection.
+                assert not db._conn.execute(
+                    "SELECT 1 FROM messages_fts_trigram WHERE messages_fts_trigram MATCH 'UNIQUE_TOOLCALL_TOKEN_43701' LIMIT 1"
+                ).fetchone()
+                assert db._conn.execute(
+                    "SELECT 1 FROM messages_fts_trigram "
+                    "WHERE messages_fts_trigram MATCH '部署完成' LIMIT 1"
+                ).fetchone()
+            trigger_sql = db._conn.execute(
+                "SELECT sql FROM sqlite_master "
+                "WHERE type = 'trigger' AND name = 'messages_fts_trigram_update'"
+            ).fetchone()[0]
+            assert "tool_calls" not in trigger_sql
+            assert db.get_meta("fts_storage_version") == str(FTS_STORAGE_VERSION)
+        finally:
+            db.close()
+
 
 
 
@@ -3747,7 +3916,7 @@ class TestFTSExternalContentMigration:
         Mirrors what happened when ``_ensure_fts_schema`` ran inside
         ``_execute_write`` and the process died before the marker writes.
         """
-        from hermes_state import FTS_SQL, FTS_TRIGRAM_SQL
+        from hermes_state_common import FTS_SQL, FTS_TRIGRAM_SQL
 
         conn = db._conn
         db._drop_fts_triggers(conn)
@@ -3812,7 +3981,7 @@ class TestFTSExternalContentMigration:
             assert db.fts_rebuild_status() is None
             assert db.fts_optimize_available() is False
             assert db.get_meta("fts_storage_version") == str(
-                hermes_state.FTS_STORAGE_VERSION
+                hermes_state_common.FTS_STORAGE_VERSION
             )
             assert db._conn.execute(
                 "SELECT name FROM sqlite_master WHERE name LIKE '%_v22_trash%'"
@@ -3854,7 +4023,7 @@ class TestFTSExternalContentMigration:
                 "INSERT INTO state_meta (key, value) VALUES "
                 "('fts_storage_version', ?) "
                 "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                (str(hermes_state.FTS_STORAGE_VERSION),),
+                (str(hermes_state_common.FTS_STORAGE_VERSION),),
             )
             db._conn.commit()
 
@@ -3869,7 +4038,7 @@ class TestFTSExternalContentMigration:
             assert result["ok"] is True
             assert len(db.search_messages("deployment")) == 1
             assert db.get_meta("fts_storage_version") == str(
-                hermes_state.FTS_STORAGE_VERSION
+                hermes_state_common.FTS_STORAGE_VERSION
             )
             assert db.fts_optimize_available() is False
         finally:
@@ -4216,14 +4385,14 @@ class TestApplyWalProbe:
         import hermes_state
 
         monkeypatch.setattr(
-            hermes_state, "is_sqlite_wal_reset_vulnerable", lambda version_info=None: False
+            hermes_state_wal, "is_sqlite_wal_reset_vulnerable", lambda version_info=None: False
         )
 
 
     def test_sets_wal_on_fresh_connection(self, tmp_path):
         """Probe sees 'delete', then set-pragma runs and returns 'wal'."""
         import sqlite3
-        from hermes_state import apply_wal_with_fallback
+        from hermes_state_wal import apply_wal_with_fallback
 
         class _TracingConn(sqlite3.Connection):
             def __init__(self, *a, **kw):
@@ -4256,7 +4425,7 @@ class TestApplyWalProbe:
         import sys
         import threading
         import sqlite3
-        from hermes_state import apply_wal_with_fallback
+        from hermes_state_wal import apply_wal_with_fallback
 
         db_path = tmp_path / "concurrent.db"
         errors = []
@@ -4302,7 +4471,7 @@ class TestApplyWalProbe:
     def test_returns_wal_not_delete_from_probe(self, tmp_path):
         """Early-return only on 'wal'; 'delete' or 'memory' must fall through to set-pragma."""
         import sqlite3
-        from hermes_state import apply_wal_with_fallback
+        from hermes_state_wal import apply_wal_with_fallback
 
         class _TracingConn(sqlite3.Connection):
             def __init__(self, *a, **kw):
@@ -5779,8 +5948,7 @@ class TestPerformancePragmasEndToEnd:
         # path. Force WAL eligibility so _get_read_conn is truly exercised
         # (established pattern used by the WAL tests above).
         monkeypatch.setattr(
-            hermes_state,
-            "is_sqlite_wal_reset_vulnerable",
+            hermes_state_wal, "is_sqlite_wal_reset_vulnerable",
             lambda version_info=None: False,
         )
         home = tmp_path / "hermes_home"

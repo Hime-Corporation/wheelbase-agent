@@ -12,7 +12,7 @@ import re
 
 import pytest
 
-from tools import browser_tool, terminal_tool
+from tools import browser_tool, browser_tool_cdp as browser_cdp, terminal_tool
 from tui_gateway.wheelbase_identity import WheelbaseIdentity
 from tui_gateway.wheelbase_inject import (
     apply_session_injection,
@@ -46,7 +46,7 @@ IDENT_B = _identity(
 def _sandboxed_env(monkeypatch):
     monkeypatch.setenv("TERMINAL_ENV", "docker")
     # Resolver normally fetches /json/version; identity-resolve for tests.
-    monkeypatch.setattr(browser_tool, "_resolve_cdp_override", lambda u: u)
+    monkeypatch.setattr(browser_cdp, "_resolve_cdp_override", lambda u: u)
     yield
     for t in (
         "task-a",
@@ -68,8 +68,8 @@ def test_two_users_no_cross_bleed(tmp_path):
     cleanup_b = apply_session_injection("task-b", IDENT_B, tmp_path)
 
     # Browser: each task resolves its own relay URL.
-    assert browser_tool._get_cdp_override("task-a") == IDENT_A.cdp_url
-    assert browser_tool._get_cdp_override("task-b") == IDENT_B.cdp_url
+    assert browser_cdp._get_cdp_override("task-a") == IDENT_A.cdp_url
+    assert browser_cdp._get_cdp_override("task-b") == IDENT_B.cdp_url
 
     # Sandbox: each task mounts only its own user volume.
     vols_a = terminal_tool._task_env_overrides["task-a"]["docker_volumes"]
@@ -365,7 +365,7 @@ def test_missing_cdp_url_clears_registration(tmp_path):
     no_browser = _identity(user_id="user-aaaa", tenant_id="t1", jwt="jwt-a", cdp_url="")
     apply_session_injection("task-a", no_browser, tmp_path)()
     # Falls back to env/config path (empty in tests -> empty string).
-    assert browser_tool._get_cdp_override("task-a") != IDENT_A.cdp_url
+    assert browser_cdp._get_cdp_override("task-a") != IDENT_A.cdp_url
 
 
 def test_rejects_anonymous_injection(tmp_path):

@@ -131,7 +131,7 @@ def _require_sandboxed_env(shell_relay_url: str = "") -> str:
     )
 
 
-def clear_ephemeral_task_state(task_id: str) -> None:
+def clear_ephemeral_task_state(task_id: str, hermes_home: Path | None = None) -> None:
     """Forget every task-keyed registration owned by one ephemeral worker.
 
     Background and preview task IDs are never resumed. Their terminal,
@@ -144,9 +144,10 @@ def clear_ephemeral_task_state(task_id: str) -> None:
         return
 
     try:
+        from hermes_constants import get_hermes_home
         clear_task_credential_state(
             task_id,
-            Path(os.environ.get("HERMES_HOME") or str(Path.home() / ".hermes")),
+            Path(hermes_home) if hermes_home is not None else Path(get_hermes_home()),
             reason="ephemeral_task_end",
         )
     except Exception:

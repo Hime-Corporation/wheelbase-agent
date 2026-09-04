@@ -73,7 +73,9 @@ def test_wheelbase_dashboard_oauth_and_model_routes_exist():
 
 
 def test_oauth_catalog_has_expected_provider_ids_and_flows():
-    catalog = web_server._build_oauth_catalog()
+    from hermes_cli.web_routers import oauth as oauth_routes
+
+    catalog = oauth_routes._build_oauth_catalog()
     by_id = {entry["id"]: entry for entry in catalog}
 
     required_ids = {"openai-codex", "anthropic", "xai-oauth"}
@@ -92,7 +94,9 @@ def test_oauth_provider_catalog_base_also_has_expected_ids_and_flows():
     """Same pin against the raw ``_OAUTH_PROVIDER_CATALOG`` base tuple (not
     just the derived ``_build_oauth_catalog()`` view) — both are
     upstream-owned surfaces and either could silently drop an entry."""
-    by_id = {entry["id"]: entry for entry in web_server._OAUTH_PROVIDER_CATALOG}
+    from hermes_cli.web_server_oauth import _OAUTH_PROVIDER_CATALOG
+
+    by_id = {entry["id"]: entry for entry in _OAUTH_PROVIDER_CATALOG}
 
     required_ids = {"openai-codex", "anthropic", "xai-oauth"}
     missing = required_ids - set(by_id)
@@ -113,7 +117,9 @@ def test_oauth_provider_catalog_base_also_has_expected_ids_and_flows():
 
 
 def test_oauth_submit_body_has_expected_fields():
-    fields = web_server.OAuthSubmitBody.model_fields
+    from hermes_cli.web_models import OAuthSubmitBody
+
+    fields = OAuthSubmitBody.model_fields
     assert "session_id" in fields
     assert "code" in fields
 
@@ -124,7 +130,9 @@ def test_oauth_submit_body_has_expected_fields():
 
 
 def test_model_assignment_body_accepts_scope_provider_model():
-    fields = web_server.ModelAssignment.model_fields
+    from hermes_cli.web_models import ModelAssignment
+
+    fields = ModelAssignment.model_fields
     for key in ("scope", "provider", "model"):
         assert key in fields, f"ModelAssignment is missing required field {key!r}"
 
@@ -133,7 +141,7 @@ def test_model_assignment_body_accepts_scope_provider_model():
 # (e) OAuth session poll status literals.
 #
 # These are inline string literals assigned directly to `sess["status"]`
-# throughout web_server.py rather than an enum, so there is no importable
+# throughout the split OAuth modules rather than an enum, so there is no importable
 # symbol to pin against type-safely. `_new_oauth_session` is the single
 # place that documents the full contract in a comment (`# pending |
 # approved | denied | expired | error`) next to the literal that creates
@@ -152,7 +160,9 @@ def test_model_assignment_body_accepts_scope_provider_model():
 
 
 def test_oauth_session_status_literals_are_documented():
-    source = inspect.getsource(web_server._new_oauth_session)
+    from hermes_cli.web_routers import oauth as oauth_routes
+
+    source = inspect.getsource(oauth_routes._new_oauth_session)
     assert '"status": "pending"' in source
 
     documented_literals_comment = source.split('"status": "pending",', 1)[1].splitlines()[0]
@@ -165,8 +175,11 @@ def test_oauth_session_status_literals_are_documented():
 
 def test_oauth_session_status_literals_actually_used_in_file():
     """Belt-and-suspenders: confirm the non-pending literals are assigned
-    somewhere in web_server.py, not just documented in a stale comment."""
-    source = inspect.getsource(web_server)
+    somewhere in the split OAuth implementation."""
+    from hermes_cli import web_server_oauth
+    from hermes_cli.web_routers import oauth as oauth_routes
+
+    source = inspect.getsource(oauth_routes) + inspect.getsource(web_server_oauth)
     for status in ("approved", "expired", "error"):
         assert f'sess["status"] = "{status}"' in source, (
             f'expected sess["status"] = "{status}" to appear somewhere in '

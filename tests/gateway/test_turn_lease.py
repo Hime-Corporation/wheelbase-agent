@@ -142,8 +142,6 @@ def test_timeout_fails_closed_instead_of_authorizing_an_unserialized_turn():
         assert registry.release(successor) is True
 
     _run(scenario())
-
-
 @pytest.mark.asyncio
 async def test_agent_path_propagates_timed_out_lease_before_loading_transcript(
     monkeypatch, tmp_path
@@ -314,7 +312,6 @@ def test_registry_does_not_evict_lease_during_waiter_handoff():
         assert registry.release(other) is True
 
     _run(scenario())
-
 
 def test_registry_does_not_evict_an_uncontended_acquire_before_it_locks():
     """Every pending acquire is protected, even if the lock looked free."""

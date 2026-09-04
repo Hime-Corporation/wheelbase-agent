@@ -658,7 +658,9 @@ def test_cloud_signed_refresh_is_independent_per_device(tmp_path, monkeypatch):
 def test_identity_update_refreshes_active_shell_and_browser_policy_immediately(
     new_cdp, new_shell, tmp_path, monkeypatch
 ):
-    from tools import browser_tool
+    from tools import browser_tool, browser_tool_cdp as browser_cdp
+    from tools import browser_tool_install as browser_install
+    from tools import browser_tool_session as browser_session
 
     plugin = importlib.import_module("plugins.wheelbase-desktop-exec")
     task_id = "active-d1"
@@ -714,7 +716,7 @@ def test_identity_update_refreshes_active_shell_and_browser_policy_immediately(
         assert active_identity["cdp_url"] == new_cdp
         assert active_identity["shell_relay_url"] == new_shell
         assert wb_runtime.current_identity()["cdp_url"] == new_cdp
-        assert browser_tool._desktop_task_cdp_raw(task_id) == new_cdp
+        assert browser_cdp._desktop_task_cdp_raw(task_id) == new_cdp
 
         if new_shell:
             relayed = {}
@@ -744,16 +746,16 @@ def test_identity_update_refreshes_active_shell_and_browser_policy_immediately(
             assert relayed["relay_url"] == new_shell
             resolved_cdp = []
             monkeypatch.setattr(
-                browser_tool,
+                browser_cdp,
                 "_resolve_cdp_override",
                 lambda raw: resolved_cdp.append(raw) or raw,
             )
             monkeypatch.setattr(
-                browser_tool,
+                browser_install,
                 "_find_agent_browser",
                 lambda: (_ for _ in ()).throw(FileNotFoundError("diagnostic")),
             )
-            browser_tool._run_browser_command(task_id, "snapshot", [])
+            browser_session._run_browser_command(task_id, "snapshot", [])
             assert resolved_cdp == [new_cdp]
         else:
             shell_result = json.loads(
@@ -766,7 +768,7 @@ def test_identity_update_refreshes_active_shell_and_browser_policy_immediately(
                 )
             )
             assert shell_result["error_code"] == "desktop_unavailable"
-            browser_result = browser_tool._run_browser_command(
+            browser_result = browser_session._run_browser_command(
                 task_id, "snapshot", []
             )
             assert browser_result["error_code"] == "desktop_unavailable"
@@ -781,7 +783,7 @@ def test_identity_update_refreshes_active_shell_and_browser_policy_immediately(
 def test_identity_update_does_not_refresh_another_device_active_tasks(
     tmp_path, monkeypatch
 ):
-    from tools import browser_tool
+    from tools import browser_tool, browser_tool_cdp as browser_cdp
 
     d1 = WheelbaseIdentity(
         user_id="user-aaaa",
@@ -856,12 +858,12 @@ def test_identity_update_does_not_refresh_another_device_active_tasks(
             }
         )
         assert wb_runtime.get_task_identity(task1)["shell_relay_url"] == ""
-        assert browser_tool._desktop_task_cdp_raw(task1) == ""
+        assert browser_cdp._desktop_task_cdp_raw(task1) == ""
         assert (
             wb_runtime.get_task_identity(task2)["shell_relay_url"]
             == d2.shell_relay_url
         )
-        assert browser_tool._desktop_task_cdp_raw(task2) == d2.cdp_url
+        assert browser_cdp._desktop_task_cdp_raw(task2) == d2.cdp_url
     finally:
         reset_transport(transport_token)
         wb_runtime.reset_identity(token2)
@@ -930,7 +932,7 @@ def test_identity_update_does_not_refresh_another_device_active_tasks(
 def test_runtime_probe_returns_safe_profile_and_fail_closed_evidence(
     identity, relay_status, attempted, error_code, tmp_path, _bound, monkeypatch
 ):
-    from tools import browser_tool
+    from tools import browser_tool, browser_tool_install as browser_install
 
     profile_home = (
         tmp_path
@@ -941,7 +943,7 @@ def test_runtime_probe_returns_safe_profile_and_fail_closed_evidence(
     )
     monkeypatch.setattr(server, "get_hermes_home", lambda: profile_home)
     monkeypatch.setattr(
-        browser_tool,
+        browser_install,
         "_find_agent_browser",
         lambda: (_ for _ in ()).throw(AssertionError("host browser action")),
     )
@@ -1069,7 +1071,7 @@ def test_runtime_probe_rejects_noncanonical_relay_status_v2(
 def test_runtime_probe_evaluates_lost_surface_independently(
     tmp_path, _bound, monkeypatch
 ):
-    from tools import browser_tool
+    from tools import browser_tool, browser_tool_install as browser_install
 
     identity = WheelbaseIdentity(
         user_id="user-aaaa",
@@ -1081,7 +1083,7 @@ def test_runtime_probe_evaluates_lost_surface_independently(
     )
     monkeypatch.setattr(server, "get_hermes_home", lambda: tmp_path)
     monkeypatch.setattr(
-        browser_tool,
+        browser_install,
         "_find_agent_browser",
         lambda: (_ for _ in ()).throw(AssertionError("host browser action")),
     )
@@ -1183,7 +1185,7 @@ def test_ephemeral_tasks_clear_only_their_per_task_registries(
     import sys
     import types
 
-    from tools import browser_tool, terminal_tool
+    from tools import browser_tool, browser_tool_cdp as browser_cdp, terminal_tool
     from tui_gateway.wheelbase_inject import apply_session_injection
 
     monkeypatch.setenv("TERMINAL_ENV", "docker")
@@ -1286,7 +1288,7 @@ def test_ephemeral_tasks_clear_only_their_per_task_registries(
         ephemeral_task = response["result"]["task_id"]
 
         assert wb_runtime.get_task_identity(ephemeral_task) is None
-        assert ephemeral_task not in browser_tool._task_cdp_urls
+        assert ephemeral_task not in browser_cdp._task_cdp_urls
         assert ephemeral_task not in terminal_tool._task_env_overrides
         assert ephemeral_task not in terminal_tool._session_cwd
 
@@ -1298,8 +1300,8 @@ def test_ephemeral_tasks_clear_only_their_per_task_registries(
 
         assert wb_runtime.get_task_identity(parent_task) == parent_identity
         assert wb_runtime.get_task_identity(sibling_task) == sibling_identity
-        assert browser_tool._task_cdp_urls[parent_task] == parent_wb.cdp_url
-        assert browser_tool._task_cdp_urls[sibling_task] == sibling_wb.cdp_url
+        assert browser_cdp._task_cdp_urls[parent_task] == parent_wb.cdp_url
+        assert browser_cdp._task_cdp_urls[sibling_task] == sibling_wb.cdp_url
         assert terminal_tool._task_env_overrides[parent_task] == parent_terminal
         assert terminal_tool._task_env_overrides[sibling_task] == sibling_terminal
         assert wb_runtime.current_identity() == parent_identity

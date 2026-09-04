@@ -1,7 +1,6 @@
-"""Coverage for the Wheelbase/upstream hermes_state.py merge (schema v26).
+"""Coverage for the Wheelbase/upstream hermes_state.py merge (schema v26 policy).
 
-Both branches happened to land on ``SCHEMA_VERSION = 26`` independently, with
-different content: Wheelbase's own v26 dropped the UNIQUE title index and
+Wheelbase's v26 policy dropped the UNIQUE title index and
 added a plain lookup index; upstream's v26 added title provenance
 (``title_source``), hidden sessions, ``git_metadata_generation``, and two new
 tables (``gateway_hygiene_state``, ``session_turn_leases``). The merge keeps
@@ -22,7 +21,8 @@ from unittest.mock import patch
 
 import pytest
 
-from hermes_state import SCHEMA_VERSION, SessionDB
+from hermes_state import SessionDB
+from hermes_state_common import SCHEMA_VERSION
 
 
 @pytest.fixture
@@ -35,8 +35,8 @@ def db(tmp_path):
 
 
 class TestWheelbaseV26Reconciliation:
-    """Reopening a real pre-merge Wheelbase-v26 store must reconcile in
-    upstream's additions even though the stamped schema_version never moves.
+    """Reopening a real pre-merge Wheelbase-v26 store must reconcile the
+    upstream additions even when its stamped version is already 26.
     """
 
     def test_reopening_a_real_wheelbase_v26_store_reconciles_upstream_additions(
@@ -61,16 +61,15 @@ class TestWheelbaseV26Reconciliation:
             version = conn.execute(
                 "SELECT version FROM schema_version"
             ).fetchone()[0]
-            assert version == 26 == SCHEMA_VERSION
+            assert version == SCHEMA_VERSION
+            conn.execute("UPDATE schema_version SET version = 26")
             for column in ("title_source", "hidden", "git_metadata_generation"):
                 conn.execute(f"ALTER TABLE sessions DROP COLUMN {column}")
             for table in ("gateway_hygiene_state", "session_turn_leases"):
                 conn.execute(f"DROP TABLE IF EXISTS {table}")
             conn.commit()
-            # schema_version is left at 26 throughout. The crux of this test:
-            # a version-gated migration block (`if current_version < 26`)
-            # would NOT fire on reopen, because the stamped version already
-            # reads 26 -- reconciliation must not depend on that gate.
+            # The simulated pre-merge store is stamped v26. Reconciliation of
+            # the missing columns/tables must not depend on a later version gate.
 
         reopened = SessionDB(db_path=db_path)
         try:
@@ -110,11 +109,9 @@ class TestWheelbaseV26Reconciliation:
                 "newer": "Dealership Assistance Inquiry",
             }
 
-            # The version number itself never had to move: both sides already
-            # called their (different-content) schema v26.
             assert (
                 conn.execute("SELECT version FROM schema_version").fetchone()[0]
-                == 26
+                == SCHEMA_VERSION
             )
 
             # Both rows must still be usable through the normal API.
