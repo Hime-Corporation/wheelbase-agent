@@ -168,8 +168,10 @@ class TestExecuteCodeRemoteTempDir(unittest.TestCase):
 
             def execute(self, command, cwd=None, timeout=None):
                 self.commands.append((command, cwd, timeout))
-                if "command -v python3" in command:
-                    return {"output": "OK\n"}
+                if "python3 -c" in command:
+                    # Real-interpreter probe (_probe_python3) — see
+                    # code_execution_tool.py's _PYTHON3_PROBE_MARKER.
+                    return {"output": "HERMES_PY3_OK3\n"}
                 if "python3 script.py" in command:
                     return {"output": "hello\n", "returncode": 0}
                 return {"output": ""}
@@ -211,8 +213,10 @@ class TestExecuteCodeRemoteTempDir(unittest.TestCase):
 
             def execute(self, command, cwd=None, timeout=None):
                 self.commands.append((command, cwd, timeout))
-                if "command -v python3" in command:
-                    return {"output": "OK\n"}
+                if "python3 -c" in command:
+                    # Real-interpreter probe (_probe_python3) — see
+                    # code_execution_tool.py's _PYTHON3_PROBE_MARKER.
+                    return {"output": "HERMES_PY3_OK3\n"}
                 if "python3 script.py" in command:
                     return {"output": "hello\n", "returncode": 0}
                 return {"output": ""}
@@ -789,8 +793,10 @@ class TestHeadTailTruncation(unittest.TestCase):
 
             def execute(self, command, cwd=None, timeout=None):
                 self.commands.append((command, cwd, timeout))
-                if "command -v python3" in command:
-                    return {"output": "OK\n"}
+                if "python3 -c" in command:
+                    # Real-interpreter probe (_probe_python3) — see
+                    # code_execution_tool.py's _PYTHON3_PROBE_MARKER.
+                    return {"output": "HERMES_PY3_OK3\n"}
                 if "python3 script.py" in command:
                     return {"output": "HEAD\n" + ("x" * 80_000) + "\nTAIL\n", "returncode": 0}
                 return {"output": ""}

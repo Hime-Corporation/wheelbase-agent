@@ -230,6 +230,7 @@ def _spawn_remote_kernel(env, env_type: str, owner: str, task_env_id: str,
         MAX_STDOUT_BYTES,
         _ship_file_to_remote,
         _env_temp_dir,
+        _probe_python3,
         generate_hermes_tools_module,
     )
     import secrets as _secrets
@@ -237,6 +238,24 @@ def _spawn_remote_kernel(env, env_type: str, owner: str, task_env_id: str,
     kernel_dir = f"{_env_temp_dir(env)}/hermes_rkernel_{uuid.uuid4().hex[:12]}"
     q_dir = shlex.quote(kernel_dir)
     try:
+        # Same CLT-stub trap _execute_remote's top-level check guards against
+        # (see _probe_python3's docstring) — this call is normally only
+        # reached after that check already passed, but a bare `nohup ...
+        # python3 kernel_runner.py &` backgrounded like this would otherwise
+        # report a PID (from `echo PID:$!`, which fires regardless of whether
+        # python3 itself ever ran) and only fail the later liveness probe,
+        # burning a spawn attempt on a host that can never run it. Cheap
+        # enough to re-check here too rather than trust the caller forever.
+        py3_ok, py3_detail = _probe_python3(env)
+        if not py3_ok:
+            logger.warning(
+                "remote kernel spawn skipped: python3 did not run in %s "
+                "(probe output: %s). On macOS this usually means Xcode "
+                "Command Line Tools are missing.",
+                env_type, py3_detail.strip()[:200] or "no output",
+            )
+            return None
+
         env.execute(f"mkdir -p {q_dir}/cells {q_dir}/rpc", cwd="/", timeout=15)
 
         rpc_token = _secrets.token_urlsafe(32)

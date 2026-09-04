@@ -1208,6 +1208,35 @@ def _finish_remote_kernel_result(kernel_result: Dict[str, Any], *,
     return json.dumps(result, ensure_ascii=False)
 
 
+# Marker printed by _probe_python3's one-liner. Grepped for verbatim by
+# tests that script a fake remote env's execute() — keep the two in sync.
+_PYTHON3_PROBE_MARKER = "HERMES_PY3_OK"
+
+
+def _probe_python3(env, *, timeout: int = 15) -> tuple[bool, str]:
+    """Actually run python3 on *env* rather than merely checking it's on PATH.
+
+    The old probe was ``command -v python3 >/dev/null 2>&1 && echo OK``. On a
+    stock macOS host with no Xcode Command Line Tools installed,
+    ``/usr/bin/python3`` still exists on PATH — it's Apple's CLT stub, which
+    is enough to make ``command -v`` succeed even though invoking it for real
+    pops the "install the command line developer tools" GUI dialog instead of
+    running. The old probe reported "OK" in exactly that situation, and the
+    real run further down (``python3 script.py``) then hung on that dialog
+    with no Python traceback to explain why. Exit status alone can't be
+    trusted to catch this either (the stub's own exit behavior when a dialog
+    is pending is not a clean, reliable failure) — only the presence of our
+    marker in stdout proves a real interpreter executed.
+    """
+    probe = env.execute(
+        f'python3 -c "import sys; print(\'{_PYTHON3_PROBE_MARKER}\' + '
+        'str(sys.version_info[0]))"',
+        cwd="/", timeout=timeout,
+    )
+    output = probe.get("output", "") or ""
+    return (f"{_PYTHON3_PROBE_MARKER}3" in output), output
+
+
 def _execute_remote(
     code: str,
     task_id: Optional[str],
@@ -1248,18 +1277,23 @@ def _execute_remote(
     rpc_thread = None
 
     try:
-        # Verify Python is available on the remote
-        py_check = env.execute(
-            "command -v python3 >/dev/null 2>&1 && echo OK",
-            cwd="/", timeout=15,
-        )
-        if "OK" not in py_check.get("output", ""):
+        # Verify python3 actually RUNS on the remote, not just that it's on
+        # PATH — see _probe_python3's docstring for the macOS CLT-stub trap
+        # a plain `command -v python3` probe falls into.
+        py3_ok, py3_probe_output = _probe_python3(env)
+        if not py3_ok:
+            detail = py3_probe_output.strip()[:200] or "no output"
             return json.dumps({
                 "status": "error",
                 "error": (
-                    f"Python 3 is not available in the {env_type} terminal "
-                    "environment. Install Python to use execute_code with "
-                    "remote backends."
+                    f"python3 did not actually run in the {env_type} "
+                    f"terminal environment (probe output: {detail}). On "
+                    "macOS this usually means Xcode Command Line Tools are "
+                    "missing: the stock /usr/bin/python3 is a stub that "
+                    "satisfies `command -v python3` but pops an install "
+                    "dialog instead of running. Run `xcode-select --install`"
+                    ", or point Hermes at a real python3 (e.g. via pyenv or "
+                    "Homebrew), to use execute_code with remote backends."
                 ),
                 "tool_calls_made": 0,
                 "duration_seconds": 0,

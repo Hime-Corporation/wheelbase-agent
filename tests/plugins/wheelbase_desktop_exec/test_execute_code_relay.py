@@ -142,7 +142,11 @@ def test_execute_code_restores_previous_cache_entry_after_call(monkeypatch):
     assert _active_environments[key] is sentinel
 
 
-def test_execute_code_cleanup_closes_transport(monkeypatch):
+def test_execute_code_cleanup_does_not_close_the_shared_transport(monkeypatch):
+    # The transport is now cached per (task_id, relay_url) and reused across
+    # calls (see __init__.py's cache above _make_transport) — env.cleanup()
+    # in the finally block must NOT close it just because ONE call finished,
+    # or every later call for this task would find a dead connection.
     ft = FakeTransport()
     monkeypatch.setattr(plug, "_make_transport", lambda url, ident: ft)
     _stub_execute(monkeypatch)
@@ -154,7 +158,7 @@ def test_execute_code_cleanup_closes_transport(monkeypatch):
         tool_name="execute_code", args={"code": "1"}, next_call=nc,
         task_id="t-desk", tool_call_id="e4",
     )
-    assert ft.closed is True
+    assert ft.closed is False
 
 
 def test_execute_code_cleanup_runs_even_if_next_call_raises(monkeypatch):
@@ -173,7 +177,9 @@ def test_execute_code_cleanup_runs_even_if_next_call_raises(monkeypatch):
             tool_name="execute_code", args={"code": "1"}, next_call=nc,
             task_id="t-desk", tool_call_id="e5",
         )
-    assert ft.closed is True
+    # An unrelated crash in the built-in handler says nothing about the
+    # transport's health — it stays cached (and open) for the next call.
+    assert ft.closed is False
     assert key not in _active_environments
 
 
@@ -325,10 +331,13 @@ def test_execute_code_repeated_tool_call_id_returns_cached_result_no_second_run(
     assert transport_calls["n"] == 1    # second call never even built a transport
 
 
-def test_execute_code_active_environments_never_holds_a_dead_env_after_call(monkeypatch):
+def test_execute_code_active_environments_never_holds_a_stale_env_after_call(monkeypatch):
     # After a call completes, the shared cache must either be empty for this
-    # key or hold a live env — never the closed/dead env this call itself
-    # cleaned up.
+    # key or hold a live env — never the one-shot env wrapper this call
+    # injected (its transport is shared/cache-owned now, so it is never
+    # "closed" the way it used to be — see
+    # test_execute_code_cleanup_does_not_close_the_shared_transport — but the
+    # wrapper itself must still not linger in _active_environments).
     from tools.terminal_tool import _active_environments, _resolve_container_task_id
 
     key = _resolve_container_task_id("t-desk")
@@ -343,12 +352,12 @@ def test_execute_code_active_environments_never_holds_a_dead_env_after_call(monk
         tool_name="execute_code", args={"code": "1"}, next_call=nc,
         task_id="t-desk", tool_call_id="dead-env-1",
     )
-    # No prior entry -> popped clean; the closed-transport env is not cached.
+    # No prior entry -> popped clean; our injected env is not left cached.
     assert key not in _active_environments
-    assert ft.closed is True
+    assert ft.closed is False
 
     # Repeat with a real prior entry: it must come back untouched (still
-    # live), not get clobbered by our (now-closed) injected env.
+    # live), not get clobbered by our injected env.
     class _PriorEnv:
         pass
 
@@ -360,6 +369,6 @@ def test_execute_code_active_environments_never_holds_a_dead_env_after_call(monk
             task_id="t-desk", tool_call_id="dead-env-2",
         )
         assert _active_environments[key] is prior_env  # untouched, still live
-        assert ft.closed is True
+        assert ft.closed is False
     finally:
         _active_environments.pop(key, None)

@@ -7,9 +7,19 @@ user's machine. Mobile-origin users (no relay URL) use the sandboxed cloud
 path; desktop-origin users with a missing/dead relay fail closed. Zero
 upstream-core edits.
 
+All calls for a given (task_id, relay_url) share ONE transport, cached at
+module scope (see the cache above ``_make_transport``) — not a fresh dial
+per call. A stale/closed entry rebuilds transparently on the next call, and
+a send that fails against a cached entry (never reached the desktop) is
+retried once against a freshly built one.
+
 All 7 built-in tools route to the desktop when a relay url is present:
   * terminal/process        → ``_relay_command`` (bash `exec` frame).
-  * read_file/write_file    → ``_relay_file`` (`read`/`write` frames).
+  * write_file, and read_file for ordinary text → ``_relay_file`` (`read`/
+    `write` frames). read_file for a structured document (.ipynb/.docx/.xlsx
+    — ``tools/read_extract.py``'s EXTRACTABLE_EXTENSIONS) goes through
+    ``_relay_read_extract`` instead: the raw `read` frame does a UTF-8
+    decode on the sidecar, which turns a ZIP-based document into mojibake.
   * patch/search_files       → ``_relay_file_ops``: wraps a
     ``DesktopRelayEnvironment`` in the same ``ShellFileOperations`` the
     built-in tools use, so the fuzzy-match/rg/grep logic runs unchanged and
@@ -42,6 +52,7 @@ from __future__ import annotations
 
 import json
 import logging
+from collections import OrderedDict
 from typing import Any, Callable
 
 logger = logging.getLogger(__name__)
@@ -352,6 +363,136 @@ def _make_transport(relay_url: str, identity: dict):
     return WebsocketExecTransport(relay_url, identity)
 
 
+# Shared relay-transport cache: one WebSocket per (task_id, relay_url)
+# instead of one per relayed tool call.
+#
+# Before this, _relay and _relay_execute_code each called _make_transport()
+# on EVERY call. Two defects followed: (a) _relay had no `finally` on its
+# success path, so a relayed terminal/read_file/write_file/patch/search_files
+# call that succeeded never closed the socket it opened — every one leaked a
+# WebSocket plus its ws_transport.py reader thread. (b) the Go ExecHub's
+# GatewayConnect allows exactly ONE gateway connection per desktop and evicts
+# whatever was there before with a bare Close() and no close handshake
+# (agent_exec.go GatewayConnect) the instant a second dial arrives for the
+# same desktop — so two back-to-back relayed calls for the same task raced
+# their own transports into existence, and the loser's connection died
+# mid-flight with "no close frame was received or sent" (surfaced at
+# ws_transport.py's send() as "desktop exec relay send failed: ..."). This
+# was a real reported production symptom, not a theoretical one.
+#
+# WebsocketExecTransport was already built to multiplex — its reader thread
+# buckets frames by request_id (see ws_transport.py) — specifically so more
+# than one in-flight request can share a connection. The fix is to actually
+# do that: hand out the SAME transport to every call for a given
+# (task_id, relay_url) instead of dialing a new one each time.
+#
+# No task-teardown hook exists to close a task's transport the moment its
+# desktop session ends — checked wheelbase_sdk.runtime (set_task_identity /
+# release_task / clear_task) and hermes_cli.plugins.VALID_HOOKS; nothing
+# fires per-task-id on release that a plugin can register against. Rather
+# than invent one, eviction here is bounded instead: an evict-oldest cap
+# closes the least-recently-used connection once the process is juggling
+# _MAX_TRANSPORT_CACHE of them, the same shape as the _result_cache above.
+_transport_cache: "OrderedDict[tuple[str, str], Any]" = OrderedDict()
+_transport_cache_lock = threading.Lock()
+_MAX_TRANSPORT_CACHE = 64
+
+
+def _acquire_transport(task_id: str, relay_url: str, identity: dict) -> tuple[Any, bool]:
+    """Return (transport, from_cache) for (task_id, relay_url).
+
+    Reuses a live cached transport when one exists. "Live" means its
+    ``_closed`` flag is not set — WebsocketExecTransport sets that in
+    close(); FakeTransport in tests has no such attribute, so a missing flag
+    is treated as live via getattr's default. A closed entry is evicted here
+    so the fresh build below replaces it under the same key rather than
+    piling up a second entry.
+    """
+    key = (task_id, relay_url)
+    with _transport_cache_lock:
+        cached = _transport_cache.get(key)
+        if cached is not None:
+            if not getattr(cached, "_closed", False):
+                _transport_cache.move_to_end(key)
+                return cached, True
+            del _transport_cache[key]
+    transport = _make_transport(relay_url, identity)
+    _store_transport(task_id, relay_url, transport)
+    return transport, False
+
+
+def _store_transport(task_id: str, relay_url: str, transport: Any) -> None:
+    """Cache *transport* under (task_id, relay_url), evicting (and closing)
+    the least-recently-used entry once _MAX_TRANSPORT_CACHE is exceeded —
+    see the module cache's docstring above for why eviction is size-bounded
+    rather than hung off a task-teardown event that does not exist."""
+    key = (task_id, relay_url)
+    evicted: list[Any] = []
+    with _transport_cache_lock:
+        _transport_cache[key] = transport
+        _transport_cache.move_to_end(key)
+        while len(_transport_cache) > _MAX_TRANSPORT_CACHE:
+            _, old = _transport_cache.popitem(last=False)
+            evicted.append(old)
+    for old in evicted:
+        try:
+            old.close()
+        except Exception:
+            pass
+
+
+def _evict_transport(task_id: str, relay_url: str) -> None:
+    """Drop and close the cached transport for (task_id, relay_url), if any.
+
+    Called when a send against a CACHED transport raises PreDispatchError:
+    the connection is dead (evicted server-side, or dropped without us
+    noticing) and must never be handed to a later call under this key."""
+    key = (task_id, relay_url)
+    with _transport_cache_lock:
+        transport = _transport_cache.pop(key, None)
+    if transport is not None:
+        try:
+            transport.close()
+        except Exception:
+            pass
+
+
+class _SendCountingTransport:
+    """Wrap a transport to record whether ANY frame reached the wire.
+
+    The retry below is only sound when NOTHING was dispatched. For a
+    single-frame tool (terminal/read_file/write_file) a PreDispatchError is
+    proof of that on its own. It is NOT for patch/search_files: those run
+    through ShellFileOperations, which issues several exec frames over one
+    transport, so a failure on the third send says nothing about the two that
+    already executed on the user's machine. Re-running the whole operation
+    there would re-execute real side effects, which is exactly the M4
+    guarantee this plugin is built around.
+
+    Counting AFTER the inner send returns is deliberate: a send that raised
+    never reached the desktop and must not be counted.
+    """
+
+    def __init__(self, inner):
+        self._inner = inner
+        self.sends_completed = 0
+
+    def send(self, frame):
+        self._inner.send(frame)
+        self.sends_completed += 1
+
+    def recv(self, request_id, timeout=None):
+        return self._inner.recv(request_id, timeout=timeout)
+
+    def close(self):
+        self._inner.close()
+
+    def __getattr__(self, name):
+        # Anything else (notably the _closed liveness flag) reads through to
+        # the real transport.
+        return getattr(self._inner, name)
+
+
 def _tool_error(message: str) -> str:
     return json.dumps({"output": "", "returncode": 1, "exit_code": 1,
                        "status": "error", "error": message}, ensure_ascii=False)
@@ -442,33 +583,70 @@ def _relay(tool_name, args, relay_url, identity, next_call, *,
 
     from .transport import PreDispatchError
 
+    def _dispatch(transport) -> str:
+        if tool_name in ("patch", "search_files"):
+            # NOT _relay_file/_relay_command: their arg extraction (path/data,
+            # command/cmd) does not match patch's mode/old_string/new_string/
+            # patch args or search_files' pattern/target/output_mode args.
+            return _relay_file_ops(tool_name, args, transport, identity,
+                                   task_id=task_id)
+        if tool_name in _SHELL_FAMILY:
+            return _relay_command(tool_name, args, transport, identity)
+        if tool_name == "read_file" and _is_extractable_read(args):
+            # .ipynb/.docx/.xlsx: the raw `read` frame below does a UTF-8
+            # decode on the sidecar, which turns a ZIP-based document into
+            # mojibake. Route these through the same ShellFileOperations
+            # machinery patch/search_files use instead, whose
+            # read_file_bytes speaks base64-over-exec-frame. A None return
+            # means the extraction attempt hit one of read_file_tool's own
+            # non-actionable fallthrough cases (see _relay_read_extract) —
+            # fall back to the raw frame exactly like the built-in falls
+            # through to its normal read path in the same situation.
+            extracted = _relay_read_extract(args, transport, identity)
+            if extracted is not None:
+                return extracted
+        return _relay_file(tool_name, args, transport, identity)
+
     try:
-        transport = _make_transport(relay_url, identity)
+        transport, from_cache = _acquire_transport(task_id, relay_url, identity)
     except PreDispatchError as exc:
-        try:
-            transport.close()
-        except Exception:
-            pass
         return _desktop_unavailable(str(exc))
     except Exception as exc:
         logger.warning("relay transport build failed: %s", exc)
         return _desktop_unavailable(str(exc))
 
     relay_ok = False
+    counting = _SendCountingTransport(transport)
     try:
-        if tool_name in ("patch", "search_files"):
-            # NOT _relay_file/_relay_command: their arg extraction (path/data,
-            # command/cmd) does not match patch's mode/old_string/new_string/
-            # patch args or search_files' pattern/target/output_mode args.
-            result = _relay_file_ops(tool_name, args, transport, identity,
-                                     task_id=task_id)
-        elif tool_name in _SHELL_FAMILY:
-            result = _relay_command(tool_name, args, transport, identity)
-        else:
-            result = _relay_file(tool_name, args, transport, identity)
+        result = _dispatch(counting)
         relay_ok = True
     except PreDispatchError as exc:
-        return _desktop_unavailable(str(exc))
+        if from_cache and counting.sends_completed == 0:
+            # Nothing reached the desktop on this attempt, so rebuilding and
+            # re-sending exactly once is safe. This is the retry _relay never
+            # had before the shared cache existed: per-call transports could
+            # never go stale mid-task, but a transport now outlives many calls,
+            # and the Go ExecHub can evict it from under us at any time (see
+            # the cache's module docstring above _make_transport).
+            #
+            # The sends_completed guard is what makes that claim true for
+            # patch/search_files, which issue SEVERAL frames over one transport
+            # -- see _SendCountingTransport. Contrast with a POST-dispatch
+            # failure (the `except Exception` below): that command may already
+            # have run on the desktop, so it is NEVER retried (M4).
+            _evict_transport(task_id, relay_url)
+            try:
+                transport = _make_transport(relay_url, identity)
+                _store_transport(task_id, relay_url, transport)
+                result = _dispatch(transport)
+                relay_ok = True
+            except PreDispatchError as exc2:
+                return _desktop_unavailable(str(exc2))
+            except Exception as exc2:
+                logger.warning("relay post-dispatch failure for %s: %s", tool_name, exc2)
+                result = _desktop_unavailable(str(exc2))
+        else:
+            return _desktop_unavailable(str(exc))
     except Exception as exc:
         # Post-dispatch failure: return a tool error, NEVER re-dispatch (M4).
         logger.warning("relay post-dispatch failure for %s: %s", tool_name, exc)
@@ -514,6 +692,10 @@ def _relay_command(tool_name, args, transport, identity) -> str:
         cwd=_relay_cwd(identity),
         timeout=int(args.get("timeout") or 120),
         workspace_root=identity.get("workspace_root") or "",
+        # transport is the module-level cache's shared connection, not this
+        # call's own — this short-lived env wrapper must never close it
+        # (see DesktopRelayEnvironment.__init__'s _owns_transport comment).
+        owns_transport=False,
     )
     env._snapshot_ready = True  # desktop shell is already a login shell
     command = _extract_command(tool_name, args)
@@ -550,6 +732,134 @@ def _relay_file(tool_name, args, transport, identity) -> str:
                       ensure_ascii=False)
 
 
+def _is_extractable_read(args: dict) -> bool:
+    """True when a read_file call's path is one of read_extract.py's
+    EXTRACTABLE_EXTENSIONS (.ipynb/.docx/.xlsx)."""
+    from pathlib import Path
+
+    from tools.read_extract import EXTRACTABLE_EXTENSIONS
+
+    return Path(_file_path(args)).suffix.lower() in EXTRACTABLE_EXTENSIONS
+
+
+def _relay_read_extract(args: dict, transport, identity: dict) -> str | None:
+    """Route an extractable-document read_file call through the SAME
+    ShellFileOperations machinery patch/search_files use (_relay_file_ops),
+    mirroring read_file_tool's own extraction stage exactly
+    (tools/file_tools.py read_file_tool, the "Structured-document
+    extraction" block ~1661-1758).
+
+    _relay_file's raw `read` frame asks the sidecar for ``Bun.file(path)
+    .text()`` — a UTF-8 decode. A .docx/.xlsx is a ZIP container, so that
+    decode turns it into mojibake instead of readable text (confirmed
+    user-facing bug). ``ShellFileOperations.read_file_bytes`` already speaks
+    base64-over-exec-frame (the same machinery _relay_file_ops uses for
+    patch/search_files), and ``tools.read_extract.extract_document_bytes``
+    is pure stdlib zipfile/ElementTree with no environment dependency at
+    all — so the only new plumbing this needs is fetching the bytes over the
+    relay; the extraction/pagination/truncation logic itself is copied
+    verbatim from the built-in so the model reads identical output whether
+    the read ran locally or through the desktop relay.
+
+    Returns ``None`` when extraction hit one of read_file_tool's own
+    non-actionable fallthrough cases (a ValueError/binascii transport
+    hiccup, a generic non-actionable ExtractionError, or a malformed
+    .ipynb) — the built-in falls through to its normal raw-read path in
+    exactly those cases (Python's ``try/except`` with no matching ``return``
+    inside the ``except`` continues past the whole block), so the caller
+    here does the same by falling back to ``_relay_file``.
+    """
+    import base64 as _b64
+    from pathlib import Path
+
+    from .relay_env import DesktopRelayEnvironment
+    from tools.file_operations import ShellFileOperations, normalize_read_pagination
+    from tools.file_tools import _get_max_read_chars, _truncate_to_char_budget
+    from tools.read_extract import (
+        ANYDOC_EXTENSIONS, EXTRACTABLE_EXTENSIONS, MAX_DOCUMENT_BYTES,
+        ExtractionError, extract_document_bytes,
+    )
+    from agent.redact import redact_sensitive_text
+
+    path = _file_path(args)
+    offset, limit = normalize_read_pagination(args.get("offset", 1), args.get("limit", 500))
+
+    env = DesktopRelayEnvironment(
+        transport=transport,
+        cwd=_relay_cwd(identity),
+        timeout=int(args.get("timeout") or 120),
+        workspace_root=identity.get("workspace_root") or "",
+        owns_transport=False,  # shared cache owns it — see _relay_command
+    )
+    env._snapshot_ready = True  # desktop shell is already a login shell
+    fileops = ShellFileOperations(env)
+
+    binary = fileops.read_file_bytes(path, max_bytes=MAX_DOCUMENT_BYTES)
+    try:
+        if binary.error or binary.base64_content is None:
+            raise ExtractionError(binary.error or "Document bytes unavailable")
+        document_bytes = _b64.b64decode(binary.base64_content, validate=True)
+        extracted_text = extract_document_bytes(document_bytes, path)
+    except (ExtractionError, ValueError, _b64.binascii.Error) as exc:
+        doc_ext = Path(path).suffix.lower()
+        binary_doc = doc_ext in ANYDOC_EXTENSIONS or (
+            doc_ext in EXTRACTABLE_EXTENSIONS and doc_ext != ".ipynb"
+        )
+        if (
+            binary_doc
+            and isinstance(exc, ExtractionError)
+            and not str(exc).startswith("Unsupported document type")
+        ):
+            return _patch_tool_error(
+                f"Cannot read '{path}' ({doc_ext}): document extraction "
+                f"failed — {exc}. Use terminal utilities to inspect or "
+                "convert the file."
+            )
+        return None
+
+    lines = extracted_text.splitlines()
+    total_lines = len(lines)
+    end_line = offset + limit - 1
+    page_text = "\n".join(lines[offset - 1:end_line])
+    result_dict = {
+        "content": fileops._add_line_numbers(page_text, offset) if page_text else "",
+        "total_lines": total_lines,
+        "file_size": binary.file_size,
+        "truncated": total_lines > end_line,
+        "extracted_document": True,
+    }
+    if result_dict["truncated"]:
+        result_dict["hint"] = (
+            f"Use offset={end_line + 1} to continue reading "
+            f"(showing {offset}-{min(end_line, total_lines)} of {total_lines} lines)"
+        )
+    content_len = len(result_dict["content"])
+    max_chars = _get_max_read_chars()
+    if content_len > max_chars:
+        trimmed, lines_kept, _ = _truncate_to_char_budget(result_dict["content"], max_chars)
+        next_offset = offset + lines_kept
+        shown_end = offset + lines_kept - 1
+        result_dict["content"] = trimmed
+        result_dict["truncated"] = True
+        result_dict["truncated_by"] = "bytes"
+        result_dict["next_offset"] = next_offset
+        result_dict["hint"] = (
+            f"Output truncated at the {max_chars:,}-char read budget "
+            f"after {lines_kept} line(s) (showing lines {offset}-"
+            f"{shown_end} of {total_lines}). Use offset={next_offset} "
+            "to continue."
+        )
+        if len(trimmed.split("\n", 1)[0]) >= max_chars:
+            result_dict["hint"] += (
+                " Note: the first line alone exceeded the budget and "
+                "was clamped mid-line; its remainder is not "
+                "retrievable via offset."
+            )
+    if result_dict["content"]:
+        result_dict["content"] = redact_sensitive_text(result_dict["content"], file_read=True)
+    return json.dumps(result_dict, ensure_ascii=False)
+
+
 def _patch_tool_error(message: str) -> str:
     """Same envelope shape as ``tools.registry.tool_error`` (single ``error``
     key, no ``success``/``status``) — matches ``patch_tool``'s validation-error
@@ -575,6 +885,7 @@ def _relay_file_ops(tool_name, args, transport, identity, *, task_id="") -> str:
         cwd=_relay_cwd(identity),
         timeout=int(args.get("timeout") or 120),
         workspace_root=identity.get("workspace_root") or "",
+        owns_transport=False,  # shared cache owns it — see _relay_command
     )
     env._snapshot_ready = True  # desktop shell is already a login shell
     fileops = ShellFileOperations(env)
@@ -726,8 +1037,24 @@ def _relay_execute_code(args, relay_url, identity, next_call, *, task_id, tool_c
 
     from .transport import PreDispatchError
 
+    # Shared transport (same cache _relay uses — see the module docstring
+    # above _make_transport). Unlike _relay, a mid-call send failure here
+    # cannot be retried-once against a fresh transport: the built-in
+    # execute_code handler (tools/code_execution_tool.py's _execute_remote)
+    # already wraps its own env.execute() calls in a blanket
+    # `except Exception` that converts ANY failure, including a
+    # PreDispatchError raised from a stale send, into a normal
+    # {"status": "error", ...} return — so by the time control comes back to
+    # next_call() below, there is nothing left here to catch and retry
+    # without editing that upstream handler (which this plugin's design
+    # forbids — see the module docstring's "Zero upstream-core edits"). The
+    # `_closed`-flag check in _acquire_transport still protects against
+    # handing out a transport that was explicitly closed; a transport that
+    # died silently (send still "succeeds" until the OS notices) self-heals
+    # on the NEXT relayed call for this (task_id, relay_url) — any tool, not
+    # just execute_code — via _relay's retry-and-evict path above.
     try:
-        transport = _make_transport(relay_url, identity)
+        transport, _from_cache = _acquire_transport(task_id, relay_url, identity)
     except PreDispatchError as exc:
         return _desktop_unavailable(str(exc))
     except Exception as exc:
@@ -741,13 +1068,16 @@ def _relay_execute_code(args, relay_url, identity, next_call, *, task_id, tool_c
             cwd=_relay_cwd(identity),
             timeout=int(args.get("timeout") or 120),
             workspace_root=identity.get("workspace_root") or "",
+            # Shared/cached transport, not this call's own — see
+            # DesktopRelayEnvironment's _owns_transport comment. cleanup()
+            # below must not close a connection other calls still need.
+            owns_transport=False,
         )
     except Exception as exc:
+        # Pure Python object construction — this failure has nothing to do
+        # with the transport's health, so the shared cache is left alone for
+        # the next call to keep using it.
         logger.warning("execute_code relay environment build failed: %s", exc)
-        try:
-            transport.close()
-        except Exception:
-            pass
         return _desktop_unavailable(str(exc))
 
     env._snapshot_ready = True  # desktop shell is already a login shell
@@ -795,6 +1125,10 @@ def _relay_execute_code(args, relay_url, identity, next_call, *, task_id, tool_c
                     _active_environments[key] = prev
                 else:
                     _active_environments.pop(key, None)
+        # No-op now that owns_transport=False (the transport is cache-owned
+        # and other calls for this task may still need it) — kept for any
+        # non-transport per-call teardown BaseEnvironment subclasses might
+        # someday add.
         try:
             env.cleanup()
         except Exception:

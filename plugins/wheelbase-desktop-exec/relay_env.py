@@ -22,12 +22,25 @@ class DesktopRelayEnvironment(BaseEnvironment):
     _stdin_mode = "heredoc"
 
     def __init__(self, transport: ExecTransport, cwd: str, timeout: int,
-                 env: dict | None = None, workspace_root: str = ""):
+                 env: dict | None = None, workspace_root: str = "",
+                 owns_transport: bool = True):
         super().__init__(cwd=cwd, timeout=timeout, env=env)
         self._transport = transport
         # Desktop workspace jail root (spec §7.2.1 open item: how the cloud
         # turn learns the intended root — carried in identity for now).
         self._workspace_root = workspace_root or cwd
+        # Whether cleanup() (called explicitly, or from BaseEnvironment.__del__
+        # when THIS short-lived wrapper is garbage-collected) may close
+        # _transport. The plugin now caches one transport per (task_id,
+        # relay_url) and hands it to a FRESH DesktopRelayEnvironment on every
+        # relayed call (see __init__.py's module-level transport cache) — if
+        # cleanup() closed a shared transport by default, the wrapper object
+        # going out of scope at the end of a single tool call would silently
+        # kill the connection out from under every OTHER call still using it.
+        # Callers that build an env around a cache-owned transport MUST pass
+        # owns_transport=False; the cache itself is responsible for closing
+        # it (on eviction or process exit), never a per-call env wrapper.
+        self._owns_transport = owns_transport
 
     @staticmethod
     def _embed_stdin_heredoc(command: str, stdin_data: str) -> str:
@@ -123,6 +136,12 @@ class DesktopRelayEnvironment(BaseEnvironment):
         return _ThreadedProcessHandle(exec_fn, cancel_fn=cancel)
 
     def cleanup(self):
+        if not self._owns_transport:
+            # Shared/cached transport — see __init__'s _owns_transport
+            # comment. Closing it here (including via BaseEnvironment.__del__
+            # when this wrapper is GC'd) would kill a connection other
+            # relayed calls for the same task may still be using.
+            return
         try:
             self._transport.close()
         except Exception:

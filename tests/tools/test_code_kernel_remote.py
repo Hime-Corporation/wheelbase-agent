@@ -58,6 +58,9 @@ def _spawn_ok_handlers(cell_results):
         return {"output": "", "returncode": 0}
 
     return [
+        # _spawn_remote_kernel's own execution probe (see _probe_python3 in
+        # code_execution_tool.py) — must answer before "nohup" is ever sent.
+        ("python3 -c", lambda c: {"output": "HERMES_PY3_OK3\n", "returncode": 0}),
         ("nohup", lambda c: {"output": "PID:4242\n", "returncode": 0}),
         ("kill -0", lambda c: {"output": "ALIVE\n", "returncode": 0}),
         ("cat ", cat_handler),
@@ -120,6 +123,7 @@ class TestSpawnAndReuse(RemoteKernelBase):
 
     def test_spawn_failure_fails_open(self):
         env = ScriptedEnv([
+            ("python3 -c", lambda c: {"output": "HERMES_PY3_OK3\n", "returncode": 0}),
             ("nohup", lambda c: {"output": "sh: cannot fork\n", "returncode": 1}),
         ])
         self.assertIsNone(_run(env))
@@ -163,6 +167,7 @@ class TestDeathDetection(RemoteKernelBase):
     def test_cell_timeout_kills_kernel_and_reports(self):
         # cat never returns a result file → cell deadline expires.
         env = ScriptedEnv([
+            ("python3 -c", lambda c: {"output": "HERMES_PY3_OK3\n", "returncode": 0}),
             ("nohup", lambda c: {"output": "PID:77\n", "returncode": 0}),
             ("kill -0", lambda c: {"output": "ALIVE\n", "returncode": 0}),
             ("cat ", lambda c: {"output": "", "returncode": 0}),
@@ -212,7 +217,7 @@ class TestDispatchIntegration(unittest.TestCase):
             "kernel": {"reused": True, "remote": True, "execution_count": 3},
         }
         env = ScriptedEnv([
-            ("command -v python3", lambda c: {"output": "OK\n", "returncode": 0}),
+            ("python3 -c", lambda c: {"output": "HERMES_PY3_OK3\n", "returncode": 0}),
         ])
         with patch("tools.code_execution_tool._load_config",
                    return_value={"timeout": 30, "max_tool_calls": 5}), \
@@ -230,7 +235,7 @@ class TestDispatchIntegration(unittest.TestCase):
         from unittest.mock import MagicMock
 
         env = ScriptedEnv([
-            ("command -v python3", lambda c: {"output": "OK\n", "returncode": 0}),
+            ("python3 -c", lambda c: {"output": "HERMES_PY3_OK3\n", "returncode": 0}),
             ("python3 script.py", lambda c: {"output": "per-call ran\n",
                                              "returncode": 0}),
         ])
