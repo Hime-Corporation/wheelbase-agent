@@ -163,6 +163,35 @@ class TestCodingContextBlock:
         assert "coding agent" not in _stable_prompt(agent)
 
 
+class TestWheelbaseCanvasProtocolHint:
+    """The merge of upstream/main on 2026-09-04 pasted this inject after a
+    ``return`` in ``_tool_guidance_block``, so the model stopped seeing
+    ``#preview/`` / ``#media:`` schemes. Pin the public builder, not the
+    helper: the hint must land in the stable tier when ``inventory_search``
+    is loaded, and nowhere otherwise.
+    """
+
+    def test_stable_tier_includes_canvas_schemes_when_inventory_search_loaded(self):
+        parts = _prompt_parts(_make_agent(valid_tool_names=["inventory_search"]))
+        stable = parts["stable"]
+        assert "## Wheelbase canvas links" in stable
+        assert "#preview/" in stable
+        assert "#media:" in stable
+        assert "Preview:" in stable
+        assert "## Wheelbase canvas links" not in parts["context"]
+        assert "## Wheelbase canvas links" not in parts["volatile"]
+
+    def test_absent_without_inventory_search(self):
+        stable = _stable_prompt(_make_agent(valid_tool_names=["terminal", "read_file"]))
+        assert "## Wheelbase canvas links" not in stable
+        assert "#preview/" not in stable
+        assert "#media:" not in stable
+
+    def test_byte_stable_across_rebuilds(self):
+        agent = _make_agent(valid_tool_names=["inventory_search"])
+        assert _stable_prompt(agent) == _stable_prompt(agent)
+
+
 class TestExecutionGuidanceInjection:
     """Injection gate for OPENAI_MODEL_EXECUTION_GUIDANCE via
     ``agent.execution_guidance`` (auto/true/false/list).

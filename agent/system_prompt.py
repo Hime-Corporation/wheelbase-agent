@@ -309,18 +309,6 @@ def _tool_guidance_block(agent: Any) -> Optional[str]:
     ]
     return " ".join(g for g in tool_guidance if g) or None
 
-    # Wheelbase canvas protocol — inject when any Wheelbase inventory/work tool
-    # is loaded so the agent knows how to trigger the desktop canvas rail.
-    # Gated on a single stable toolset sentinel (inventory_search) to keep the
-    # check O(1) and byte-stable across sessions. The hint is part of the stable
-    # tier so it is covered by upstream prompt caching.
-    if "inventory_search" in agent.valid_tool_names:
-        stable_parts.append(WHEELBASE_CANVAS_PROTOCOL_HINT)
-
-    # Steering only lands inside tool results, so it's only reachable when the
-    # agent has tools. Static text → byte-stable prompt (no cache hit).
-    if agent.valid_tool_names:
-        stable_parts.append(STEER_CHANNEL_NOTE)
 
 def _skills_prompt(agent: Any) -> str:
     """Skills index (empty without skills tools).  Focus mode demotes non-coding
@@ -533,6 +521,13 @@ def _guidance_parts(agent: Any) -> List[str]:
     parts.append(_tool_guidance_block(agent))  # None/empty entries are dropped by _join_tier
     if not agent.valid_tool_names:
         return parts
+    # Wheelbase canvas protocol — inject when any Wheelbase inventory/work tool
+    # is loaded so the agent knows how to trigger the desktop canvas rail.
+    # Gated on a single stable toolset sentinel (inventory_search) to keep the
+    # check O(1) and byte-stable across sessions. Lives in the stable tier so
+    # it is covered by upstream prompt caching.
+    if "inventory_search" in agent.valid_tool_names:
+        parts.append(WHEELBASE_CANVAS_PROTOCOL_HINT)
     # Steering only lands inside tool results, so only reachable with tools.
     parts.append(STEER_CHANNEL_NOTE)
     # agent.tool_use_enforcement / agent.execution_guidance: "auto" (default)

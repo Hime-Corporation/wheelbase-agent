@@ -276,15 +276,8 @@ async def handle_ws(ws: Any, *, auth_identity: dict | None = None, subprotocol: 
         # separate from upstream's smaller browser-controller auth identity.
         _attach_identity_to_transport(ws, transport)
 
-        # resolve_skin() reads config + initializes the skin engine —
-        # synchronous I/O + CPU work that should not block the event loop
-        # during the cold-start window. Run it in the thread pool so the
-        # WS read loop stays free to drain the frontend's initial RPC
-        # burst (setup.status, session.list, ...) without a stall
-        # (#60800). The skin payload is small (a dict of strings/arrays),
-        # so the to_thread overhead is negligible.
         # resolve_skin() is synchronous I/O + CPU; pooled so the read loop can
-        # drain the frontend's initial RPC burst.
+        # drain the frontend's initial RPC burst (#60800).
         skin_payload = await asyncio.to_thread(server.resolve_skin)
         # change_events: this backend broadcasts pet/cron/sessions.changed, so clients can demote legacy
         # polls to backstops. replay_epoch lets reconnecting clients detect a backend restart and reset

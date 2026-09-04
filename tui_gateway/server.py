@@ -610,21 +610,12 @@ def _profile_scoped(handler):
     """Bind ``params['profile']``'s HERMES_HOME around a handler (pets/projects resolve via
     ``get_hermes_home``, so app-global remote mode still hits the focused profile). No-op for launch.
 
-    Secondary-profile adapters are constructed inside ``_profile_runtime_scope`` (secret scope installed +
-    multiplex active) — the same discriminator the Buzz/SimpleX adapters use for this bug class (#98738).
-    The DEFAULT profile under multiplexing runs unscoped: ``os.environ`` holds its own bridge output there
-    and keeps its legacy precedence.
-    Same discriminator as the Buzz/SimpleX/Raft adapters (#98738): secret scope installed + multiplex
-    active. The DEFAULT profile under multiplexing (and every single-profile process) runs unscoped and
-    keeps its legacy ``os.environ`` precedence.
-    Secondary-profile adapters are constructed, connected, and reloaded inside ``_profile_runtime_scope``
-    (secret scope installed + multiplex active) — the same discriminator as the Discord adapter's
-    ``_profile_scoped_config_load`` (#72348). The DEFAULT profile under multiplexing runs unscoped:
-    ``os.environ`` holds its own bridge output there and keeps its legacy precedence.
-    Secondary-profile adapters are constructed, connected, and reloaded inside ``_profile_runtime_scope``
-    (secret scope installed + multiplex active) — the same discriminator the Buzz/SimpleX adapters use for
-    this bug class (#98738). The DEFAULT profile under multiplexing runs unscoped: ``os.environ`` holds its
-    own bridge output there and keeps its legacy precedence.
+    Secondary-profile adapters are constructed, connected, and reloaded inside
+    ``_profile_runtime_scope`` (secret scope installed + multiplex active) — the
+    same discriminator the Buzz/SimpleX/Raft adapters use for this bug class
+    (#98738, #72348). The DEFAULT profile under multiplexing, and every
+    single-profile process, runs unscoped and keeps its legacy ``os.environ``
+    precedence.
     """
     def wrapper(rid, params):
         home = _profile_home(_request_profile(params))

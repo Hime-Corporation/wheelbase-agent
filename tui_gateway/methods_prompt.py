@@ -972,16 +972,9 @@ def _spawn_side_agent(
     def run():
         wb_cleanup = None
         session_tokens = _set_session_context(task_id, cwd=(cwd or _session_cwd(session)))
-        # Bug #50233: ephemeral agent threads don't inherit the session's HERMES_HOME override (the
-        # ContextVar set on the session-create thread doesn't propagate here), so a background turn under a
-        # non-default profile would run against the wrong home. Re-bind the override for the duration of
-        # this turn, exactly as the normal prompt turn does, and restore it afterward.
-        # Bug #50233: ephemeral preview-restart agent threads don't inherit the session's HERMES_HOME
-        # override (the ContextVar set on the session-create thread doesn't propagate here). Re-bind it for
-        # the duration of the turn, mirroring the normal prompt turn, then restore it. NOTE: we deliberately
-        # do NOT close this agent through task-wide process cleanup — the whole point of preview.restart is
-        # to leave a background server running under this task_id, and AIAgent.close() would kill every
-        # process for the task_id and tear down the very server the restart just started.
+        # Bug #50233: ephemeral agent threads don't inherit the session's HERMES_HOME
+        # override (the ContextVar set on the session-create thread doesn't
+        # propagate here). Re-bind it for the duration of the turn, then restore.
         profile_home = session.get("profile_home")
         home_token = set_hermes_home_override(profile_home) if profile_home else None
         try:

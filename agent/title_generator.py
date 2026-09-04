@@ -299,34 +299,20 @@ def _has_upgraded_title(session_db, session_id: str) -> bool:
 
 
 def _persist_session_title(session_db, session_id, title, *, source, dedupe=True):
-    """Persist at *source* authority via ``set_auto_title`` (precedence check + write in one
-    transaction, so a manual ``/title`` is never overwritten); None when a higher authority held the row.
-    ``ValueError`` = unique-title index collision → append ``#N`` via ``get_next_title_in_lineage``;
-    ``dedupe=False`` re-raises instead (the derived title is on the critical path, collides constantly
-    on "hi", and the model replaces it a second later anyway).
+    """Persist at *source* authority via ``set_auto_title`` (precedence check + write
+    in one transaction, so a manual ``/title`` is never overwritten). Returns the
+    title actually persisted, or None when a higher authority already held the row.
 
-    The write goes through ``set_auto_title`` (precedence check + write in one
-    transaction) so a manual ``/title`` set while generation was in flight is
-    never overwritten; stores without provenance support fall back to
-    ``set_auto_title_if_empty`` and then to a plain ``set_session_title`` for
-    older store adapters. Duplicate titles are legal since schema v26, so the
-    ``ValueError`` path below is only a safety net for a legacy or read-only
-    store that still enforces uniqueness (e.g. one where the v26 unique-index
-    drop could not be applied) — it is not normal Wheelbase behavior: rather
-    than swallow the error and leave the session untitled (#50537), append a
-    ``#N`` suffix via ``get_next_title_in_lineage`` when the store supports
-    lineage dedup; otherwise re-raise so the caller can decide.
+    Duplicate titles are legal since schema v26. The ``ValueError`` path is only a
+    safety net for a legacy or read-only store that still enforces uniqueness —
+    not normal Wheelbase behavior. When ``dedupe=True`` and the store supports
+    lineage, append ``#N`` via ``get_next_title_in_lineage`` rather than leaving
+    the session untitled (#50537). ``dedupe=False`` re-raises; derived titles use
+    that because they sit on the turn's critical path and collide constantly
+    ("hi"), and the model replaces them a second later.
 
-    ``dedupe=False`` re-raises that collision instead. The derived title is the
-    one write on the turn's critical path, and it is also the one that collides
-    constantly — it is a slice of the user's own words, and people open sessions
-    with "hi" and "help me debug this". Scanning the lineage for the next free
-    "hi #N" is a widening scan, run inline, for a name the model replaces a
-    second later. The background stage picks the collision back up, so nothing
-    is lost by declining it here.
-
-    Returns the title actually persisted, or None when a higher-authority
-    title already held the row (nothing was written).
+    Stores without provenance fall back to ``set_auto_title_if_empty`` then
+    ``set_session_title``.
     """
     auto_fn = getattr(session_db, "set_auto_title", None)
 

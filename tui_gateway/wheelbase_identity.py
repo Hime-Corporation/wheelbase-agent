@@ -355,11 +355,12 @@ def remove_credential_file(hermes_home: Path, session_jti_hash: str) -> bool:
 
 
 def _attach_identity_to_transport(ws: Any, transport: Any) -> None:
-    """Capture Wheelbase identity headers from the WS upgrade and attach to transport.
+    """Capture Wheelbase identity from the WS upgrade and attach it to *transport*.
 
-    Sets ``transport.wheelbase_identity`` to a :class:`WheelbaseIdentity` instance
-    when trusted identity headers are present, or ``None`` for legacy/desktop
-    connections.  Always safe: exceptions are caught and produce ``identity=None``.
+    Sets ``transport.wheelbase_identity`` to a :class:`WheelbaseIdentity` when a
+    valid broker envelope is present, or ``None`` for legacy/desktop connections
+    with no envelope. Does not catch: a malformed envelope or independent
+    identity headers raise, and the WS accept fails closed.
     """
     raw_headers = getattr(ws, "headers", None) or {}
     identity = identity_from_headers(raw_headers)

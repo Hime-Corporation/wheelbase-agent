@@ -1,11 +1,12 @@
 # The Wheelbase Fork of hermes-agent
 
 **Audience:** whoever has to carry this fork through the next upstream merge.
-**Last verified:** 2026-07-30, against `HEAD = 82f5eff5f`, with `upstream` freshly
-fetched: `upstream/main = 3a2b33298` (2026-07-30).
+**Last verified:** 2026-09-04, after merging `upstream/main = 13e72fb205`
+(`1c275d17dd`) and restoring the canvas-hint inject that merge dropped.
 
-> ⚠️ **The fork is 3,076 commits behind upstream.** See §3.1 for the conflict map —
-> that section is the one to read before attempting a merge.
+> The 2026-09-04 merge (`1c275d17dd`) caught the fork up to `upstream/main`.
+> It is **0 commits behind**. Re-derive §3.1 with the `comm -12` command below
+> *before* the next merge; the July 30 conflict map is spent.
 
 This document describes **everything Wheelbase has added to or changed in
 `NousResearch/hermes-agent`**. It is derived mechanically from
@@ -21,20 +22,19 @@ merge, use the same command.
 | `origin` | `https://github.com/Hime-Corporation/wheelbase-agent` |
 | `upstream` | `https://github.com/NousResearch/hermes-agent` |
 | Working branch | `wheelbase` (this is the deployed branch; there is no `main` here) |
-| Merge-base with `upstream/main` | `3ef6bbd20` (`chore: release v0.19.0`, 2026-07-20) — the last merge |
-| Current `upstream/main` | `3a2b33298` (2026-07-30) |
-| **Behind upstream by** | **3,076 commits** (4,748 files changed upstream since the merge-base) |
-| Ahead by | **99 commits** |
-| Delta size | **194 files, +22,503 / −1,153 lines** |
+| Merge-base with `upstream/main` | `13e72fb205` (`Merge pull request #102986`, 2026-09-04) — the last merge |
+| Current `upstream/main` | `13e72fb205` (2026-09-04) |
+| **Behind upstream by** | **0 commits** |
+| Ahead by | **148 commits** |
+| Delta size | **280 files, +37,310 / −1,613 lines** |
 
-> A previous version of this doc said "0 behind." That was measured against a
-> **stale cached ref** — `upstream/main` had not been fetched since 2026-07-20, so
-> it was comparing against the commit the last merge already brought in. Always
-> `git fetch upstream --no-tags` before trusting a behind-count.
+> Always `git fetch upstream --no-tags` before trusting a behind-count. A
+> previous version of this doc reported "0 behind" against a stale cached ref;
+> the 2026-09-04 number is against a freshly fetched `upstream/main`.
 
 The vast majority of that delta is **additive** (new files upstream has never
-heard of). Only ~1,400 lines sit inside upstream-owned files — but that small
-slice is where all the merge pain lives. See §3.
+heard of). A few thousand lines still sit inside upstream-owned files — that
+small slice is where all the merge pain lives. See §3.
 
 ### How upstream merges are done here
 
@@ -48,9 +48,10 @@ git commit -m "Merge upstream/main (hermes <sha>) into wheelbase — N-commit ca
 ```
 
 Past merges: `d5c5519ef` (+361), `0d8089290` (+830), `51f1707c0` (+765),
-`98fc7d668` (+888), `a0f133dcb` (+712), and most recently `2d92c6a23`
-(v0.19.0). Merges are **not** rebased — history is preserved so the fork delta
-stays computable from the merge-base.
+`98fc7d668` (+888), `a0f133dcb` (+712), `2d92c6a23` (v0.19.0),
+`0dec985fa` (3a2b33298), `33be7e0c6` (3312947e14), and most recently
+`1c275d17dd` (13e72fb205, 4,557-commit catch-up). Merges are **not** rebased —
+history is preserved so the fork delta stays computable from the merge-base.
 
 Almost every merge has needed a follow-up "reconcile fork tests" commit
 (e.g. `f1b00a6da`, `028061bd7`). Budget for that; it is normal, not a signal
@@ -97,10 +98,11 @@ Two security fixes worth knowing about, both in `profile_router.py`:
 shared `auth.json` fallback without cross-tenant leakage.
 
 This depends on undocumented upstream behaviour.
-`tests/gateway/test_wheelbase_upstream_contracts.py` (174 lines) exists purely
-to pin those behaviours so an upstream merge that changes them fails loudly
+`tests/gateway/test_tenant_auth_fallback.py` pins the walk-up and the shared
+`auth.json` fallback so an upstream merge that changes them fails loudly
 instead of silently mis-resolving credentials. **Do not delete that test file
-during a merge conflict** — read it, it is the tripwire.
+during a merge conflict** — it is the tripwire. `test_wheelbase_upstream_contracts.py`
+pins dashboard OAuth / `/api/model/set`, not this layout.
 
 Note `profiles_root()` (flat) and `hermes_home_root()` (tenant-nested) are both
 still live: `profile_cron` sweeps both layouts because a deferred migration
@@ -163,7 +165,9 @@ infrastructure:
 
 Enabled per-profile via `PROFILE_PLUGINS` in `profile_router.py` **and**
 separately in the seeded Telegram `config.yaml` in `scripts/gateway-entrypoint.sh`.
-Both lists must be kept in sync by hand — there is no shared constant.
+The six product plugins must be kept in sync by hand — there is no shared
+constant. `wheelbase-desktop-exec` is dashboard-child only (it needs a
+`shell_relay_url`); do not add it to the Telegram seed.
 
 **Conflict risk: LOW** (own directory tree). Their real dependency is on
 `wheelbase_sdk` and on Wheelbase's Postgres schema, not on upstream.
@@ -186,16 +190,17 @@ installed unconditionally by `Dockerfile.gateway`.
 
 | File | Δ | What Wheelbase changed | Conflict risk |
 |---|---|---|---|
-| `tui_gateway/server.py` | **+755/−246** | ~30 hunks across a 15k-line file that upstream churns constantly. Identity threading (`_transport_identity`, `_wheelbase_explicit_cwd`), `wheelbase_identity` carried on the session dict, per-profile store resolution for every `session.*` RPC, the three `apply_session_injection` call sites (`_run_prompt_submit`, background, preview) with their cleanup handlers, credential-file refresh on JWT update, and CDP-resolution changes. | **HIGH** |
+| `tui_gateway/server.py` | **+190/−small** | Identity threading (`_transport_identity`, `_request_profile` reject for identified callers). Most session.* RPC scoping and the three prompt-inject sites moved out during upstream's TUI split: inject now lives in `tui_gateway/prompt_turn.py` (direct) and `tui_gateway/methods_prompt.py` `_spawn_side_agent` (background + preview), with cleanup in `finally`. `methods_session.py` is the large remaining session-scoping file (+518). | **HIGH** |
 | `tools/environments/daytona.py` | +183/−~30 | `always_on` (never reaped on idle), `_call_with_timeout` hard wall-clock cap on every blocking Daytona control-plane call (they otherwise have *no* timeout — this was a real production hang), `ensure_cwd()`, and a procps-free process-tree kill that walks `/proc` from `python3` because the slim Daytona image has no `pkill`. | **MEDIUM-HIGH** |
 | `tools/browser_tool.py` | +85/−~15 | Per-task CDP registry (`register_task_cdp_url`, `_get_cdp_override(task_id)`) so each user's browser tool lands on *their own* desktop Chrome via the backend relay; `_resolve_cdp_override` now **fails closed** (returns `""` on discovery failure instead of the raw endpoint); query-string preservation when appending `/json/version`; local-Chromium fallback when a CDP session fails; `AGENT_BROWSER_CLI` absolute-path override for the bundled Electron build. | **MEDIUM** |
 | `tools/terminal_tool.py` | +58/−~10 | `register_task_env_overrides` now **merges** instead of replacing (so injection and the ACP adapter can each own a slice); `sandbox_key` pins one stable sandbox per user instead of per-turn `task_id`; `docker_volumes`/`docker_env` per-task overrides merged with globals; `TERMINAL_DAYTONA_ALWAYS_ON`; idle reaper skips always-on envs. | **MEDIUM** |
-| `hermes_cli/web_server.py` | +75/−~5 | (a) `GET /api/cron/channels` for the delivery-channel UI. (b) `mount_spa` runs frontend-less when `web_dist/assets` is missing, not just when `web_dist` is — without this the `--skip-build` per-profile child crashes at startup and per-profile routing silently falls back to the shared store. | **MEDIUM** |
+| `hermes_cli/web_routers/cron.py` | +small | `GET /api/cron/channels` for the delivery-channel UI (moved out of `web_server.py`). | **LOW** |
+| `hermes_cli/web_server_dashboard.py` | (upstream) | `mount_spa` now mounts unconditionally and 404s per-request (`check_dir=False`), so a missing `web_dist/assets` no longer crashes `--skip-build` children. `Dockerfile.gateway` still stubs `web_dist/index.html` + `web_dist/assets/.keep`. | **MEDIUM** if the stub is lost |
 | `gateway/run.py` | +22 | Telegram forum "General" topic: thread id is `None` or `"1"` and both map to `message_thread_id=None` on send, so media/files landed detached from the topic. Carries the trigger message id as a reply anchor instead. | **MEDIUM** (big file, small hunk) |
 | `plugins/platforms/telegram/adapter.py` | +7 | Consumes the `telegram_general_reply_fallback` metadata set above. | **LOW** |
 | `agent/prompt_builder.py` | +55 | `WHEELBASE_CANVAS_PROTOCOL_HINT` — teaches the agent the `#preview/` and `#media:` markdown-href schemes the Wheelbase desktop parses to drive its canvas/artifacts rail. | **LOW** (appended constant) |
-| `agent/system_prompt.py` | +9 | Injects that hint into the **stable** prompt tier, gated on `"inventory_search" in agent.valid_tool_names` so it stays O(1) and byte-stable (prompt-cache safe — upstream's cardinal rule). | **LOW-MEDIUM** |
-| `hermes_state.py` | +18 | `user_id` filter on `list_sessions_rich` and the matching session count, so one owner's sidebar never sees another's rows. Legacy `NULL user_id` rows are deliberately excluded. | **LOW** |
+| `agent/system_prompt.py` | +small | Injects that hint from `_guidance_parts` into the **stable** prompt tier, gated on `"inventory_search" in agent.valid_tool_names`. The 2026-09-04 merge pasted this after a `return` in `_tool_guidance_block` (dead code). Pin: `tests/agent/test_system_prompt.py` (`TestWheelbaseCanvasProtocolHint`). | **LOW-MEDIUM** |
+| `hermes_state_sessions.py` | +20 | `user_id` filter on `list_sessions_rich` / `session_count` (`s.user_id = ?`), so one owner's sidebar never sees another's rows. Legacy `NULL user_id` rows are deliberately excluded. Moved out of `hermes_state.py` in the September 2026 decomposition. | **LOW** |
 | `tui_gateway/ws.py` | +2 | One import + `_attach_identity_to_transport(ws, transport)` on accept. Tiny but load-bearing — everything in §2.1 hangs off it. | **LOW** |
 | `gateway/platforms/base.py` | ±6 | **Trailing-whitespace-only churn.** No semantic change. | **Take upstream's side on every merge.** |
 | `plugins/hermes-achievements/dashboard/dist/{index.js,style.css}` | −872 | Fork deletes stale upstream build artifacts (`be0b45bac`). | Will **reappear** on merges that touch them; just re-delete. |
@@ -223,8 +228,18 @@ See §4.
 
 Roughly 60 new test files. The ones that matter most during a merge:
 
-* `tests/gateway/test_wheelbase_upstream_contracts.py` — pins undocumented
-  upstream behaviours the tenant layout depends on. **This is your merge canary.**
+* `tests/gateway/test_tenant_auth_fallback.py` — pins `get_default_hermes_root()`
+  walking `…/tenants/<tid>/profiles/wb-<uid>` up to the tenant root, plus the
+  shared `auth.json` fallback and the cross-tenant non-consultation guard.
+  **This is the tenant-layout merge canary.**
+* `tests/gateway/test_profile_router_tenant_keying.py` — nested spawn,
+  same-user-two-tenants isolation, invalid tenant header rejection.
+* `tests/gateway/test_wheelbase_upstream_contracts.py` — dashboard OAuth routes
+  and `/api/model/set` (the desktop Accounts tab). Not the tenant canary.
+* `tests/hermes_state/test_wheelbase_v26_merge_policy.py` — non-unique titles +
+  per-user list vs upstream v26 provenance/hidden/leases.
+* `tests/agent/test_system_prompt.py` (`TestWheelbaseCanvasProtocolHint`) —
+  canvas `#preview/` / `#media:` hint still lands in the stable tier.
 * `tests/test_profile_router.py`, `tests/gateway/test_profile_router_*.py`,
   `tests/gateway/test_tenant_*.py` — router, tenant keying, `?profile=` rejection.
 * `tests/test_wheelbase_inject.py`, `test_wheelbase_identity.py`,
@@ -238,53 +253,51 @@ Roughly 60 new test files. The ones that matter most during a merge:
 
 ---
 
-## 3.1 Measured conflict map — against upstream/main @ 3a2b33298 (2026-07-30)
+## 3.1 Measured remaining delta — against upstream/main @ 13e72fb205 (2026-09-04)
 
-Derived mechanically. `MB=3ef6bbd20`:
+The 2026-09-04 merge landed at `1c275d17dd`. Merge-base **is** `upstream/main`,
+so the next merge starts from a clean catch-up. Re-derive the overlap the
+moment `upstream/main` moves:
+
 ```bash
 git fetch upstream --no-tags
+MB=$(git merge-base HEAD upstream/main)
 comm -12 <(git diff --name-only $MB upstream/main | sort) \
          <(git diff --name-only $MB HEAD          | sort)
 ```
 
-**Only 19 of our 194 changed files are also touched upstream.** The other 175 are
-purely additive and will merge without a murmur. The whole cost is in these 19 —
-and it is very unevenly distributed.
+Remaining fork delta vs `13e72fb205`: **280 files, +37,310 / −1,613**. Most of
+that is additive (`tui_gateway/profile_router.py`, `plugins/wheelbase/**`,
+`plugins/wheelbase-desktop-exec/**`, `wheelbase_sdk/**`, tests, docs). The
+slice still sitting inside upstream-owned files, after the merge:
 
-`ours` / `theirs` = lines changed on each side since the merge-base. When `theirs`
-dwarfs `ours` by orders of magnitude, upstream effectively rewrote the file: **do
-not try to merge those hunks — re-apply our intent by hand onto the new upstream
+| File | remaining Δ vs upstream | Notes |
+|---|---:|---|
+| `tui_gateway/methods_session.py` | +518 | User-scoped session list/resume/move. Largest remaining upstream-owned hunk. |
+| `tui_gateway/server.py` | +190 | Identity on the session; identified callers cannot pick `profile`. |
+| `tools/environments/daytona.py` | +215 | `always_on`, `_call_with_timeout`. |
+| `tui_gateway/methods_prompt.py` | +94 | `_spawn_side_agent` inject (background + preview). |
+| `agent/prompt_builder.py` | +61 | `WHEELBASE_CANVAS_PROTOCOL_HINT` constant. |
+| `hermes_state_schema.py` | +46 | Drop unique title index on open. |
+| `hermes_state_titles.py` | +44 | Non-unique title writes. |
+| `tui_gateway/ws.py` | +34 | `_attach_identity_to_transport` on accept. |
+| `gateway/run.py` | +22 | Telegram General-topic reply fallback. |
+| `hermes_state_sessions.py` | +20 | `s.user_id = ?` list/count filter. |
+| `tools/terminal_tool.py` | +20 | Env-override merge; `sandbox_key`. |
+| `tui_gateway/prompt_turn.py` | +18 | Direct-path `apply_session_injection`. |
+| `agent/system_prompt.py` | +small | Canvas hint in `_guidance_parts` (stable tier). |
+| `tools/browser_tool.py` | +7 | Per-task CDP registry. |
+| `plugins/platforms/telegram/adapter.py` | +7 | Consumes the General-topic fallback. |
+
+`ours` / `theirs` on the *next* merge will not match this table. When `theirs`
+dwarfs `ours` by orders of magnitude, upstream rewrote the file: **do not try
+to merge those hunks — re-apply our intent by hand onto the new upstream
 version.**
 
-| File | ours | theirs | Verdict |
-|---|---:|---:|---|
-| `tui_gateway/server.py` | 755 | **10,450** | 🔴 **Worst.** 30 hunks in a file upstream rewrote wholesale. Re-apply by intent (§3 item 1). Budget the bulk of the merge here. |
-| `tests/test_tui_gateway_server.py` | 114 | **5,810** | 🔴 Follows server.py. Expect to rewrite our test additions against the new structure. |
-| `gateway/run.py` | 22 | **36,015** | 🔴 Upstream churn is total. Our 22 lines are noise — take upstream whole, re-add our lines deliberately. |
-| `hermes_cli/web_server.py` | 75 | **5,086** | 🔴 Same pattern. Re-apply the `mount_spa` assets guard by hand — and note it **fails silently** if lost. |
-| `hermes_state.py` | 18 | **5,423** | 🔴 Small edit, huge upstream delta. Re-apply by hand. |
-| `plugins/platforms/telegram/adapter.py` | 7 | 890 | 🟠 Tiny edit, large rewrite. Re-apply. |
-| `gateway/platforms/base.py` | 6 | 1,060 | ✅ **Take upstream's entirely.** Verified `git diff -w` = **0** non-whitespace lines on our side. Pure trailing-whitespace churn. Never resolve this one manually. |
-| `tests/tools/test_browser_cdp_override.py` | 99 | 31 | 🟡 We changed more than upstream — our tests likely survive; reconcile normally. |
-| `tools/browser_tool.py` | 85 | 130 | 🟡 Comparable magnitudes — a genuine three-way merge. Review carefully; this is CDP fail-closed logic. |
-| `tools/terminal_tool.py` | 58 | 153 | 🟡 Genuine merge. Touches the desktop-exec relay carve-out. |
-| `agent/prompt_builder.py` | 55 | 164 | 🟡 Genuine merge. Canvas-link protocol. |
-| `agent/system_prompt.py` | 9 | 126 | 🟡 Small, manageable. |
-| `tools/browser_cdp_tool.py` | 12 | 7 | 🟢 Both tiny. Trivial. |
-| `tui_gateway/ws.py` | 2 | 86 | 🟢 Two lines — but they are `_attach_identity_to_transport`, which **fails silently** if lost. Verify after merging. |
-| `tests/tools/test_browser_cdp_tool.py` | 18 | 186 | 🟢 |
-| `tests/tools/test_browser_cloud_fallback.py` | 16 | 97 | 🟢 |
-| `tests/tools/test_browser_hybrid_routing.py` | 7 | 105 | 🟢 |
-| `tests/gateway/test_session_list_allowed_sources.py` | 4 | 33 | 🟢 |
-
-All four of the big files (`gateway/run.py`, `tui_gateway/server.py`,
-`hermes_state.py`, `hermes_cli/web_server.py`) **still exist upstream** — verified.
-So this is a real merge, not a rename/relocation hunt.
-
-**Strategy implied by the table:** 6 files are re-apply-by-hand, 1 is take-theirs,
-and only ~5 are genuine three-way merges. That is a much smaller job than "3,076
-commits behind" suggests — but `tui_gateway/server.py` alone will dominate it, and
-the silent-failure items (§6) mean a clean-looking merge can still be wrong.
+The 2026-09-04 merge taught one extra lesson: after upstream splits a module,
+a mechanically pasted Wheelbase hunk can land after a `return` and still look
+clean. `TestWheelbaseCanvasProtocolHint` exists so that particular silent
+failure cannot recur unnoticed.
 
 ---
 
@@ -298,24 +311,28 @@ Cheap (own files, conflict only on deletion/rename upstream):
 
 Expensive (Wheelbase edits inside upstream-owned code), worst first:
 
-1. **`tui_gateway/server.py`** — by far the worst. 30 hunks in the fastest-moving
-   file in the repo. When it conflicts, resolve by re-applying the *intent*
-   (identity on the session dict; per-profile store for every `session.*` RPC;
-   injection wrapped around all three prompt-submit paths with cleanup in
-   `finally`) rather than by mechanically keeping "ours".
-2. **`tools/environments/daytona.py`** — heavily rewritten around upstream's
-   `BaseEnvironment` contract.
-3. **`tools/browser_tool.py`** and **`tools/terminal_tool.py`** — signature
-   changes (`_get_cdp_override(task_id)`) that upstream call sites don't know about.
-4. **`hermes_cli/web_server.py`** — the `mount_spa` guard sits in a function
-   upstream edits regularly; losing it re-breaks per-profile routing *silently*.
-5. **`gateway/run.py`** — small hunk, huge file.
-6. Everything else in the §2.6 table is a small appended block.
+1. **`tui_gateway/methods_session.py`** — largest remaining upstream-owned hunk.
+   User-scoped list/resume/workspace.move; foreign and `NULL` owner rows fail
+   closed. Re-apply that intent, do not keep ours mechanically.
+2. **`tui_gateway/server.py`** — identity on the session dict; identified
+   callers cannot select `profile`. Injection is no longer here: it lives in
+   `prompt_turn.py` (direct) and `methods_prompt.py` `_spawn_side_agent`
+   (background + preview), with cleanup in `finally`.
+3. **`tools/environments/daytona.py`** — `always_on` + `_call_with_timeout`
+   around upstream's `BaseEnvironment` contract.
+4. **`tools/browser_tool.py`** and **`tools/terminal_tool.py`** — per-task CDP
+   fail-closed; `register_task_env_overrides` must **merge**.
+5. **`agent/system_prompt.py`** — canvas hint in `_guidance_parts`. A
+   mechanical paste after a `return` is how the 2026-09-04 merge dropped it.
+6. **`gateway/run.py`** — small Telegram General-topic hunk, huge file.
+7. Everything else in the §2.6 table is a small appended block.
 
 **Silent-failure watchlist** (things that break without an error, so a merge can
-"succeed" and still be wrong): the `mount_spa` guard, the tenant-root walk-up,
-`_attach_identity_to_transport` in `ws.py`, and the heredoc override in
-`relay_env.py`.
+"succeed" and still be wrong): the canvas hint in `_guidance_parts`, the
+`Dockerfile.gateway` `web_dist/assets` stub (upstream `mount_spa` 404s
+per-request but `--skip-build` still needs the stub files), the tenant-root
+walk-up, `_attach_identity_to_transport` in `ws.py`, and the heredoc override
+in `relay_env.py`.
 
 ### Active policy: this repo is excluded from the umbrella's tooling migrations
 
