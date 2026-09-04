@@ -10,7 +10,8 @@ from __future__ import annotations
 import uuid
 from typing import Any
 
-from tools.environments.base import BaseEnvironment, _ThreadedProcessHandle
+from tools.environments.base import BaseEnvironment
+from tools.environments.base_output import _ThreadedProcessHandle
 
 from .transport import ExecTransport, PreDispatchError
 
